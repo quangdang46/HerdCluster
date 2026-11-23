@@ -340,12 +340,15 @@ name = "cluster-node"
 version = "0.1.0"
 dependencies = [
  "api-client",
+ "chrono",
  "cluster-bridge",
  "cluster-core",
  "cluster-fleet",
  "cluster-net",
+ "rand_core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tracing",
