@@ -4,8 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "HerdCluster cluster-node crate"
+description = "HerdCluster cluster-node crate: controller/worker daemons, herdr runtime supervisor, resources, doctor"
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+cluster-core.workspace = true
+cluster-net.workspace = true
+cluster-bridge.workspace = true
+cluster-fleet.workspace = true
+api-client.workspace = true
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

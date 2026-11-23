@@ -1,14 +1,21 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "herdcluster", version, about = "Distributed coding-agent cluster on top of herdr")]
+#[command(
+    name = "herdcluster",
+    version,
+    about = "Distributed coding-agent cluster on top of herdr"
+)]
 struct Cli {
+    /// Print verbose diagnostics to stderr
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
-enum Commands {
+pub(crate) enum Commands {
     /// Initialize this machine as the cluster controller
     Init {
         /// Cluster display name (default: hostname)
@@ -82,7 +89,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum AgentCommands {
+pub(crate) enum AgentCommands {
     /// List agents (use --all for every machine)
     List {
         #[arg(long)]
@@ -91,11 +98,23 @@ enum AgentCommands {
         json: bool,
     },
     /// Show agent details
-    Get { id: String, #[arg(long)] json: bool },
+    Get {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Read agent terminal output
-    Read { id: String, #[arg(long)] json: bool },
+    Read {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Wait for an agent state
-    Wait { id: String, #[arg(long)] json: bool },
+    Wait {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Send a prompt to an agent
     Prompt { id: String, text: String },
     /// Send keys to an agent
@@ -105,7 +124,7 @@ enum AgentCommands {
 }
 
 #[derive(Subcommand)]
-enum SkillsCommands {
+pub(crate) enum SkillsCommands {
     /// Install the orchestration skill into the current project
     Install,
     /// Show skill installation status
@@ -114,20 +133,5 @@ enum SkillsCommands {
 
 pub fn run() -> i32 {
     let cli = Cli::parse();
-    match cli.command {
-        Commands::Init { .. } => not_implemented("init"),
-        Commands::Join { .. } => not_implemented("join"),
-        Commands::Worker => not_implemented("worker"),
-        Commands::Doctor { .. } => not_implemented("doctor"),
-        Commands::Machines { .. } => not_implemented("machines"),
-        Commands::Spawn { .. } => not_implemented("spawn"),
-        Commands::Agent { .. } => not_implemented("agent"),
-        Commands::Status { .. } => not_implemented("status"),
-        Commands::Skills { .. } => not_implemented("skills"),
-    }
-}
-
-fn not_implemented(cmd: &str) -> i32 {
-    eprintln!("herdcluster {cmd}: not implemented yet (see docs/herdcluster/PLAN.md)");
-    2
+    crate::commands::dispatch(cli.command, cli.verbose)
 }

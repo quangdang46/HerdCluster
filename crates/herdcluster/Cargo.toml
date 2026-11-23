@@ -18,7 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 api-client.workspace = true
 cluster-core.workspace = true
-cluster-net.workspace = true
-cluster-bridge.workspace = true
 cluster-fleet.workspace = true
-cluster-node.workspace = true
+# cluster-net / cluster-bridge / cluster-node are intentionally NOT deps
+# yet: init/join/worker/skills are stubbed until those crates' public APIs
+# stabilize. Re-add when wiring the daemon commands.
