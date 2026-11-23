@@ -440,6 +440,33 @@ impl ControllerHandle {
             }));
         }
 
+        // ---- revocation watch: enforce `revoke` marker files ----
+        // `cluster_node::revoke::revoke_worker` runs in a separate
+        // process and cannot reach this in-memory state; it drops a
+        // marker under `<state_dir>/revocations/` that this loop picks
+        // up to close live sessions and drop the cached registry row.
+        {
+            let controller = controller.clone();
+            let registry = registry.clone();
+            let dirty = dirty.clone();
+            let state_dir = state_dir.clone();
+            #[cfg(unix)]
+            let bridges = bridges.clone();
+            let mut shutdown_rx = shutdown_tx.subscribe();
+            tasks.push(tokio::spawn(async move {
+                revocation_watch_loop(
+                    controller,
+                    registry,
+                    dirty,
+                    state_dir,
+                    #[cfg(unix)]
+                    bridges,
+                    &mut shutdown_rx,
+                )
+                .await;
+            }));
+        }
+
         // ---- pairing FSM + code slot ----
         let mut rng = rand_core::OsRng;
         let pairing_server = PairingServer::start(SystemClock, &mut rng);
@@ -1089,6 +1116,136 @@ fn on_worker_disconnected(
     }
 }
 
+/// How often the revocation watch scans `<state_dir>/revocations/`.
+const REVOKE_SCAN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Poll for revocation markers written by `cluster_node::revoke` and
+/// enforce them against live state. See [`process_revocations`].
+#[allow(clippy::too_many_arguments)]
+async fn revocation_watch_loop(
+    controller: Arc<Controller>,
+    registry: Arc<Mutex<WorkerRegistry>>,
+    dirty: Arc<AtomicBool>,
+    state_dir: PathBuf,
+    #[cfg(unix)] bridges: Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) {
+    let dir = crate::revoke::revocations_dir(&state_dir);
+    let mut tick = tokio::time::interval(REVOKE_SCAN_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = shutdown_rx.changed() => break,
+        }
+        process_revocations(
+            &controller,
+            &registry,
+            &dirty,
+            &state_dir,
+            #[cfg(unix)]
+            &bridges,
+            &dir,
+        );
+    }
+}
+
+/// Enforce every pending revocation marker in `dir`:
+///
+/// 1. Close the live [`Session`] for the marker's pubkey (the worker's
+///    reconnect will then be refused by `on_worker_connected`'s
+///    registry check — revocation is server-side, not cosmetic).
+/// 2. Remove the row from the **in-memory** registry — required because
+///    this process caches `workers.json` and `persist_loop` would
+///    otherwise resurrect the row `revoke_worker` deleted on disk.
+/// 3. Drop the worker's [`ControllerBridge`] (unix) so the bridge socket
+///    stops serving.
+/// 4. Consume the marker file.
+///
+/// Synchronous and idempotent: markers for already-removed workers are
+/// still consumed (their pubkey session close is a no-op when absent).
+#[allow(clippy::too_many_arguments)]
+fn process_revocations(
+    controller: &Arc<Controller>,
+    registry: &Arc<Mutex<WorkerRegistry>>,
+    dirty: &AtomicBool,
+    state_dir: &Path,
+    #[cfg(unix)] bridges: &Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    dir: &Path,
+) {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return; // no revocations dir yet — the common case
+    };
+    for item in read.flatten() {
+        let path = item.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read(&path) else {
+            continue;
+        };
+        let marker: crate::revoke::RevocationMarker = match serde_json::from_slice(&raw) {
+            Ok(m) => m,
+            Err(_) => {
+                // Corrupt marker: quarantine rather than wedge the loop.
+                let _ = std::fs::rename(&path, path.with_extension("json.bad"));
+                continue;
+            }
+        };
+        if marker.version != crate::revoke::REVOCATION_MARKER_VERSION {
+            // Unknown future version — leave it for a newer controller.
+            continue;
+        }
+
+        // 1. Kill the live session, if any.
+        if let Ok(pk) = protocol::pubkey_from_hex(&marker.pubkey) {
+            if let Some(sess) = controller.session(&pk) {
+                sess.close();
+            }
+        }
+
+        // 2+3. Registry row + bridge, keyed by worker_id with a pubkey
+        // fallback (the marker is authoritative for both).
+        let removed_id = {
+            let mut reg = registry.lock().unwrap();
+            let target = if reg.get(&marker.worker_id).is_some() {
+                Some(marker.worker_id.clone())
+            } else {
+                reg.list()
+                    .iter()
+                    .find(|w| w.pubkey == marker.pubkey)
+                    .map(|w| w.worker_id.clone())
+            };
+            match target {
+                Some(id) if reg.remove(&id) => {
+                    dirty.store(true, Ordering::Relaxed);
+                    // Revocation is rare — persist immediately instead of
+                    // waiting for the debounced tick.
+                    if let Err(e) = reg.save() {
+                        tracing::warn!("workers.json save after revocation failed: {e}");
+                    }
+                    Some(id)
+                }
+                _ => None,
+            }
+        };
+        #[cfg(unix)]
+        if let Some(id) = &removed_id {
+            if let Some(bridge) = bridges.lock().unwrap().remove(id) {
+                bridge.shutdown();
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = removed_id;
+
+        // 4. Consume the marker.
+        if let Err(e) = crate::revoke::consume_marker(state_dir, &marker.worker_id) {
+            tracing::debug!(error = %e, "revocation marker cleanup failed");
+        }
+        println!("worker '{}' revoked", marker.label);
+    }
+}
+
 /// Debounced `workers.json` persistence: every [`PERSIST_TICK`] save when
 /// dirty, refreshing derived statuses first.
 async fn persist_loop(
@@ -1442,5 +1599,96 @@ mod tests {
         assert_eq!(handle.pairing_code().len(), 8);
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// `revoke_worker_in_state_dir` against a *running* controller:
+    /// the marker file must kill the live session, drop the in-memory
+    /// registry row (which persist_loop would otherwise resurrect),
+    /// remove the bridge, and be consumed — all without touching
+    /// controller internals.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctrl_revoke_kills_live_session_and_row() {
+        let state_dir = tempdir("revoke");
+        let worker_dir = tempdir("revoke-worker");
+
+        let handle = ControllerHandle::run(ControllerConfig {
+            port: Some(0),
+            auto_accept_pairing: true,
+            state_dir: Some(state_dir.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let addr = handle.local_addr();
+
+        let identity = Keypair::load_or_create(&worker_dir.join("identity.key")).unwrap();
+        let pubkey = identity.public_key_bytes();
+        let outcome = pair_with_controller(
+            addr,
+            &handle.pairing_code(),
+            &pubkey,
+            "revoke-me",
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        let PairingClientOutcome::Accepted { credential, .. } = outcome else {
+            panic!("expected PairAccept");
+        };
+        let cred = WorkerCredential::decode(&credential).unwrap();
+        save_worker_credential(&worker_dir, &cred).unwrap();
+        let client = conn::WorkerClient::load(&worker_dir, worker_cfg("revoke-me")).unwrap();
+        let session = client.connect_once(addr).await.expect("worker connect");
+        assert!(session.is_alive());
+
+        // Wait for the registry row so we know the worker_id for the
+        // marker-consumed assertion.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let worker_id = loop {
+            {
+                let reg = WorkerRegistry::open(state_dir.join("workers.json")).unwrap();
+                if let Some(w) = reg.list().first() {
+                    break w.worker_id.clone();
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "worker never registered");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+
+        // Revoke from "another process" — file-level only.
+        let outcome = crate::revoke::revoke_worker_in_state_dir("revoke-me", &state_dir)
+            .expect("revoke");
+        assert!(outcome.removed_registry);
+        assert!(outcome.disconnected_live);
+
+        // The watch loop (500 ms cadence) must: close the session,
+        // consume the marker, and keep workers.json empty.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let session_dead = !session.is_alive();
+            let marker_gone =
+                !crate::revoke::revocation_marker_path(&state_dir, &worker_id).exists();
+            let reg_empty = WorkerRegistry::open(state_dir.join("workers.json"))
+                .unwrap()
+                .list()
+                .is_empty();
+            if session_dead && marker_gone && reg_empty {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "revoke not enforced: session_dead={session_dead} marker_gone={marker_gone} reg_empty={reg_empty}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Bridge socket for the label is gone too.
+        assert!(!state_dir.join("bridge").join("revoke-me.sock").exists());
+
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&worker_dir);
     }
 }

@@ -24,8 +24,15 @@ pub(crate) enum Commands {
         /// Skip orchestration skill provisioning offer
         #[arg(long)]
         no_skills: bool,
+        /// TCP listen port (default: 47820; 0 = ephemeral)
+        #[arg(long)]
+        port: Option<u16>,
+        /// Non-interactive: auto-accept pairing requests, auto-install skills
+        #[arg(long)]
+        yes: bool,
     },
-    /// Pair this machine as a worker with a discovered controller
+    /// Pair this machine as a worker with a discovered controller,
+    /// then run as the worker daemon
     Join {
         /// Controller hint (optional; auto-discovery by default)
         #[arg(long)]
@@ -37,16 +44,35 @@ pub(crate) enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Run as a worker daemon (used internally after join)
-    Worker,
+    /// Run as a worker daemon (requires a prior `herdcluster join`)
+    Worker {
+        /// Controller address override (`ip:port` or `host:port`)
+        #[arg(long)]
+        controller: Option<String>,
+    },
     /// Diagnose cluster health; --fix attempts safe remediations
     Doctor {
         #[arg(long)]
         fix: bool,
+        /// Confirm safe fixes without prompting
+        #[arg(long)]
+        yes: bool,
         #[arg(long)]
         machine: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Revoke a worker's pairing (removes registry entry + credential)
+    Revoke {
+        /// Worker label to revoke
+        label: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage worker autostart (launch at login/boot)
+    Autostart {
+        #[command(subcommand)]
+        command: AutostartCommands,
     },
     /// List cluster machines and their status
     Machines {
@@ -124,9 +150,26 @@ pub(crate) enum AgentCommands {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum AutostartCommands {
+    /// Install the worker daemon as a login/boot autostart entry
+    Install,
+    /// Remove the autostart entry
+    Uninstall,
+    /// Show autostart status
+    Status,
+}
+
+#[derive(Subcommand)]
 pub(crate) enum SkillsCommands {
     /// Install the orchestration skill into the current project
-    Install,
+    Install {
+        /// Install without asking (also overwrites diverged installs)
+        #[arg(long)]
+        yes: bool,
+        /// Overwrite a diverged local copy without asking
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Show skill installation status
     Status,
 }

@@ -16,9 +16,10 @@ path = "src/main.rs"
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio = { version = "1", features = ["full"] }
 api-client.workspace = true
 cluster-core.workspace = true
 cluster-fleet.workspace = true
-# cluster-net / cluster-bridge / cluster-node are intentionally NOT deps
-# yet: init/join/worker/skills are stubbed until those crates' public APIs
-# stabilize. Re-add when wiring the daemon commands.
+cluster-node.workspace = true
+# cluster-net / cluster-bridge stay out of scope: herdcluster talks to the
+# daemons through cluster-node's public API, never the wire internals.

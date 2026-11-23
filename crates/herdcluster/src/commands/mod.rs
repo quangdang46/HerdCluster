@@ -2,35 +2,57 @@
 //!
 //! `cli.rs` owns argv parsing only; every subcommand dispatches here.
 //! Handlers compose `cluster-fleet` (fleet ops, spawn, machines view),
-//! `api-client` (local herdr), and `cluster-core` (config/registry).
-//! Commands that need `cluster-node`/`cluster-net`/`cluster-bridge`
-//! (still being built by other workstreams) stay stubbed in [`stubs`]
-//! and return exit code 2.
+//! `api-client` (local herdr), `cluster-core` (config/registry), and
+//! `cluster-node` (controller/worker daemons, doctor, skills, revoke,
+//! autostart). Daemon commands are async — they run on a per-command
+//! tokio runtime via [`block_on`].
 
 pub mod agent;
+pub mod autostart;
 pub mod doctor;
+pub mod init;
+pub mod join;
 pub mod machines;
 pub mod render;
+pub mod revoke;
+pub mod skills;
 pub mod spawn;
 pub mod status;
-pub mod stubs;
+pub mod worker;
 
 use std::fmt::Display;
+use std::future::Future;
 
 use cluster_fleet::{FleetContext, FleetError, SpawnError};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::cli::Commands;
+use crate::cli::{Commands, SkillsCommands};
 
 /// Dispatch a parsed command. Returns the process exit code:
 /// 0 ok, 1 runtime error, 2 usage/not-implemented.
 pub fn dispatch(command: Commands, verbose: bool) -> i32 {
     match command {
-        Commands::Init { .. } => stubs::init(),
-        Commands::Join { .. } => stubs::join(),
-        Commands::Worker => stubs::worker(),
-        Commands::Doctor { fix, machine, json } => doctor::run(fix, machine, json, verbose),
+        Commands::Init {
+            name,
+            no_skills,
+            port,
+            yes,
+        } => init::run(name, no_skills, port, yes, verbose),
+        Commands::Join {
+            controller,
+            yes,
+            json,
+        } => join::run(controller, yes, json, verbose),
+        Commands::Worker { controller } => worker::run(controller, verbose),
+        Commands::Doctor {
+            fix,
+            yes,
+            machine,
+            json,
+        } => doctor::run(fix, yes, machine, json, verbose),
+        Commands::Revoke { label, json } => revoke::run(&label, json),
+        Commands::Autostart { command } => autostart::run(command),
         Commands::Machines { json } => machines::run(json, verbose),
         Commands::Spawn {
             name,
@@ -45,8 +67,45 @@ pub fn dispatch(command: Commands, verbose: bool) -> i32 {
         ),
         Commands::Agent { command } => agent::run(command, verbose),
         Commands::Status { all, json } => status::run(all, json, verbose),
-        Commands::Skills { command } => stubs::skills(command),
+        Commands::Skills { command } => match command {
+            SkillsCommands::Install { yes, overwrite } => skills::install(yes, overwrite),
+            SkillsCommands::Status => skills::status(),
+        },
     }
+}
+
+/// Run `fut` on a fresh multi-thread tokio runtime. Daemon commands are
+/// one-shot processes, so a per-command runtime is simpler than threading
+/// one through `dispatch` (which is sync by design for the CLI surface).
+///
+/// Returns `Err(exit_code)` when the runtime itself cannot start.
+pub(crate) fn block_on<F: Future>(fut: F) -> Result<F::Output, i32> {
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => Ok(rt.block_on(fut)),
+        Err(e) => {
+            eprintln!("error: failed to start async runtime: {e}");
+            Err(1)
+        }
+    }
+}
+
+/// Print a `cluster-node` service error and return exit code 1.
+///
+/// `code` is the stable snake_case tag used inside the `--json` error
+/// envelope (cluster-node errors don't carry machine-readable codes).
+pub(crate) fn report_node_error(code: &str, e: &impl Display, json: bool) -> i32 {
+    if json {
+        let envelope = serde_json::json!({
+            "error": { "code": code, "message": e.to_string() }
+        });
+        eprintln!(
+            "{}",
+            serde_json::to_string(&envelope).unwrap_or_else(|_| envelope.to_string())
+        );
+    } else {
+        eprintln!("error: {e}");
+    }
+    1
 }
 
 /// `--verbose` diagnostics on stderr (no logging dep — keep it simple).
@@ -211,21 +270,5 @@ mod tests {
         let v = e.to_json();
         assert_eq!(v["error"]["code"], "unknown_machine");
         assert!(v["error"]["message"].is_string());
-    }
-
-    #[test]
-    fn dispatch_stub_exit_codes() {
-        // Stubbed commands return 2 (usage/not-implemented).
-        assert_eq!(
-            dispatch(
-                Commands::Init {
-                    name: None,
-                    no_skills: false
-                },
-                false
-            ),
-            2
-        );
-        assert_eq!(dispatch(Commands::Worker, false), 2);
     }
 }
