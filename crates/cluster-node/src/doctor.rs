@@ -154,11 +154,7 @@ pub async fn run_doctor(opts: DoctorOptions) -> Result<DoctorReport, DoctorError
 
     let _ = cluster; // config outcome already recorded as a check
     let ok = !checks.iter().any(|c| c.status == CheckStatus::Fail);
-    Ok(DoctorReport {
-        checks,
-        ok,
-        fixed,
-    })
+    Ok(DoctorReport { checks, ok, fixed })
 }
 
 // ---------------------------------------------------------------------------
@@ -208,14 +204,20 @@ fn update_check(
 
 /// Returns the loaded [`registry::ClusterInfo`] when `cluster.json`
 /// exists and parses; the check result is always recorded.
-fn check_cluster_config(state_dir: &Path, checks: &mut Vec<CheckResult>) -> Option<registry::ClusterInfo> {
+fn check_cluster_config(
+    state_dir: &Path,
+    checks: &mut Vec<CheckResult>,
+) -> Option<registry::ClusterInfo> {
     let path = state_dir.join(registry::CLUSTER_FILE_NAME);
     if !path.exists() {
         push_hint(
             checks,
             "cluster config",
             CheckStatus::Warn,
-            format!("no cluster.json at {} — this machine hasn't run `herdcluster init`", path.display()),
+            format!(
+                "no cluster.json at {} — this machine hasn't run `herdcluster init`",
+                path.display()
+            ),
             "run `herdcluster init` on the controller machine (workers can ignore this)",
         );
         return None;
@@ -250,7 +252,10 @@ fn check_cluster_config(state_dir: &Path, checks: &mut Vec<CheckResult>) -> Opti
                 "cluster config",
                 CheckStatus::Fail,
                 format!("cannot load cluster.json: {e}"),
-                format!("restore or delete {} and re-run `herdcluster init`", path.display()),
+                format!(
+                    "restore or delete {} and re-run `herdcluster init`",
+                    path.display()
+                ),
             );
             None
         }
@@ -275,7 +280,10 @@ fn check_state_layout(state_dir: &Path, checks: &mut Vec<CheckResult>) {
             checks,
             "state dir layout",
             CheckStatus::Pass,
-            format!("{} exists with credentials/ + runtime/", state_dir.display()),
+            format!(
+                "{} exists with credentials/ + runtime/",
+                state_dir.display()
+            ),
         );
     } else {
         push_hint(
@@ -365,7 +373,10 @@ fn check_local_herdr(checks: &mut Vec<CheckResult>) {
                     "start herdr on this machine (`herdr`), or run `herdcluster worker` which supervises it",
                 )
             } else {
-                (CheckStatus::Fail, "check the herdr socket path (HERDR_SOCKET_PATH)")
+                (
+                    CheckStatus::Fail,
+                    "check the herdr socket path (HERDR_SOCKET_PATH)",
+                )
             };
             push_hint(checks, "local herdr api", status, e.to_string(), hint);
             return;
@@ -418,17 +429,17 @@ async fn check_lan_discovery(checks: &mut Vec<CheckResult>) {
     } else {
         let names: Vec<String> = found
             .iter()
-            .map(|c| {
-                c.cluster_name
-                    .clone()
-                    .unwrap_or_else(|| c.hostname.clone())
-            })
+            .map(|c| c.cluster_name.clone().unwrap_or_else(|| c.hostname.clone()))
             .collect();
         push(
             checks,
             "lan discovery",
             CheckStatus::Pass,
-            format!("{} controller(s) visible: {}", found.len(), names.join(", ")),
+            format!(
+                "{} controller(s) visible: {}",
+                found.len(),
+                names.join(", ")
+            ),
         );
     }
 }
@@ -479,8 +490,12 @@ fn check_workers_registered(
     // Scope filter.
     let scoped: Vec<WorkerEntry> = match machine {
         Some(label) if label != LOCAL_LABEL => {
-            let hits: Vec<WorkerEntry> =
-                file.workers.iter().filter(|w| w.label == label).cloned().collect();
+            let hits: Vec<WorkerEntry> = file
+                .workers
+                .iter()
+                .filter(|w| w.label == label)
+                .cloned()
+                .collect();
             if hits.is_empty() {
                 push_hint(
                     checks,
@@ -579,16 +594,14 @@ fn check_machine_endpoints(
             }
         };
 
-        match client.request_with_timeout(
-            "ping",
-            &serde_json::json!({}),
-            BRIDGE_PROBE_TIMEOUT,
-        ) {
+        match client.request_with_timeout("ping", &serde_json::json!({}), BRIDGE_PROBE_TIMEOUT) {
             Ok(pong) => {
                 let protocol = pong.get("protocol").and_then(|v| v.as_u64());
                 let mut detail = format!(
                     "reachable via bridge — herdr protocol {}",
-                    protocol.map(|p| p.to_string()).unwrap_or_else(|| "?".into())
+                    protocol
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "?".into())
                 );
                 if let Some(kinds) = w
                     .resources
@@ -651,7 +664,9 @@ fn check_agent_clis(checks: &mut Vec<CheckResult>) {
             .iter()
             .find_map(|k| crate::provisioning::suggested_install_command(k))
             .map(|cmd| format!("install one, e.g. `{cmd}`"))
-            .unwrap_or_else(|| "install an agent CLI (claude, codex, …) and ensure it is on PATH".into());
+            .unwrap_or_else(|| {
+                "install an agent CLI (claude, codex, …) and ensure it is on PATH".into()
+            });
         push_hint(
             checks,
             "agent clis",
@@ -690,7 +705,8 @@ fn check_agent_clis(checks: &mut Vec<CheckResult>) {
             status,
             detail,
             hints.first().cloned().unwrap_or_else(|| {
-                "missing kinds can be installed with the commands in `herdcluster` provisioning".into()
+                "missing kinds can be installed with the commands in `herdcluster` provisioning"
+                    .into()
             }),
         );
     } else {
@@ -723,7 +739,12 @@ fn check_disk_space(state_dir: &Path, checks: &mut Vec<CheckResult>) {
                     "consider freeing space; under 8 GiB is tight for agent workloads",
                 );
             } else {
-                push(checks, "disk space", CheckStatus::Pass, format!("{gib} GiB free"));
+                push(
+                    checks,
+                    "disk space",
+                    CheckStatus::Pass,
+                    format!("{gib} GiB free"),
+                );
             }
         }
         None => push(
@@ -865,7 +886,10 @@ fn check_orchestration_skill(checks: &mut Vec<CheckResult>) {
                 checks,
                 "orchestration skill",
                 CheckStatus::Warn,
-                format!("local copy in {} differs from the bundled version", cwd.display()),
+                format!(
+                    "local copy in {} differs from the bundled version",
+                    cwd.display()
+                ),
                 "review local edits, then `herdcluster skills install --overwrite` to replace",
             );
         }
@@ -912,7 +936,10 @@ fn apply_fixes(
             .any(|c| c.name == "file permissions" && c.status != CheckStatus::Pass);
         if needs_perms {
             let proceed = opts.yes
-                || crate::join_ux::confirm("Tighten permissions on sensitive herdcluster files to 0600?", true);
+                || crate::join_ux::confirm(
+                    "Tighten permissions on sensitive herdcluster files to 0600?",
+                    true,
+                );
             if proceed {
                 use std::os::unix::fs::PermissionsExt;
                 let mut n = 0usize;
@@ -961,7 +988,10 @@ fn apply_fixes(
                                     checks,
                                     "orchestration skill",
                                     CheckStatus::Pass,
-                                    format!("installed bundled skill at {}", outcome.path.display()),
+                                    format!(
+                                        "installed bundled skill at {}",
+                                        outcome.path.display()
+                                    ),
                                 );
                                 fixed.push("installed orchestration skill".to_string());
                             }
@@ -970,7 +1000,10 @@ fn apply_fixes(
                                     checks,
                                     "orchestration skill",
                                     CheckStatus::Warn,
-                                    format!("skill install skipped: {}", outcome.skipped_reason.unwrap_or_default()),
+                                    format!(
+                                        "skill install skipped: {}",
+                                        outcome.skipped_reason.unwrap_or_default()
+                                    ),
                                 );
                             }
                             Err(e) => {
@@ -999,7 +1032,10 @@ fn apply_fixes(
                                     checks,
                                     "orchestration skill",
                                     CheckStatus::Pass,
-                                    format!("replaced diverged skill at {}", outcome.path.display()),
+                                    format!(
+                                        "replaced diverged skill at {}",
+                                        outcome.path.display()
+                                    ),
                                 );
                                 fixed.push("replaced diverged orchestration skill".to_string());
                             }
@@ -1041,18 +1077,13 @@ fn print_repair_guidance(checks: &[CheckResult]) {
 mod tests {
     use super::*;
     use crate::resources::STATE_DIR_ENV_LOCK;
-    use std::sync::Mutex;
 
     /// Serializes env-mutating doctor tests (also guards against other
     /// modules' HERDCLUSTER_STATE_DIR tests running concurrently).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-doctor-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hc-doctor-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1094,8 +1125,8 @@ mod tests {
 
     #[tokio::test]
     async fn doctor_on_empty_state_dir_does_not_panic() {
-        let _g1 = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g2 = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g1 = STATE_DIR_ENV_LOCK.lock().await;
+        let _g2 = ENV_LOCK.lock().await;
         let dir = tmpdir("empty");
         std::env::set_var(cluster_core::config::ENV_STATE_DIR, &dir);
 
@@ -1115,8 +1146,8 @@ mod tests {
 
     #[tokio::test]
     async fn doctor_fix_creates_layout_and_installs_skill() {
-        let _g1 = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g2 = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g1 = STATE_DIR_ENV_LOCK.lock().await;
+        let _g2 = ENV_LOCK.lock().await;
         let dir = tmpdir("fix");
         let project = tmpdir("fixproj");
         std::env::set_var(cluster_core::config::ENV_STATE_DIR, &dir);
@@ -1140,10 +1171,7 @@ mod tests {
         // ensure_layout ran → credentials/ + runtime/ exist now.
         assert!(dir.join("credentials").is_dir());
         assert!(dir.join("runtime").is_dir());
-        assert!(report
-            .fixed
-            .iter()
-            .any(|f| f.contains("state dirs")));
+        assert!(report.fixed.iter().any(|f| f.contains("state dirs")));
         // --yes auto-installed the missing skill into the temp project.
         assert!(crate::skills::agents_skill_dir(&project)
             .join("SKILL.md")
@@ -1160,8 +1188,8 @@ mod tests {
 
     #[tokio::test]
     async fn doctor_machine_scope_unknown_label_fails() {
-        let _g1 = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _g2 = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g1 = STATE_DIR_ENV_LOCK.lock().await;
+        let _g2 = ENV_LOCK.lock().await;
         let dir = tmpdir("scope");
         std::env::set_var(cluster_core::config::ENV_STATE_DIR, &dir);
 

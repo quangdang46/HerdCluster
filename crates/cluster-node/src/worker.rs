@@ -193,10 +193,8 @@ pub async fn join_in_state_dir(
 
     let (addr, cluster_name) = resolve_target(&cfg).await?;
 
-    if interactive(&cfg) {
-        if !confirm_pairing(addr, cluster_name.as_deref())? {
-            return Ok(JoinOutcome::Declined);
-        }
+    if interactive(&cfg) && !confirm_pairing(addr, cluster_name.as_deref())? {
+        return Ok(JoinOutcome::Declined);
     }
 
     let code = pairing_code(&cfg)?;

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 /// Return the "list" payload of a list-style response: a bare JSON array,
 /// or the first array found under a well-known collection key.
-pub(crate) fn items_array<'a>(value: &'a Value) -> &'a [Value] {
+pub(crate) fn items_array(value: &Value) -> &[Value] {
     if let Some(a) = value.as_array() {
         return a;
     }
@@ -80,13 +80,7 @@ pub(crate) fn find_id(value: &Value, keys: &[&str], depth: usize) -> Option<Stri
 }
 
 /// Common identifier key aliases, most-specific first.
-pub(crate) const ID_KEYS: &[&str] = &[
-    "pane_id",
-    "workspace_id",
-    "agent_id",
-    "terminal_id",
-    "id",
-];
+pub(crate) const ID_KEYS: &[&str] = &["pane_id", "workspace_id", "agent_id", "terminal_id", "id"];
 
 /// Agent-status aliases.
 pub(crate) const STATUS_KEYS: &[&str] = &["status", "state"];

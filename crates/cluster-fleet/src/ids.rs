@@ -200,16 +200,16 @@ mod tests {
     fn parse_rejects_malformed() {
         for bad in [
             "",
-            "claude",                    // no machine prefix
-            "/agent",                    // empty machine
-            "local/",                    // empty agent
-            "local//x",                  // empty middle → agent contains '/'
-            "a/b/c",                     // extra slash
-            " local/x",                  // leading space
-            "local/x ",                  // trailing space
-            "local/my agent",            // whitespace inside
-            "local/agent\n",             // control char
-            "loc al/x",                  // whitespace in machine
+            "claude",         // no machine prefix
+            "/agent",         // empty machine
+            "local/",         // empty agent
+            "local//x",       // empty middle → agent contains '/'
+            "a/b/c",          // extra slash
+            " local/x",       // leading space
+            "local/x ",       // trailing space
+            "local/my agent", // whitespace inside
+            "local/agent\n",  // control char
+            "loc al/x",       // whitespace in machine
         ] {
             assert!(
                 matches!(parse_global_id(bad), Err(FleetError::MalformedId { .. })),

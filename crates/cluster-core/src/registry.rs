@@ -268,20 +268,20 @@ pub fn load_or_init_cluster(
     path: &Path,
     default_name: &str,
 ) -> Result<LoadOutcome<ClusterInfo>, RegistryError> {
-    Ok(load_or_quarantine::<ClusterInfo, _>(path, || ClusterInfo {
+    load_or_quarantine::<ClusterInfo, _>(path, || ClusterInfo {
         cluster_id: random_id(32),
         name: default_name.to_string(),
         port: crate::config::DEFAULT_PORT,
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         created_at: Utc::now(),
         machines: BTreeMap::new(),
-    })?)
+    })
 }
 
 /// Save `cluster.json` atomically with `0600` perms.
 pub fn save_cluster_info(path: &Path, info: &ClusterInfo) -> Result<(), RegistryError> {
-    let json = serde_json::to_vec_pretty(info)
-        .map_err(|e| RegistryError::Corrupt(e.to_string()))?;
+    let json =
+        serde_json::to_vec_pretty(info).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
     fsutil::atomic_write(path, &json)?;
     Ok(())
 }
@@ -298,8 +298,8 @@ pub fn load_workers(path: &Path) -> Result<LoadOutcome<WorkersFile>, RegistryErr
 
 /// Save `workers.json` atomically with `0600` perms.
 pub fn save_workers(path: &Path, file: &WorkersFile) -> Result<(), RegistryError> {
-    let json = serde_json::to_vec_pretty(file)
-        .map_err(|e| RegistryError::Corrupt(e.to_string()))?;
+    let json =
+        serde_json::to_vec_pretty(file).map_err(|e| RegistryError::Corrupt(e.to_string()))?;
     fsutil::atomic_write(path, &json)?;
     Ok(())
 }
@@ -418,11 +418,7 @@ mod tests {
     use super::*;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-registry-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hc-registry-{}-{}", tag, std::process::id()));
         let _ = fsutil::ensure_dir(&dir);
         dir
     }

@@ -1,0 +1,101 @@
+name: release
+
+# Tag a release with `git tag vX.Y.Z && git push origin vX.Y.Z`.
+# The tag must match the `version` in the workspace Cargo.toml — see
+# docs/herdcluster/RELEASING.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Published asset names — install.sh MUST stay in sync with these:
+#   herdcluster-<target-triple>.tar.gz  (contains a single `herdcluster` binary)
+#   checksums.txt                        (sha256 of every .tar.gz)
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS controller — arm64 native, x86_64 cross on the same runner
+          # (Xcode CLT clang links both arches; no extra toolchain needed).
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          # Linux worker (incl. WSL2) — built natively on the runner.
+          # Cross-compiling linux-gnu from macOS needs a C toolchain/linker
+          # (cargo-zigbuild or a container); native runner builds avoid that.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release -p herdcluster --target ${{ matrix.target }}
+
+      - name: Strip and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/herdcluster"
+          test -x "$bin"
+          strip "$bin"
+          mkdir -p dist
+          tar -czf "dist/herdcluster-${{ matrix.target }}.tar.gz" -C "$(dirname "$bin")" herdcluster
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: herdcluster-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: create GitHub release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums and stage installer
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum herdcluster-*.tar.gz > checksums.txt
+          cp "${{ github.workspace }}/install.sh" .
+          ls -l
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            dist/*

@@ -409,7 +409,11 @@ impl<C: Clock> PairingClient<C> {
     }
 
     /// Handle a `PairAccept` message.
-    pub fn on_accept(&mut self, credential: Vec<u8>, ca_fingerprint: String) -> Result<(), PairingError> {
+    pub fn on_accept(
+        &mut self,
+        credential: Vec<u8>,
+        ca_fingerprint: String,
+    ) -> Result<(), PairingError> {
         self.refresh()?;
         if self.phase != ClientPhase::Waiting {
             return Err(PairingError::WrongState);

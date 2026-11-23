@@ -42,7 +42,7 @@ pub const DEFAULT_REPORT_INTERVAL: Duration = Duration::from_secs(15);
 /// Serializes tests that mutate `HERDCLUSTER_STATE_DIR` (process-global
 /// env). Shared with `scheduler_wire` tests via `pub(crate)`.
 #[doc(hidden)]
-pub static STATE_DIR_ENV_LOCK: Mutex<()> = Mutex::new(());
+pub static STATE_DIR_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ---------------------------------------------------------------------------
 // Sampling
@@ -515,7 +515,6 @@ mod tests {
         assert!(r.cpu_cores >= 1, "cpu_cores={}", r.cpu_cores);
         // Linux/macOS both report real memory; unknown platforms report 0,
         // which is still a sane (documented) value.
-        assert!(r.mem_total_mb == 0 || r.mem_total_mb > 0);
         assert!(r.mem_available_mb <= r.mem_total_mb.max(1) || r.mem_total_mb == 0);
         assert!(r.max_agents >= 1 && r.max_agents <= MAX_AGENTS_CEILING);
         assert!(r.load_avg.len() == 3 || r.load_avg.is_empty());
@@ -582,7 +581,7 @@ mod tests {
 
     #[test]
     fn configured_max_agents_defaults_without_cluster_json() {
-        let _g = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = STATE_DIR_ENV_LOCK.blocking_lock();
         let dir = std::env::temp_dir().join(format!("hc-res-{}-{}", "nojson", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -594,7 +593,7 @@ mod tests {
 
     #[test]
     fn configured_max_agents_honors_local_override() {
-        let _g = STATE_DIR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = STATE_DIR_ENV_LOCK.blocking_lock();
         let dir =
             std::env::temp_dir().join(format!("hc-res-{}-{}", "override", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);

@@ -234,7 +234,8 @@ fn remove_worker_credentials(state_dir: &Path, entry: &registry::WorkerEntry) ->
         let name = item.file_name().to_string_lossy().to_string();
         let matches = name.contains(&entry.worker_id)
             || name.contains(&entry.label)
-            || (!entry.pubkey.is_empty() && name.contains(&entry.pubkey[..8.min(entry.pubkey.len())]));
+            || (!entry.pubkey.is_empty()
+                && name.contains(&entry.pubkey[..8.min(entry.pubkey.len())]));
         if matches && std::fs::remove_file(item.path()).is_ok() {
             removed = true;
         }
@@ -252,11 +253,7 @@ mod tests {
     use cluster_core::protocol::Resources;
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-revoke-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hc-revoke-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

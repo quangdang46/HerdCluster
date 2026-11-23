@@ -36,15 +36,7 @@ use crate::skills::InstallOutcome;
 /// well-known agent CLIs — herdr's manifest set drifts, so an
 /// unreachable API means "best effort", not authoritative.
 const FALLBACK_KINDS: &[&str] = &[
-    "claude",
-    "codex",
-    "opencode",
-    "gemini",
-    "cursor",
-    "aider",
-    "copilot",
-    "goose",
-    "crush",
+    "claude", "codex", "opencode", "gemini", "cursor", "aider", "copilot", "goose", "crush",
     "droid",
 ];
 
@@ -54,11 +46,15 @@ const FALLBACK_KINDS: &[&str] = &[
 /// hint tells the user exactly what to run.
 fn auth_hint_for(kind: &str) -> Option<&'static str> {
     Some(match kind {
-        "claude" => "run `claude` once and complete the login flow (or `claude login`) on this machine",
+        "claude" => {
+            "run `claude` once and complete the login flow (or `claude login`) on this machine"
+        }
         "codex" => "run `codex login` on this machine",
         "gemini" => "run `gemini` and complete the Google sign-in on this machine",
         "opencode" => "run `opencode auth login` on this machine",
-        "aider" => "configure API keys via `aider --api-key` or environment variables on this machine",
+        "aider" => {
+            "configure API keys via `aider --api-key` or environment variables on this machine"
+        }
         "copilot" => "run `copilot` and complete GitHub sign-in on this machine",
         "cursor" => "run `cursor-agent login` (or `agent login`) on this machine",
         "goose" => "run `goose configure` and complete provider setup on this machine",
@@ -207,9 +203,7 @@ pub fn install_agent_cli(kind: &str, yes: bool) -> Result<InstallOutcome, Provis
         return Ok(InstallOutcome {
             path: probe_path,
             created: false,
-            skipped_reason: Some(format!(
-                "no known non-interactive installer for '{kind}'"
-            )),
+            skipped_reason: Some(format!("no known non-interactive installer for '{kind}'")),
         });
     };
 
@@ -217,9 +211,7 @@ pub fn install_agent_cli(kind: &str, yes: bool) -> Result<InstallOutcome, Provis
         return Ok(InstallOutcome {
             path: probe_path,
             created: false,
-            skipped_reason: Some(format!(
-                "not run (consent required): {command}"
-            )),
+            skipped_reason: Some(format!("not run (consent required): {command}")),
         });
     }
 
@@ -254,9 +246,7 @@ fn run_argv_command(command: &str) -> std::io::Result<std::process::ExitStatus> 
         // get a definite outcome rather than a spawn error.
         return Ok(std::process::ExitStatus::default());
     };
-    std::process::Command::new(program)
-        .args(argv)
-        .status()
+    std::process::Command::new(program).args(argv).status()
 }
 
 /// Agent kinds this machine's herdr supports: `server.agent_manifests`
@@ -380,8 +370,11 @@ mod tests {
         for kind in FALLBACK_KINDS {
             if let Some(cmd) = suggested_install_command(kind) {
                 assert!(
-                    !cmd.contains('|') && !cmd.contains('>') && !cmd.contains('$')
-                        && !cmd.contains(';') && !cmd.contains('`'),
+                    !cmd.contains('|')
+                        && !cmd.contains('>')
+                        && !cmd.contains('$')
+                        && !cmd.contains(';')
+                        && !cmd.contains('`'),
                     "suggested command for {kind} needs a shell: {cmd}"
                 );
             }
@@ -396,9 +389,7 @@ mod tests {
         assert!(!probes.is_empty());
         assert!(probes.iter().all(|p| !p.kind.is_empty()));
         // auth_hint only appears for installed kinds.
-        assert!(probes
-            .iter()
-            .all(|p| p.auth_hint.is_none() || p.installed));
+        assert!(probes.iter().all(|p| p.auth_hint.is_none() || p.installed));
     }
 
     #[test]
@@ -414,12 +405,10 @@ mod tests {
         // yes=false must not spawn anything — outcome is a skipped
         // report naming the command.
         let out = install_agent_cli("claude", false).unwrap();
-        if out.skipped_reason.is_none() {
+        match &out.skipped_reason {
             // Already installed on this machine — also fine.
-            assert!(out.path == PathBuf::from("claude"));
-        } else {
-            let reason = out.skipped_reason.unwrap();
-            assert!(reason.contains("claude") || reason.contains("PATH"));
+            None => assert!(out.path == *"claude"),
+            Some(reason) => assert!(reason.contains("claude") || reason.contains("PATH")),
         }
         // Unknown kind → skipped, not error.
         let out = install_agent_cli("no-such-kind-xyz", false).unwrap();

@@ -67,7 +67,10 @@ pub enum SkillError {
 /// adding a matching `include_str!` entry here.
 pub fn bundled_skill_files() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("SKILL.md", include_str!("../../../.agents/skills/herdr-orchestrator/SKILL.md")),
+        (
+            "SKILL.md",
+            include_str!("../../../.agents/skills/herdr-orchestrator/SKILL.md"),
+        ),
         (
             "AGENTS.md",
             include_str!("../../../.agents/skills/herdr-orchestrator/AGENTS.md"),
@@ -90,9 +93,7 @@ pub fn bundled_skill_files() -> Vec<(&'static str, &'static str)> {
         ),
         (
             "model-routing-and-context.md",
-            include_str!(
-                "../../../.agents/skills/herdr-orchestrator/model-routing-and-context.md"
-            ),
+            include_str!("../../../.agents/skills/herdr-orchestrator/model-routing-and-context.md"),
         ),
         (
             "parallel-worktrees.md",
@@ -123,18 +124,12 @@ pub fn bundled_skill_files() -> Vec<(&'static str, &'static str)> {
 
 /// `.agents` copy path for a project.
 pub fn agents_skill_dir(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join(".agents")
-        .join("skills")
-        .join(SKILL_NAME)
+    project_dir.join(".agents").join("skills").join(SKILL_NAME)
 }
 
 /// `.claude` copy path for a project.
 pub fn claude_skill_dir(project_dir: &Path) -> PathBuf {
-    project_dir
-        .join(".claude")
-        .join("skills")
-        .join(SKILL_NAME)
+    project_dir.join(".claude").join("skills").join(SKILL_NAME)
 }
 
 fn skill_md_path(dir: &Path) -> PathBuf {
@@ -269,11 +264,7 @@ mod tests {
     use super::*;
 
     fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-skill-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hc-skill-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

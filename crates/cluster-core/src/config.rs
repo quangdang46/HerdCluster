@@ -69,7 +69,10 @@ fn platform_state_dir() -> Result<PathBuf, ConfigError> {
     #[cfg(target_os = "macos")]
     {
         let home = home_dir()?;
-        Ok(home.join("Library").join("Application Support").join("herdcluster"))
+        Ok(home
+            .join("Library")
+            .join("Application Support")
+            .join("herdcluster"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -227,11 +230,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-config-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hc-config-{}-{}", tag, std::process::id()));
         let _ = fsutil::ensure_dir(&dir);
         dir
     }
@@ -244,10 +243,7 @@ mod tests {
         std::env::remove_var(ENV_PORT);
         assert_eq!(state_dir().unwrap(), dir);
         // Path accessors resolve under the override.
-        assert_eq!(
-            identity_key_path().unwrap(),
-            dir.join("identity.key")
-        );
+        assert_eq!(identity_key_path().unwrap(), dir.join("identity.key"));
         assert_eq!(cluster_json_path().unwrap(), dir.join("cluster.json"));
         assert_eq!(workers_json_path().unwrap(), dir.join("workers.json"));
         assert_eq!(credentials_dir().unwrap(), dir.join("credentials"));
@@ -312,10 +308,7 @@ mod tests {
 
         // Invalid port → error.
         std::env::set_var(ENV_PORT, "not-a-port");
-        assert!(matches!(
-            load_cluster(),
-            Err(ConfigError::InvalidPort(_))
-        ));
+        assert!(matches!(load_cluster(), Err(ConfigError::InvalidPort(_))));
         std::env::remove_var(ENV_STATE_DIR);
         std::env::remove_var(ENV_PORT);
         let _ = std::fs::remove_dir_all(&dir);

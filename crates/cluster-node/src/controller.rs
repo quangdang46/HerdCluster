@@ -50,12 +50,10 @@ use chrono::Utc;
 use cluster_core::config::{self, ConfigError};
 use cluster_core::identity;
 use cluster_core::pairing::{
-    self, Clock, JoinRequest, PairingServer, PairingPhase, SystemClock, PAIRING_TTL_MS,
+    self, Clock, JoinRequest, PairingPhase, PairingServer, SystemClock, PAIRING_TTL_MS,
 };
 use cluster_core::protocol::{self, Message, Resources};
-use cluster_core::registry::{
-    self, ClusterInfo, WorkerEntry, WorkerRegistry, WorkerStatus,
-};
+use cluster_core::registry::{self, ClusterInfo, WorkerEntry, WorkerRegistry, WorkerStatus};
 use cluster_net::conn::{
     ConnError, Controller, ControllerEvent, Session, WorkerCredential, WorkerSession,
 };
@@ -68,9 +66,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 #[cfg(unix)]
-use std::collections::HashMap;
-#[cfg(unix)]
 use cluster_bridge::controller::ControllerBridge;
+#[cfg(unix)]
+use std::collections::HashMap;
 
 /// How often the UDP socket re-broadcasts its discovery announce.
 const UDP_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1);
@@ -82,9 +80,7 @@ const PAIRING_TICK: Duration = Duration::from_secs(30);
 const PAIR_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// Overall deadline for one pairing exchange (hello → answer). The
 /// controller-side confirm window is 120 s; this adds slack.
-const PAIR_EXCHANGE_TIMEOUT: Duration = Duration::from_millis(
-    pairing::CONFIRM_TIMEOUT_MS + 30_000,
-);
+const PAIR_EXCHANGE_TIMEOUT: Duration = Duration::from_millis(pairing::CONFIRM_TIMEOUT_MS + 30_000);
 /// First byte of a TLS handshake record (content type `handshake`).
 const TLS_HANDSHAKE_BYTE: u8 = 0x16;
 
@@ -490,8 +486,7 @@ impl ControllerHandle {
             let pairing = pairing.clone();
             let mut shutdown_rx = shutdown_tx.subscribe();
             tasks.push(tokio::spawn(async move {
-                public_accept_loop(public_listener, internal_addr, pairing, &mut shutdown_rx)
-                    .await;
+                public_accept_loop(public_listener, internal_addr, pairing, &mut shutdown_rx).await;
             }));
         }
 
@@ -520,8 +515,14 @@ impl ControllerHandle {
             let host = hostname();
             let mut shutdown_rx = shutdown_tx.subscribe();
             tasks.push(tokio::spawn(async move {
-                udp_service_loop(udp, public_addr.port(), &cluster_name, &host, &mut shutdown_rx)
-                    .await;
+                udp_service_loop(
+                    udp,
+                    public_addr.port(),
+                    &cluster_name,
+                    &host,
+                    &mut shutdown_rx,
+                )
+                .await;
             }));
         }
 
@@ -633,7 +634,6 @@ async fn public_accept_loop(
                 }
             },
         };
-        let internal_addr = internal_addr;
         let pairing = pairing.clone();
         tokio::spawn(async move {
             handle_public_conn(stream, internal_addr, pairing).await;
@@ -684,11 +684,15 @@ async fn pairing_conn(mut stream: TcpStream, shared: Arc<PairingShared>) {
         let Ok(pk) = protocol::pubkey_from_hex(&worker_pubkey) else {
             return;
         };
-        run_pairing_exchange(&mut stream, &shared, JoinRequest {
-            code,
-            worker_pubkey: pk,
-            hostname,
-        })
+        run_pairing_exchange(
+            &mut stream,
+            &shared,
+            JoinRequest {
+                code,
+                worker_pubkey: pk,
+                hostname,
+            },
+        )
         .await;
     });
     if exchange.await.is_err() {
@@ -798,11 +802,7 @@ async fn run_pairing_exchange(
         Err(pairing::PairingError::Expired) => {
             // Rotate so the next code is fresh; tell the worker it.
             shared.with_server(|_| ());
-            let new_code = shared
-                .code_slot
-                .lock()
-                .unwrap()
-                .clone();
+            let new_code = shared.code_slot.lock().unwrap().clone();
             write_pairing_frame(
                 stream,
                 &Message::PairReject {
@@ -863,8 +863,7 @@ async fn confirm_prompt(pending: &pairing::PendingJoin) -> bool {
     print!("accept? [y/N] ");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let deadline = Duration::from_millis(remaining_ms);
-    let answer = tokio::time::timeout(deadline, tokio::task::spawn_blocking(read_stdin_line))
-        .await;
+    let answer = tokio::time::timeout(deadline, tokio::task::spawn_blocking(read_stdin_line)).await;
     match answer {
         Ok(Ok(line)) => matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"),
         _ => false,
@@ -1375,8 +1374,8 @@ pub async fn pair_with_controller(
         hostname: hostname.to_string(),
         caps: caps.to_vec(),
     };
-    let frame = protocol::encode_frame(&hello)
-        .map_err(|e| PairingClientError::Protocol(e.to_string()))?;
+    let frame =
+        protocol::encode_frame(&hello).map_err(|e| PairingClientError::Protocol(e.to_string()))?;
     stream.write_all(&frame).await?;
 
     let mut decoder = protocol::FrameDecoder::new();
@@ -1430,11 +1429,7 @@ mod tests {
     use cluster_net::conn::{self, save_worker_credential, WorkerConfig};
 
     fn tempdir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hc-ctrl-{}-{}",
-            tag,
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hc-ctrl-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1522,7 +1517,10 @@ mod tests {
                     break;
                 }
             }
-            assert!(std::time::Instant::now() < deadline, "worker never registered");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never registered"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
@@ -1530,7 +1528,10 @@ mod tests {
         let sock = state_dir.join("bridge").join("test-worker.sock");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !sock.exists() {
-            assert!(std::time::Instant::now() < deadline, "bridge socket missing");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bridge socket missing"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
@@ -1593,7 +1594,12 @@ mod tests {
         })
         .await
         .unwrap();
-        for p in ["cluster.json", "identity.key", "tls/ca.crt", "tls/server.crt"] {
+        for p in [
+            "cluster.json",
+            "identity.key",
+            "tls/ca.crt",
+            "tls/server.crt",
+        ] {
             assert!(state_dir.join(p).exists(), "missing {p}");
         }
         assert_eq!(handle.pairing_code().len(), 8);
@@ -1653,13 +1659,16 @@ mod tests {
                     break w.worker_id.clone();
                 }
             }
-            assert!(std::time::Instant::now() < deadline, "worker never registered");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never registered"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
 
         // Revoke from "another process" — file-level only.
-        let outcome = crate::revoke::revoke_worker_in_state_dir("revoke-me", &state_dir)
-            .expect("revoke");
+        let outcome =
+            crate::revoke::revoke_worker_in_state_dir("revoke-me", &state_dir).expect("revoke");
         assert!(outcome.removed_registry);
         assert!(outcome.disconnected_live);
 

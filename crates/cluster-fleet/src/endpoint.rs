@@ -139,10 +139,9 @@ pub fn bridge_socket_path(state_dir: &Path, label: &str) -> PathBuf {
 /// `HERDR_SOCKET_PATH` and herdr session env vars). Fails only on
 /// platforms where discovery is unsupported.
 pub fn local_endpoint() -> Result<MachineEndpoint, FleetError> {
-    let socket_path = platform::socket_path()
-        .map_err(|e| FleetError::Api {
-            message: e.to_string(),
-        })?;
+    let socket_path = platform::socket_path().map_err(|e| FleetError::Api {
+        message: e.to_string(),
+    })?;
     Ok(MachineEndpoint {
         label: LOCAL_LABEL.to_string(),
         socket_path,

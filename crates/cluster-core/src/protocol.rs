@@ -204,9 +204,7 @@ struct Envelope {
 pub fn encode_frame(msg: &Message) -> Result<Vec<u8>, ProtocolError> {
     let payload = encode_payload(msg)?;
     if payload.len() > MAX_FRAME_LEN {
-        return Err(ProtocolError::FrameTooLarge {
-            len: payload.len(),
-        });
+        return Err(ProtocolError::FrameTooLarge { len: payload.len() });
     }
     let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -253,8 +251,8 @@ pub fn decode_frame(buf: &[u8]) -> Result<Message, ProtocolError> {
 
 /// Decode a bare JSON payload (no length prefix).
 pub fn decode_payload(payload: &[u8]) -> Result<Message, ProtocolError> {
-    let envelope: Envelope =
-        serde_json::from_slice(payload).map_err(|e| ProtocolError::InvalidPayload(e.to_string()))?;
+    let envelope: Envelope = serde_json::from_slice(payload)
+        .map_err(|e| ProtocolError::InvalidPayload(e.to_string()))?;
     if envelope.version != PROTOCOL_VERSION {
         return Err(ProtocolError::UnsupportedVersion {
             found: envelope.version,
@@ -318,9 +316,8 @@ pub fn pubkey_to_hex(pubkey: &[u8; 32]) -> String {
 
 /// Decode a hex public key. Errors on wrong length or non-hex input.
 pub fn pubkey_from_hex(s: &str) -> Result<[u8; 32], ProtocolError> {
-    let bytes = fsutil::hex_decode(s).ok_or_else(|| {
-        ProtocolError::InvalidPayload("pubkey is not valid hex".to_string())
-    })?;
+    let bytes = fsutil::hex_decode(s)
+        .ok_or_else(|| ProtocolError::InvalidPayload("pubkey is not valid hex".to_string()))?;
     if bytes.len() != 32 {
         return Err(ProtocolError::InvalidPayload(format!(
             "pubkey must be 32 bytes, got {}",
@@ -499,8 +496,14 @@ mod tests {
         for &b in f1.iter().chain(f2.iter()) {
             dec.feed(&[b]);
         }
-        assert_eq!(dec.next_message().unwrap(), Some(Message::Heartbeat { seq: 1 }));
-        assert_eq!(dec.next_message().unwrap(), Some(Message::Heartbeat { seq: 2 }));
+        assert_eq!(
+            dec.next_message().unwrap(),
+            Some(Message::Heartbeat { seq: 1 })
+        );
+        assert_eq!(
+            dec.next_message().unwrap(),
+            Some(Message::Heartbeat { seq: 2 })
+        );
         assert_eq!(dec.next_message().unwrap(), None);
     }
 

@@ -89,7 +89,11 @@ impl Keypair {
 
     /// Verify `sig` over `msg` against `pubkey_bytes`. Returns `false` for
     /// malformed keys/signatures rather than erroring.
-    pub fn verify(pubkey_bytes: &[u8; PUBLIC_KEY_LEN], msg: &[u8], sig: &[u8; SIGNATURE_LEN]) -> bool {
+    pub fn verify(
+        pubkey_bytes: &[u8; PUBLIC_KEY_LEN],
+        msg: &[u8],
+        sig: &[u8; SIGNATURE_LEN],
+    ) -> bool {
         let Ok(verifying) = VerifyingKey::from_bytes(pubkey_bytes) else {
             return false;
         };
@@ -202,17 +206,27 @@ mod tests {
         assert!(!Keypair::verify(&kp.public_key_bytes(), b"tampered", &sig));
         let mut bad_sig = sig;
         bad_sig[0] ^= 0xff;
-        assert!(!Keypair::verify(&kp.public_key_bytes(), b"original", &bad_sig));
+        assert!(!Keypair::verify(
+            &kp.public_key_bytes(),
+            b"original",
+            &bad_sig
+        ));
     }
 
     #[test]
     fn corrupt_key_file_detected() {
         let path = temp_path("corrupt.key");
         std::fs::write(&path, "not-hex!!!").unwrap();
-        assert!(matches!(Keypair::load(&path), Err(IdentityError::CorruptKey)));
+        assert!(matches!(
+            Keypair::load(&path),
+            Err(IdentityError::CorruptKey)
+        ));
         // Right length hex but wrong seed length is also corrupt.
         std::fs::write(&path, "deadbeef\n").unwrap();
-        assert!(matches!(Keypair::load(&path), Err(IdentityError::CorruptKey)));
+        assert!(matches!(
+            Keypair::load(&path),
+            Err(IdentityError::CorruptKey)
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -223,7 +237,9 @@ mod tests {
         let fp2 = fingerprint_of_pubkey(&kp.public_key_bytes());
         assert_eq!(fp1, fp2);
         assert_eq!(fp1.len(), FINGERPRINT_HEX_LEN);
-        assert!(fp1.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(fp1
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         // A different key must (practically) produce a different fingerprint.
         let other = Keypair::generate();
         assert_ne!(fp1, other.fingerprint());

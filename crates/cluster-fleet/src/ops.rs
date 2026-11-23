@@ -53,7 +53,9 @@ fn op_error(resolved: &crate::ids::ResolvedAgent, e: ApiError) -> FleetError {
 /// `agent.get <global-id>` — fetch one agent's details.
 pub fn agent_get(ctx: &FleetContext, global_id: &str) -> Result<Value, FleetError> {
     let (resolved, client) = resolve_and_connect(ctx, global_id)?;
-    client.agent_get(&resolved.agent).map_err(|e| op_error(&resolved, e))
+    client
+        .agent_get(&resolved.agent)
+        .map_err(|e| op_error(&resolved, e))
 }
 
 /// `agent.read <global-id>` — read the agent pane's terminal content.

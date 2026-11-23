@@ -224,7 +224,10 @@ impl SpawnError {
 impl std::fmt::Display for SpawnError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpawnError::NoPlacement { machine, rejections } => {
+            SpawnError::NoPlacement {
+                machine,
+                rejections,
+            } => {
                 if let Some(m) = machine {
                     write!(f, "unknown machine {m:?}")
                 } else {
@@ -362,10 +365,7 @@ fn resolve_machine(ctx: &FleetContext, req: &SpawnRequest) -> Result<String, Spa
 /// Effective `max_agents` for a machine: `cluster.json` override wins,
 /// then the worker-reported cap, then the scheduler default — clamped to
 /// the hard ceiling.
-fn effective_max_agents(
-    override_max: Option<u32>,
-    reported: Option<u32>,
-) -> u32 {
+fn effective_max_agents(override_max: Option<u32>, reported: Option<u32>) -> u32 {
     let v = override_max
         .or(reported)
         .unwrap_or(scheduler::DEFAULT_MAX_AGENTS);
@@ -402,19 +402,14 @@ fn build_worker_caps(ctx: &FleetContext) -> Vec<WorkerCaps> {
             &local_kinds,
         ),
         agent_count: local_count,
-        max_agents: effective_max_agents(
-            local_override.and_then(|o| o.max_agents),
-            None,
-        ),
+        max_agents: effective_max_agents(local_override.and_then(|o| o.max_agents), None),
         mem_available_mb: LOCAL_MEM_AVAILABLE_FALLBACK_MB,
     });
 
     // --- remote workers ---
     for (label, entry) in &ctx.workers {
         let resources = entry.resources.as_ref();
-        let reported_kinds: Vec<String> = resources
-            .map(|r| r.kinds.clone())
-            .unwrap_or_default();
+        let reported_kinds: Vec<String> = resources.map(|r| r.kinds.clone()).unwrap_or_default();
         let override_ = ctx.machines_overrides.get(label);
         caps.push(WorkerCaps {
             label: label.clone(),
@@ -676,8 +671,7 @@ fn ensure_pane(
         .find(|id| !before_set.contains(id))
         .ok_or_else(|| SpawnError::PaneFailed {
             machine: ep.label.clone(),
-            reason: "pane.split succeeded but no new pane id could be determined"
-                .to_string(),
+            reason: "pane.split succeeded but no new pane id could be determined".to_string(),
         })
 }
 
@@ -831,8 +825,8 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
 mod tests {
     use super::*;
     use crate::endpoint::FleetContext;
-    use cluster_core::registry::{ClusterInfo, WorkerEntry, WorkerStatus};
     use cluster_core::protocol::Resources;
+    use cluster_core::registry::{ClusterInfo, WorkerEntry, WorkerStatus};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -911,7 +905,10 @@ mod tests {
         // Exact match wins (first in order that matches).
         assert_eq!(find_workspace_by_path(&list, "/repo"), Some("w1".into()));
         // Workspace inside repo matches.
-        assert_eq!(find_workspace_by_path(&list, "/repo/sub"), Some("w3".into()));
+        assert_eq!(
+            find_workspace_by_path(&list, "/repo/sub"),
+            Some("w3".into())
+        );
         // Trailing slash tolerated.
         assert_eq!(find_workspace_by_path(&list, "/repo/"), Some("w1".into()));
         // No match.
@@ -930,12 +927,7 @@ mod tests {
 
     #[test]
     fn explicit_unknown_machine_is_no_placement() {
-        let ctx = FleetContext::build(
-            PathBuf::from("/tmp/hc"),
-            cluster(),
-            vec![],
-        )
-        .unwrap();
+        let ctx = FleetContext::build(PathBuf::from("/tmp/hc"), cluster(), vec![]).unwrap();
         let mut r = req(MachineTarget::Label("ghost".into()));
         r.ready_timeout = None;
         match spawn(&ctx, &r) {
@@ -964,7 +956,7 @@ mod tests {
             // If a dev machine runs herdr, local may be online and proceed
             // to a later step failing on socket/workspace — still a typed
             // SpawnError, which is what this test guards.
-            Err(e) => assert!(e.code().len() > 0),
+            Err(e) => assert!(!e.code().is_empty()),
             Ok(_) => panic!("spawn unexpectedly succeeded without herdr"),
         }
     }

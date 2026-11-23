@@ -102,8 +102,7 @@ pub struct Placement {
 pub fn place(caps: &[WorkerCaps], req: &PlacementRequest) -> Result<Placement, Vec<Rejection>> {
     let candidates: Vec<&WorkerCaps> = match &req.machine_hint {
         Some(hint) => {
-            let matched: Vec<&WorkerCaps> =
-                caps.iter().filter(|c| &c.label == hint).collect();
+            let matched: Vec<&WorkerCaps> = caps.iter().filter(|c| &c.label == hint).collect();
             if matched.is_empty() {
                 return Err(vec![Rejection {
                     machine: hint.clone(),
@@ -132,8 +131,7 @@ pub fn place(caps: &[WorkerCaps], req: &PlacementRequest) -> Result<Placement, V
                         hc > hb
                             || (hc == hb
                                 && (c.agent_count < b.agent_count
-                                    || (c.agent_count == b.agent_count
-                                        && c.label < b.label)))
+                                    || (c.agent_count == b.agent_count && c.label < b.label)))
                     }
                 };
                 if better {
@@ -262,7 +260,9 @@ mod tests {
         assert_eq!(err.len(), 4);
         assert!(err.iter().any(|r| r.reason == RejectionReason::Offline));
         assert!(err.iter().any(|r| r.reason == RejectionReason::Disabled));
-        assert!(err.iter().any(|r| r.reason == RejectionReason::KindUnsupported));
+        assert!(err
+            .iter()
+            .any(|r| r.reason == RejectionReason::KindUnsupported));
         assert!(err.iter().any(|r| r.reason == RejectionReason::AtCapacity));
     }
 

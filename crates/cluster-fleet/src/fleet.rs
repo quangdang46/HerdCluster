@@ -258,7 +258,10 @@ pub fn list_all_agents_with_timeout(ctx: &FleetContext, timeout: Duration) -> Ve
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| unreachable!("query thread panicked")))
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| unreachable!("query thread panicked"))
+            })
             .collect()
     });
 
@@ -302,9 +305,11 @@ fn assemble_machine_info(
         None => (false, None, None), // offline worker: not probed
     };
 
-    let registry_status = worker
-        .map(|w| serde_json::to_value(w.status).ok().and_then(|v| v.as_str().map(str::to_string)))
-        .flatten();
+    let registry_status = worker.and_then(|w| {
+        serde_json::to_value(w.status)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+    });
 
     let status = if endpoint.kind == MachineKind::Local {
         if reachable {
@@ -333,9 +338,7 @@ fn assemble_machine_info(
             .map(|r| r.kinds.clone())
             .unwrap_or_default(),
         resources,
-        last_seen: worker
-            .and_then(|w| w.last_seen)
-            .map(|t| t.to_rfc3339()),
+        last_seen: worker.and_then(|w| w.last_seen).map(|t| t.to_rfc3339()),
     }
 }
 
@@ -370,9 +373,8 @@ pub fn machines_with_timeout(ctx: &FleetContext, timeout: Duration) -> Vec<Machi
             .iter()
             .map(|ep| {
                 s.spawn(move || {
-                    let result = fetch_agent_list(ep, timeout)
-                        .map(|v| parse::items_array(&v).len())
-                        .map_err(|e| e);
+                    let result =
+                        fetch_agent_list(ep, timeout).map(|v| parse::items_array(&v).len());
                     (ep.label.clone(), Some(result))
                 })
             })

@@ -95,8 +95,11 @@ impl std::fmt::Display for FleetError {
                 write!(f, "malformed agent id {input:?}: {reason}")
             }
             FleetError::UnknownMachine { label } => {
-                write!(f, "unknown machine {label:?}: not the local machine \
-                            and not present in workers.json")
+                write!(
+                    f,
+                    "unknown machine {label:?}: not the local machine \
+                            and not present in workers.json"
+                )
             }
             FleetError::AmbiguousAgent { agent, candidates } => write!(
                 f,

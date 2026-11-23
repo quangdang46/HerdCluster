@@ -82,8 +82,10 @@ pub struct RuntimeConfig {
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     /// This platform is not supported (Windows MVP target is WSL2).
-    #[error("unsupported platform: the herdr runtime supervisor supports \
-             macOS/Linux on x86_64 and aarch64; on Windows use WSL2")]
+    #[error(
+        "unsupported platform: the herdr runtime supervisor supports \
+             macOS/Linux on x86_64 and aarch64; on Windows use WSL2"
+    )]
     UnsupportedPlatform,
     /// Underlying I/O error (spawn, filesystem, socket probe).
     #[error("runtime io error: {0}")]
@@ -227,7 +229,9 @@ fn http_get(url: &str) -> Result<Vec<u8>, RuntimeError> {
         .arg(url)
         .output()
         .map_err(|e| {
-            RuntimeError::Download(format!("failed to run curl ({e}); install curl or set {ENV_HERDR_BINARY}"))
+            RuntimeError::Download(format!(
+                "failed to run curl ({e}); install curl or set {ENV_HERDR_BINARY}"
+            ))
         })?;
     if !output.status.success() {
         return Err(RuntimeError::Download(format!(
@@ -328,8 +332,8 @@ fn ensure_managed_binary(cfg: &RuntimeConfig) -> Result<PathBuf, RuntimeError> {
     }
     let rel = latest?;
 
-    let asset_name = supported_asset(os_str(), arch_str())
-        .ok_or(RuntimeError::UnsupportedPlatform)?;
+    let asset_name =
+        supported_asset(os_str(), arch_str()).ok_or(RuntimeError::UnsupportedPlatform)?;
     let asset = rel
         .assets
         .iter()
@@ -367,7 +371,10 @@ fn ensure_managed_binary(cfg: &RuntimeConfig) -> Result<PathBuf, RuntimeError> {
             format!("{}  {}\n", sha256_hex(&bytes), asset.name),
         );
     }
-    let _ = std::fs::write(version_marker_path(&cfg.state_dir), format!("{}\n", rel.tag_name));
+    let _ = std::fs::write(
+        version_marker_path(&cfg.state_dir),
+        format!("{}\n", rel.tag_name),
+    );
     tracing::info!(bin = %bin.display(), tag = %rel.tag_name, "installed herdr runtime");
     Ok(bin)
 }
@@ -475,9 +482,9 @@ fn spawn_server(binary: &Path) -> Result<Child, RuntimeError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| {
-        RuntimeError::Spawn(format!("{} server: {e}", binary.display()))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| RuntimeError::Spawn(format!("{} server: {e}", binary.display())))?;
 
     // Forward child stdout/stderr to tracing on dedicated threads.
     if let Some(mut stream) = child.stdout.take() {
@@ -640,11 +647,9 @@ impl HerdrRuntime {
         // 2. Choose + start a binary. Blocking work (download, spawn
         //    readiness poll) goes through spawn_blocking.
         let cfg = cfg.clone();
-        let (binary, child) = tokio::task::spawn_blocking(move || {
-            start_herdr_server(&cfg)
-        })
-        .await
-        .map_err(|e| RuntimeError::Spawn(format!("blocking task join: {e}")))??;
+        let (binary, child) = tokio::task::spawn_blocking(move || start_herdr_server(&cfg))
+            .await
+            .map_err(|e| RuntimeError::Spawn(format!("blocking task join: {e}")))??;
 
         let slot = Arc::new(ChildSlot::new(child));
         let stop = Arc::new(AtomicBool::new(false));
@@ -743,7 +748,9 @@ fn start_herdr_server(cfg: &RuntimeConfig) -> Result<(PathBuf, Child), RuntimeEr
             Err(e) => {
                 // Spawn/timeout failures on the system binary also fall
                 // back — the managed binary is the reliable path.
-                tracing::warn!("system herdr failed to start ({e}); falling back to release binary");
+                tracing::warn!(
+                    "system herdr failed to start ({e}); falling back to release binary"
+                );
             }
         }
     }
@@ -833,7 +840,10 @@ mod tests {
     fn platform_supported_matches_asset_map() {
         // On supported dev platforms this is true; the function exists so
         // the cfg plumbing stays honest.
-        assert_eq!(platform_supported(), supported_asset(os_str(), arch_str()).is_some());
+        assert_eq!(
+            platform_supported(),
+            supported_asset(os_str(), arch_str()).is_some()
+        );
     }
 
     #[test]
@@ -857,8 +867,14 @@ mod tests {
 
     #[test]
     fn version_and_tag_parsing() {
-        assert_eq!(parse_version_output("herdr 0.9.5\n"), Some("0.9.5".to_string()));
-        assert_eq!(parse_version_output("herdr 0.9.5-beta.1 extra"), Some("0.9.5-beta.1".to_string()));
+        assert_eq!(
+            parse_version_output("herdr 0.9.5\n"),
+            Some("0.9.5".to_string())
+        );
+        assert_eq!(
+            parse_version_output("herdr 0.9.5-beta.1 extra"),
+            Some("0.9.5-beta.1".to_string())
+        );
         assert_eq!(parse_version_output(""), None);
         assert_eq!(tag_version("v0.9.5"), "0.9.5");
         assert_eq!(tag_version("0.9.5"), "0.9.5");
@@ -931,7 +947,9 @@ mod tests {
         let bin = ensure_managed_binary(&cfg).unwrap();
         assert!(bin.exists());
         assert_eq!(
-            std::fs::read_to_string(version_marker_path(&dir)).unwrap().trim(),
+            std::fs::read_to_string(version_marker_path(&dir))
+                .unwrap()
+                .trim(),
             "v9.9.9"
         );
         // Second call hits the fast path (version match) without download.
@@ -945,9 +963,7 @@ mod tests {
     /// processes. Not run in CI.
     #[test]
     fn ensure_with_fake_herdr_binary_gated() {
-        if std::env::var("HERDCLUSTER_RUNTIME_IT").ok().as_deref() != Some("1") {
-            return;
-        }
+        if std::env::var("HERDCLUSTER_RUNTIME_IT").ok().as_deref() != Some("1") {}
         // Requires a fake herdr implementation; left as a manual hook.
     }
 }

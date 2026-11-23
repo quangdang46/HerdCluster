@@ -48,8 +48,7 @@ pub use endpoint::{
 };
 pub use error::FleetError;
 pub use fleet::{
-    list_all_agents, machines, AgentListRow, FleetAgent, MachineInfo, FANOUT_TIMEOUT,
-    PROBE_TIMEOUT,
+    list_all_agents, machines, AgentListRow, FleetAgent, MachineInfo, FANOUT_TIMEOUT, PROBE_TIMEOUT,
 };
 pub use ids::{format_global_id, parse_global_id, resolve_global_id, GlobalId, ResolvedAgent};
 pub use ops::{

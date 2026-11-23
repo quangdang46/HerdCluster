@@ -23,9 +23,9 @@
 //! - **Windows / other**: [`AutostartStatus::Unsupported`]; install
 //!   returns [`AutostartError::Unsupported`].
 
-use std::path::PathBuf;
 #[cfg(unix)]
 use std::path::Path;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -372,7 +372,9 @@ mod tests {
     fn autostart_status_is_definite() {
         // Must always return one of the three variants — never panic.
         match autostart_status() {
-            AutostartStatus::Installed { path } => assert!(path.is_absolute() || path.is_relative()),
+            AutostartStatus::Installed { path } => {
+                assert!(path.is_absolute() || path.is_relative())
+            }
             AutostartStatus::NotInstalled => {}
             AutostartStatus::Unsupported { reason } => assert!(!reason.is_empty()),
         }
