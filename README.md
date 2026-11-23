@@ -15,6 +15,10 @@ connection. Workers auto-install the latest herdr release binary.
 Early development — see [docs/herdcluster/PLAN.md](docs/herdcluster/PLAN.md)
 for the architecture and [`.beads/`](.beads/) for the work breakdown.
 
+Rust Cargo workspace under `crates/` (`herdcluster` bin + `api-client`,
+`cluster-core`, `cluster-net`, `cluster-bridge`, `cluster-fleet`,
+`cluster-node` libs). Build with `cargo build --workspace`.
+
 ## UX target
 
 ```bash

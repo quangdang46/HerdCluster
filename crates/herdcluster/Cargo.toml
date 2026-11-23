@@ -1,0 +1,24 @@
+[package]
+name = "herdcluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+keywords = ["agents", "orchestration", "cluster", "herdr", "ai"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "herdcluster"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+api-client.workspace = true
+cluster-core.workspace = true
+cluster-net.workspace = true
+cluster-bridge.workspace = true
+cluster-fleet.workspace = true
+cluster-node.workspace = true

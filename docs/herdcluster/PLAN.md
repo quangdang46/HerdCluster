@@ -128,42 +128,44 @@ This means:
   long-lived NDJSON exchange.
 - herdr can be upgraded independently on every machine.
 
-### 3.3 Module layout (single crate, `src/`)
+### 3.3 Crate layout (Cargo workspace — decided 2026-11-23)
+
+HerdCluster is a **Cargo workspace of focused crates**, not a single flat
+`src/`. Crate boundaries follow the architecture layers so each can be
+tested and depended on independently:
 
 ```
-herdcluster/
-├── Cargo.toml                  # bin: herdcluster
-├── src/
-│   ├── main.rs                 # argv dispatch
-│   ├── cli.rs                  # subcommands: init/join/worker/doctor/
-│   │                           #   machines/spawn/agent/status/config
-│   ├── api_client.rs           # NDJSON client: connect, request, response,
-│   │                           #   error mapping, protocol-version guard
-│   ├── api_methods.rs          # typed wrappers for needed Method subset
-│   ├── cluster/
-│   │   ├── mod.rs
-│   │   ├── identity.rs         # Ed25519 keypairs, fingerprints, storage
-│   │   ├── pairing.rs          # one-time code, handshake, confirm, TTL
-│   │   ├── discovery.rs        # mDNS (_herdcluster._tcp) + UDP broadcast
-│   │   ├── transport.rs        # TLS 1.3 (rustls), reconnect/backoff
-│   │   ├── protocol.rs         # framed control messages + stream mux
-│   │   ├── registry.rs         # controller worker registry (JSON state)
-│   │   ├── bridge.rs           # local unix socket ↔ cluster stream ↔
-│   │   │                       #   worker-side herdr API socket proxy
-│   │   ├── fleet.rs            # fan-out queries, global agent IDs
-│   │   ├── scheduler.rs        # --machine auto placement policy
-│   │   ├── spawn.rs            # workspace+pane+agent.start composer
-│   │   ├── runtime.rs          # worker-side herdr server supervisor +
-│   │   │                       #   release-asset installer
-│   │   ├── resources.rs        # cpu/mem/agent_count/kinds reporter
-│   │   ├── doctor.rs           # layered checks + --fix
-│   │   └── config.rs           # cluster.json, state dir layout
-│   └── platform/               # socket path discovery per-OS
-└── docs/herdcluster/
+Cargo.toml                    # [workspace] members = crates/*
+crates/
+├── herdcluster/              # [[bin]] — argv dispatch + CLI only (thin)
+├── api-client/               # herdr NDJSON API client: socket discovery,
+│                             #   request/response, errors, compat guard,
+│                             #   typed method wrappers
+├── cluster-core/             # pure logic, no I/O deps: identity (Ed25519),
+│                             #   pairing FSM, wire protocol codec, worker
+│                             #   registry, config, scheduler scoring
+├── cluster-net/              # TLS 1.3 (rustls), stream mux, connection
+│                             #   manager (dial-out/heartbeat/reconnect),
+│                             #   LAN discovery (mDNS + UDP broadcast)
+├── cluster-bridge/           # local unix socket ↔ cluster stream ↔ herdr
+│                             #   API socket proxy (both directions)
+├── cluster-fleet/            # global agent IDs, fan-out queries, agent ops
+│                             #   routing, spawn composer, machines view
+└── cluster-node/             # daemons: controller service (init), worker
+                              #   daemon (join/worker), herdr runtime
+                              #   supervisor (release-asset install),
+                              #   resource monitor, doctor checks
 ```
 
-Language: **Rust** (single static-ish binary, no runtime deps — right fit for
-non-tech install on macOS + WSL2). Deps kept minimal: rustls, mdns-sd (or raw
+Dependency direction (enforced, no cycles):
+`herdcluster` → `cluster-node`/`cluster-fleet`/`api-client` →
+`cluster-bridge`/`cluster-net`/`cluster-core`.
+`cluster-core` depends on nothing internal. `api-client` is standalone
+(only needs socket path + NDJSON).
+
+Language: **Rust** (single static-ish binary per crate, no runtime deps —
+right fit for non-tech install on macOS + WSL2). Workspace crates keep
+dependency boundaries explicit. Deps kept minimal: rustls, mdns-sd (or raw
 UDP), serde/serde_json, clap, tokio or std-threads (match simplicity needs).
 
 ### 3.4 Worker registry (replaces catalog v2)

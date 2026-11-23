@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create HerdCluster beads (Option B: pure wrapper). Run: python3 scripts/make_beads.py"""
+"""Create HerdCluster beads (Option B: pure wrapper, Cargo workspace). Run: python3 scripts/make_beads.py"""
 import json
 import subprocess
 import sys
@@ -20,9 +20,25 @@ def b(slug, title, typ="task", pri=1, parent=None, deps=(), desc=""):
                       parent=parent, deps=list(deps), desc=desc))
 
 CTX = """CONTEXT: HerdCluster (Option B — pure wrapper, decided 2026-11-23) is a
-STANDALONE Rust binary that clusters coding agents across machines WITHOUT
-herdr source code and WITHOUT modifying herdr. Canonical plan:
+STANDALONE Rust Cargo WORKSPACE that clusters coding agents across machines
+WITHOUT herdr source code and WITHOUT modifying herdr. Canonical plan:
 docs/herdcluster/PLAN.md.
+
+CRATE LAYOUT (workspace, dependency direction is one-way, no cycles):
+  crates/herdcluster    [[bin]] argv dispatch + CLI only (thin)
+  crates/api-client     herdr NDJSON API client (socket discovery, request/
+                        response, errors, compat guard, typed methods)
+  crates/cluster-core   pure logic: identity(Ed25519), pairing FSM, wire
+                        protocol codec, worker registry, config, scheduler
+  crates/cluster-net    TLS1.3(rustls), stream mux, conn manager
+                        (dial-out/heartbeat/reconnect), LAN discovery
+  crates/cluster-bridge local unix socket <-> cluster stream <-> herdr API
+                        socket proxy
+  crates/cluster-fleet  global agent IDs, fan-out, agent ops, spawn composer
+  crates/cluster-node   daemons: controller(init), worker(join/worker),
+                        herdr runtime supervisor, resource monitor, doctor
+RULE: herdcluster -> cluster-node/fleet/api-client -> bridge/net/core.
+cluster-core depends on nothing internal. api-client standalone.
 
 ARCHITECTURE: herdcluster speaks herdr's published API — newline-delimited
 JSON (NDJSON) over a local socket: write serde_json(request)+"\\n", read one
@@ -42,136 +58,163 @@ KEY FACTS (verified upstream, reference only — no source vendored):
 - Upstream `machine add` SSH path proves release-asset auto-install pattern.
 
 RULES: this repo contains ONLY original cluster code. Never vendor/copy herdr
-source. Apache-2.0 original code. Deps pinned, prefer versions >7 days old.
+source. Apache-2.0/MIT original code. Deps pinned, prefer versions >7 days old.
 Worker dials OUT only (no inbound ports). Pairing tokens single-use/short-
 lived. Agent CLI credentials are NEVER handled — detect + hint only.
 """
 
 # ============ EPIC M1: cluster core library ============
-b("m1-core", "M1: Cluster core library (identity, pairing, protocol, registry, config)", "epic", 1, None, (),
-  "Foundation module src/cluster/ with identity, pairing state machine,\n"
-  "wire protocol, worker registry, and config. Pure logic + unit tests,\n"
-  "no networking yet.\n" + CTX)
+b("m1-core", "M1: cluster-core crate (identity, pairing, protocol, registry, config, scheduler)", "epic", 1, None, (),
+  "crates/cluster-core: pure-logic crate (no I/O deps beyond std) with\n"
+  "identity, pairing FSM, wire codec, registry, config, scheduler scoring.\n"
+  "Unit tests everywhere.\n" + CTX)
 
 b("m1-identity", "Ed25519 cluster/worker identity module", "feature", 1, "m1-core", (),
-  "src/cluster/identity.rs: generate/load/store Ed25519 keypairs for cluster\n"
-  "(controller) and worker identities under herdcluster state dir. Public\n"
-  "key fingerprint = short human ID shown in `machines`. Sign/verify\n"
-  "challenge responses for post-pairing auth. Files 0600, atomic writes.\n"
-  "Unit tests: keygen roundtrip, tamper detection, fingerprint stability.\n" + CTX)
+  "crates/cluster-core/src/identity.rs: generate/load/store Ed25519 keypairs\n"
+  "for cluster (controller) and worker identities under herdcluster state\n"
+  "dir. Fingerprint = first 16 hex of SHA-256(pubkey) — short human ID in\n"
+  "`machines`. Sign/verify challenge responses for post-pairing auth.\n"
+  "Files 0600, atomic writes, corrupt-file detection. Unit tests: keygen\n"
+  "roundtrip, tamper detection, fingerprint stability, wrong-key reject.\n" + CTX)
 
 b("m1-pairing", "Pairing protocol state machine", "feature", 1, "m1-core", ["m1-identity"],
-  "src/cluster/pairing.rs: one-time 8-char human code (unambiguous alphabet,\n"
-  "~40 bits), 5-min TTL, single-use, constant-time compare, rate-limit\n"
-  "(max 5 attempts -> 60s lockout). States: AwaitingJoin -> PendingConfirm ->\n"
+  "crates/cluster-core/src/pairing.rs: one-time 8-char code (Crockford-\n"
+  "style alphabet: no 0/O/1/I/L, ~40 bits), 5-min TTL, single-use,\n"
+  "constant-time compare, rate-limit (max 5 attempts -> 60s lockout,\n"
+  "confirm timeout 120s). States: AwaitingJoin -> PendingConfirm ->\n"
   "Approved/Rejected/Expired. Controller confirm callback; worker wait\n"
   "timeout. Pure FSM — inject clock + rng. Tests: expiry, replay, lockout,\n"
-  "confirm/deny.\n" + CTX)
+  "confirm/deny, code entropy (no ambiguous chars).\n" + CTX)
 
 b("m1-protocol", "Cluster wire protocol codec", "feature", 1, "m1-core", ["m1-identity"],
-  "src/cluster/protocol.rs: length-prefixed frames. Messages: PairHello/\n"
-  "PairAccept/PairReject, WorkerHello{pubkey,hostname,caps,resources},\n"
-  "ApiStreamOpen{stream_id}/ApiStreamData{stream_id,bytes}/ApiStreamClose,\n"
-  "Heartbeat{seq}, Resources{cpu_cores,mem_total_mb,mem_available_mb,\n"
-  "agent_count,max_agents,load_avg,kinds[]}, Event{kind,payload}.\n"
-  "Stream 0 reserved for control; data streams carry raw herdr API bytes.\n"
-  "Property tests: roundtrip, truncation/garbage rejection, 16MiB frame cap.\n" + CTX)
+  "crates/cluster-core/src/protocol.rs: length-prefixed frames with\n"
+  "protocol_version field. Messages: PairHello/PairAccept/PairReject,\n"
+  "WorkerHello{pubkey,hostname,caps,resources,protocol_version},\n"
+  "ApiStreamOpen{stream_id}/ApiStreamData{stream_id,bytes}/\n"
+  "ApiStreamClose{stream_id,half_close}, Heartbeat{seq},\n"
+  "Resources{cpu_cores,mem_total_mb,mem_available_mb,agent_count,\n"
+  "max_agents,load_avg,kinds[]}, Event{kind,payload}. Stream 0 = control;\n"
+  "data streams carry raw herdr API bytes, per-stream ordering guaranteed,\n"
+  "half-close propagates FIN. Property tests: roundtrip, truncation/garbage,\n"
+  "16MiB frame cap, version mismatch reject.\n" + CTX)
 
 b("m1-registry", "Worker registry schema + persistence", "feature", 1, "m1-core", (),
-  "src/cluster/registry.rs + state layout under herdcluster state dir:\n"
-  "cluster.json {cluster_id,name,port,protocol_version,created_at};\n"
-  "workers.json {workers:[{worker_id,label,pubkey,paired_at,last_seen,\n"
-  "status,resources{...}}]}; credentials/ per-worker keys 0600. Registry is\n"
-  "HerdCluster-owned — do NOT touch herdr's endpoint catalog. Migration/\n"
-  "corruption tests; status transitions online/offline/degraded.\n" + CTX)
+  "crates/cluster-core/src/registry.rs + state layout: cluster.json\n"
+  "{cluster_id,name,port,protocol_version,created_at}; workers.json\n"
+  "{version,workers:[{worker_id,label,pubkey,paired_at,last_seen,status,\n"
+  "resources{...}}]}. Schema-versioned, atomic writes (tmp+rename+fsync),\n"
+  "0600 perms, corrupt-file quarantine (rename .bad, start fresh, warn).\n"
+  "Status FSM online/offline/degraded with last_seen TTL. Registry is\n"
+  "HerdCluster-owned — do NOT touch herdr's endpoint catalog. Tests:\n"
+  "migration, corruption, concurrent update safety.\n" + CTX)
 
 b("m1-config", "Cluster config + state dir layout", "task", 1, "m1-core", ["m1-identity"],
-  "src/cluster/config.rs: state_dir()/herdcluster/{identity.key,cluster.json,\n"
-  "workers.json,credentials/}. cluster.json: name (default hostname), port\n"
-  "47820, protocol_version=1. Env overrides HERDCLUSTER_PORT/\n"
-  "HERDCLUSTER_STATE_DIR for tests. machines.<label>.{max_agents,kinds_\n"
-  "override} config section. Tests: create/load/corrupt handling.\n" + CTX)
+  "crates/cluster-core/src/config.rs: state_dir()/herdcluster/{identity.key,\n"
+  "cluster.json,workers.json,credentials/,runtime/}. cluster.json: name\n"
+  "(default hostname), port 47820, protocol_version=1. machines.<label>.\n"
+  "{max_agents,kinds_override}. Env overrides HERDCLUSTER_PORT/\n"
+  "HERDCLUSTER_STATE_DIR for tests. Platform state-dir resolution helper.\n"
+  "Tests: create/load/corrupt/env-override.\n" + CTX)
+
+b("m1-scheduler", "Scheduler scoring (pure logic)", "feature", 1, "m1-core", (),
+  "crates/cluster-core/src/scheduler.rs: pure placement policy — input\n"
+  "WorkerCaps{online,enabled,kinds[],agent_count,max_agents,mem_available_mb,\n"
+  "label} + request{kind,machine_hint} -> Option<placement> or rejection\n"
+  "reasons per machine. Filter online+kind+under-cap; score mem headroom/\n"
+  "slot -> lowest agent_count -> label (deterministic). Local machine is\n"
+  "just another WorkerCaps. Exhaustive unit tests over fixture sets.\n" + CTX)
 
 # ============ EPIC M2: transport & discovery ============
-b("m2-transport", "M2: Transport, discovery, API bridge", "epic", 1, None,
+b("m2-transport", "M2: cluster-net + cluster-bridge crates", "epic", 1, None,
   ["m1-core"],
-  "TLS transport + stream mux + reconnect + LAN discovery + bridge that\n"
-  "tunnels herdr API socket bytes over the cluster connection. Loopback-\n"
-  "testable before real machines.\n" + CTX)
+  "TLS + mux + conn manager + discovery (cluster-net) and API bridge\n"
+  "(cluster-bridge) tunneling herdr API socket bytes. Loopback-testable.\n" + CTX)
 
 b("m2-tls", "TLS 1.3 layer with cluster CA", "feature", 1, "m2-transport", ["m1-identity"],
-  "rustls (pure Rust, Apache/MIT/ISC — verify license, pin >=7d old). At\n"
-  "`init` generate cluster CA + server cert; worker pins CA fingerprint\n"
-  "from pairing. Mutual auth: server cert + worker Ed25519 signed challenge.\n"
-  "Deps: rustls + rcgen (CA gen) — evaluate weight vs alternatives.\n"
-  "Tests: handshake ok/fail, wrong-pin rejection, expiry path.\n" + CTX)
+  "crates/cluster-net/src/tls.rs: rustls (Apache/MIT/ISC, pin >=7d). At\n"
+  "init generate cluster CA + server cert (rcgen or rustls-pemfile —\n"
+  "evaluate weight); worker pins CA fingerprint from pairing; mutual auth\n"
+  "via worker Ed25519 signed challenge (custom verifier). Cert SANs=localhost\n"
+  "+ worker hostname; 30-day expiry + rotation path. Tests: handshake ok/\n"
+  "fail, wrong-pin reject, expired cert, wrong-key signature reject.\n" + CTX)
 
 b("m2-mux", "Stream multiplexer over one TLS connection", "feature", 1, "m2-transport", ["m2-tls"],
-  "src/cluster/mux.rs: frames {stream_id u32, flags, len u32, payload};\n"
-  "stream 0 = control/protocol, 1..=N = API byte streams. No windowing MVP;\n"
+  "crates/cluster-net/src/mux.rs: frames {stream_id u32, flags, len u32,\n"
+  "payload}; stream 0 = control/protocol, 1..=N = API byte streams. Per-\n"
+  "stream ordering guaranteed; half-close propagates FIN; no windowing MVP;\n"
   "per-stream buffer cap 1MiB, max 64 streams/conn, backpressure (stop\n"
-  "reading when queue full). Tests: interleaved streams, reset, conn drop\n"
-  "cleanup, slow-consumer backpressure.\n" + CTX)
+  "reading when queue full). Tests: interleaved streams, ordering, reset,\n"
+  "conn drop cleanup, slow-consumer backpressure, half-close.\n" + CTX)
 
 b("m2-conn", "Connection manager: dial-out, heartbeat, reconnect", "feature", 1, "m2-transport", ["m2-mux"],
-  "Worker side: resolve controller addr, dial TLS, auth, register, heartbeat\n"
-  "5s / degraded-3-miss / offline-30s. Reconnect exp backoff 0.5s->30s jitter,\n"
-  "resume without re-pairing. Controller: accept, auth, per-worker session\n"
-  "task. tokio::time pause tests: heartbeat timeout, backoff, reconnect.\n" + CTX)
+  "crates/cluster-net/src/conn.rs: worker resolves controller addr, dials\n"
+  "TLS, auths, registers, heartbeats 5s / degraded-3-miss / offline-30s.\n"
+  "Reconnect exp backoff 0.5s->30s jittered; resume without re-pairing; on\n"
+  "reconnect all open streams fail typed worker_unreachable (no silent\n"
+  "resume of half-dead streams). Controller: accept, auth, per-worker\n"
+  "session task, conn migration handling. tokio::time pause tests.\n" + CTX)
 
 b("m2-discovery", "LAN discovery: mDNS + UDP broadcast fallback", "feature", 1, "m2-transport", (),
-  "src/cluster/discovery.rs: advertise `_herdcluster._tcp.local.` at init\n"
-  "(mdns-sd crate — check maturity/license); browse on join. Fallback UDP\n"
-  "broadcast hello/response on 47820/udp for mDNS-filtered LANs; WSL2 NAT\n"
-  "caveat -> also directed broadcast via Windows host; document mirrored\n"
-  "networking. `--discover` debug flag prints candidates; manual override\n"
-  "escape hatch. Tests: two localhost instances discover each other.\n" + CTX)
+  "crates/cluster-net/src/discovery.rs: advertise `_herdcluster._tcp.local.`\n"
+  "at init via mdns-sd (check maturity/license) with TXT records {port,\n"
+  "cluster_name, protocol_version}; browse on join. Fallback UDP broadcast\n"
+  "hello/response on 47820/udp for mDNS-filtered LANs; WSL2 NAT caveat ->\n"
+  "directed broadcast via Windows host; document mirrored networking.\n"
+  "Multiple controllers found -> list + pick/--controller hint. `--discover`\n"
+  "debug prints candidates; manual override escape hatch. Tests: two\n"
+  "localhost instances discover each other.\n" + CTX)
 
-b("m2-bridge", "API bridge: local socket <-> cluster stream <-> herdr API socket", "feature", 1, "m2-transport", ["m2-conn", "m1-protocol"],
-  "src/cluster/bridge.rs: controller binds private unix socket per worker\n"
-  "profile; on accept -> ApiStreamOpen on worker conn -> worker daemon opens\n"
-  "LOCAL herdr API socket -> bidirectional byte pipe -> ApiStreamClose.\n"
-  "Worker side implements its own proxy (herdcluster speaks NDJSON natively\n"
-  "— no remote-api-bridge subprocess needed). Failure reporting like\n"
-  "upstream SshStdioBridge.failure_rx pattern. Contract test: NDJSON client\n"
-  "through bridge socket gets identical responses to direct socket.\n" + CTX)
+b("m2-bridge", "cluster-bridge: local socket <-> cluster stream <-> herdr API socket", "feature", 1, "m2-transport", ["m2-conn", "m1-protocol"],
+  "crates/cluster-bridge: controller binds private unix socket per worker\n"
+  "profile (dir 0700, socket 0600); on accept -> ApiStreamOpen -> worker\n"
+  "daemon opens LOCAL herdr API socket -> bidirectional pipe -> Close/FIN.\n"
+  "Worker proxy is herdcluster-native (speaks NDJSON itself — no upstream\n"
+  "remote-api-bridge subprocess). Idle timeout for abandoned streams;\n"
+  "socket cleanup on exit/crash (pid-file + stale sweep). Failure reporting\n"
+  "pattern like upstream SshStdioBridge.failure_rx. Contract test: NDJSON\n"
+  "client through bridge socket == direct socket responses.\n" + CTX)
 
 b("m2-fault", "Transport fault-injection tests", "task", 1, "m2-transport", ["m2-bridge"],
   "Loopback harness: kill worker mid-request, partition 30s, duplicate\n"
-  "frames, oversized frame, half-close, slow consumer. Assert typed errors\n"
-  "(no hangs), socket cleanup, reconnect resumes, no cross-stream bleed.\n"
-  "Comprehensive logging (user requires great logs for verification).\n" + CTX)
+  "frames, oversized frame, half-close, slow consumer, conn flapping.\n"
+  "Assert typed errors (no hangs), socket cleanup, reconnect resumes, no\n"
+  "cross-stream bleed, stream death on reconnect. Comprehensive structured\n"
+  "logs (user requires great logs for verification).\n" + CTX)
 
 # ============ EPIC M3: services ============
-b("m3-services", "M3: init/join services + herdcluster CLI", "epic", 1, None,
+b("m3-services", "M3: cluster-node + herdcluster CLI services", "epic", 1, None,
   ["m2-transport"],
-  "`herdcluster init` controller + `herdcluster join`/`worker` daemon as\n"
-  "real commands; unified `machines`; agent-CLI and skill provisioning.\n" + CTX)
+  "init/join/worker services (cluster-node) + herdcluster bin CLI +\n"
+  "machines + provisioning + skill install + revoke/autostart/logging.\n" + CTX)
 
-b("m3-cli", "herdcluster standalone crate + CLI skeleton", "task", 1, "m3-services", ["m1-config"],
-  "Cargo project at repo root: bin `herdcluster`, src/main.rs argv dispatch,\n"
-  "src/cli.rs clap subcommands (init/join/worker/doctor/machines/spawn/\n"
-  "agent/status/skills/config). Standalone crate — NO herdr dependency, NO\n"
-  "herdr source. --json output modes from the start. `herdcluster --version\n"
-  "protocol_version`. Build must pass `cargo build --release` clean.\n" + CTX)
+b("m3-cli", "Workspace skeleton + herdcluster CLI", "task", 1, "m3-services", ["m1-config"],
+  "Root Cargo.toml [workspace] members=crates/*; crates/herdcluster bin:\n"
+  "main.rs argv dispatch -> cli.rs clap subcommands (init/join/worker/\n"
+  "doctor/machines/spawn/agent/status/skills/config/revoke). Thin bin —\n"
+  "all logic in library crates. --json output modes everywhere; structured\n"
+  "logging via tracing (RUST_LOG + --verbose/--quiet). `herdcluster\n"
+  "--version` prints protocol_version. cargo build --release --workspace\n"
+  "clean; cargo test --workspace green. NO herdr dependency, NO herdr\n"
+  "source anywhere in repo.\n" + CTX)
 
 b("m3-controller", "Controller service (init)", "feature", 1, "m3-services", ["m3-cli", "m2-discovery", "m1-pairing", "m1-identity"],
-  "`herdcluster init [--name] [--no-skills]`: create cluster identity +\n"
-  "cluster.json, mDNS advert + TCP listener 47820, pairing server (show\n"
-  "code, AwaitingJoin), accept worker conns -> registry entries, bridge\n"
-  "factory per worker. Foreground w/ status line; Ctrl-C clean shutdown.\n"
+  "crates/cluster-node/src/controller.rs: `herdcluster init [--name]\n"
+  "[--no-skills]` — create cluster identity + cluster.json, mDNS advert +\n"
+  "TCP listener 47820, pairing server (show code, AwaitingJoin), accept\n"
+  "worker conns -> registry entries, bridge factory per worker. Foreground\n"
+  "w/ status line; Ctrl-C clean shutdown (close listener, persist registry).\n"
   "Scripted join->register->list test.\n" + CTX)
 
 b("m3-worker", "Worker daemon (join) + herdr runtime supervisor", "feature", 1, "m3-services", ["m3-cli", "m2-conn", "m2-discovery", "m1-pairing"],
-  "`herdcluster join [--controller <hint>]`: discover, pair (show controller\n"
-  "name, confirm), store credential, then daemon mode: ensure herdr server\n"
-  "running — install latest herdr RELEASE BINARY for platform if missing\n"
-  "(platform detect + GitHub release asset download + checksum verify,\n"
-  "state dir herdcluster/runtime/; upstream herdrdev/herdr releases until\n"
-  "own releases exist — implement fresh, do NOT copy upstream code), start\n"
-  "server, resource monitor (cpu/mem/agent_count/kinds via local API + host\n"
-  "stats), connect-out loop. Autostart later (systemd user/launchd bead).\n"
-  "WSL2 mirrored-networking doc note.\n" + CTX)
+  "crates/cluster-node/src/worker.rs + runtime.rs: `herdcluster join\n"
+  "[--controller <hint>]` — discover, pair (show controller name, confirm),\n"
+  "store credential, then daemon: ensure herdr server running — install\n"
+  "latest herdr RELEASE BINARY for platform if missing (platform detect +\n"
+  "GitHub release asset download + checksum verify into\n"
+  "state_dir()/herdcluster/runtime/; upstream herdrdev/herdr releases until\n"
+  "own releases exist — implement FRESH, do NOT copy upstream code), start\n"
+  "server, resource monitor, connect-out loop. `herdcluster worker` =\n"
+  "daemon-only mode. WSL2 mirrored-networking doc note.\n" + CTX)
 
 b("m3-join-ux", "Pairing UX flow polish", "task", 1, "m3-services", ["m3-controller", "m3-worker"],
   "init prints cluster name + 'run herdcluster join on another machine';\n"
@@ -180,9 +223,25 @@ b("m3-join-ux", "Pairing UX flow polish", "task", 1, "m3-services", ["m3-control
   "success + next steps. Non-TTY: --yes/--json. Plain language, no jargon.\n" + CTX)
 
 b("m3-machines", "`herdcluster machines` unified listing", "feature", 1, "m3-services", ["m3-controller", "m3-worker", "m1-registry"],
-  "Table NAME TYPE OS STATUS AGENTS CPU MEM — cluster registry live data +\n"
-  "optional read-only `herdr machine list --json` SSH rows (display only,\n"
-  "never managed). --json stable schema for scripting.\n" + CTX)
+  "crates/cluster-fleet machines view: table NAME TYPE OS STATUS AGENTS CPU\n"
+  "MEM — cluster registry live data + optional read-only `herdr machine\n"
+  "list --json` SSH rows (display only, never managed). --json stable\n"
+  "schema for scripting.\n" + CTX)
+
+b("m3-revoke", "Worker revocation + removal", "feature", 1, "m3-services", ["m3-controller", "m1-registry"],
+  "`herdcluster revoke <worker>` / `herdcluster machine remove <worker>`:\n"
+  "remove registry entry, delete stored credential, close live conn, kill\n"
+  "open streams with typed error. Worker's next connect attempt must fail\n"
+  "auth (credential no longer accepted — verify server-side check, not just\n"
+  "registry absence). `machines` shows revoked state until worker re-pairs\n"
+  "with fresh code. Tests: revoke->reconnect rejected; re-pair works.\n" + CTX)
+
+b("m3-autostart", "Worker autostart on login/boot", "task", 2, "m3-services", ["m3-worker"],
+  "`herdcluster worker install-autostart` (or join flag): Linux/WSL ->\n"
+  "systemd user unit (linger note for WSL); macOS -> launchd plist.\n"
+  "Uninstall path too. WSL2 caveat: user units need lingering or Windows\n"
+  "startup script — document both, implement systemd first. Tests: unit\n"
+  "file content validation; manual verify on WSL2.\n" + CTX)
 
 b("m3-provisioning", "Agent CLI auto-provisioning on worker", "feature", 1, "m3-services", ["m3-worker"],
   "After pairing, probe each supported kind (via server.agent_manifests +\n"
@@ -199,8 +258,8 @@ b("m3-skills", "init auto-provisions orchestration skill into project", "feature
   "If missing, offer install of bundled copy (ship skill files in release\n"
   "assets — pattern like herdr's skills/herdr/SKILL.md). Consent-gated;\n"
   "never overwrite diverged versions without asking; `--no-skills` flag;\n"
-  "doctor check 'orchestration skill present'. herdcluster skills\n"
-  "install|status subcommands.\n" + CTX)
+  "doctor check 'orchestration skill present'. `herdcluster skills\n"
+  "install|status` subcommands.\n" + CTX)
 
 b("m3-e2e", "E2E: real Mac<->WSL2 pairing", "task", 0, "m3-services", ["m3-join-ux", "m3-machines"],
   "Manual e2e on real machines: fresh WSL2 Ubuntu, install herdcluster,\n"
@@ -209,71 +268,81 @@ b("m3-e2e", "E2E: real Mac<->WSL2 pairing", "task", 0, "m3-services", ["m3-join-
   "firewall prompts, timing. Fix blockers.\n" + CTX)
 
 # ============ EPIC M4: herdr API client ============
-b("m4-api", "M4: herdr API client (NDJSON) + method wrappers + compat", "epic", 1, None,
+b("m4-api", "M4: api-client crate (NDJSON) + methods + compat", "epic", 1, None,
   ["m3-e2e"],
-  "Minimal NDJSON client for herdr's published socket API + typed wrappers\n"
-  "for the method subset herdcluster needs + protocol-version compat guard.\n" + CTX)
+  "crates/api-client: minimal NDJSON client for herdr's published socket\n"
+  "API + typed wrappers for needed methods + protocol-version compat guard.\n" + CTX)
 
 b("m4-client", "NDJSON API client core", "feature", 1, "m4-api", (),
-  "src/api_client.rs: discover herdr API socket path per-OS (unix socket\n"
-  "under herdr state dir; HERDR_SOCKET_PATH env override; Windows named\n"
-  "pipe = later bead), connect, send {id,method,params}\\n, read one JSON\n"
-  "line, map to Result<value, ApiError{code,message}>. Timeouts per call\n"
-  "(default 30s, agent.wait longer). server_not_running detection -> typed\n"
-  "error 'start herdr first'. Unit tests with fake socket server (spawn\n"
-  "test NDJSON responder).\n" + CTX)
+  "crates/api-client/src/lib.rs (+platform/): discover herdr API socket\n"
+  "path per-OS (unix socket under herdr state dir; HERDR_SOCKET_PATH env\n"
+  "override; Windows named-pipe = later bead), connect, send\n"
+  "{id,method,params}\\n, read one JSON line, map to Result<value,\n"
+  "ApiError{code,message}>. FIRST verify against real herdr whether the\n"
+  "socket allows multiple requests per connection or is request-per-conn —\n"
+  "implement accordingly (request-per-conn is acceptable MVP). Unique\n"
+  "request ids; per-call timeouts (30s default, agent.wait longer).\n"
+  "server_not_running -> typed 'start herdr first' error. Tests: fake\n"
+  "NDJSON socket server fixture.\n" + CTX)
 
 b("m4-methods", "Typed wrappers for needed API method subset", "feature", 1, "m4-api", ["m4-client"],
-  "src/api_methods.rs: agent.{list,get,read,wait,prompt,send_keys,start,\n"
-  "rename,focus}, workspace.{list,create,get}, pane.{list,split,get},\n"
-  "worktree.{list,create}, server.agent_manifests, status.server,\n"
-  "api.snapshot. Params as serde structs matching upstream schema names\n"
-  "(snake_case). Each wrapper = thin fn over client.request. Tests vs fake\n"
-  "server fixtures; one live test gated on `herdr` binary presence.\n" + CTX)
+  "crates/api-client/src/methods.rs: agent.{list,get,read,wait,prompt,\n"
+  "send_keys,start,rename,focus}, workspace.{list,create,get},\n"
+  "pane.{list,split,get}, worktree.{list,create}, server.agent_manifests,\n"
+  "status.server, api.snapshot. Serde param structs matching upstream\n"
+  "snake_case schema names. Thin fns over client.request. Tests vs fake\n"
+  "server fixtures + one live test gated on `herdr` binary presence.\n" + CTX)
 
 b("m4-socketpath", "Platform API socket path discovery", "task", 1, "m4-api", ["m4-client"],
-  "src/platform/: resolve herdr API socket path on macOS/Linux (state dir\n"
-  "convention + session name), honor HERDR_SOCKET_PATH/HERDR_SESSION env,\n"
-  "Windows named-pipe path stub (MVP WSL2 only — document). Verify against\n"
-  "real herdr install on macOS. Tests per platform cfg.\n" + CTX)
+  "crates/api-client/src/platform/: resolve herdr API socket path on\n"
+  "macOS/Linux (state dir convention + session name), honor\n"
+  "HERDR_SOCKET_PATH/HERDR_SESSION env, Windows named-pipe stub (MVP\n"
+  "WSL2-only — document). Verify against real herdr install on macOS.\n"
+  "Per-platform cfg tests.\n" + CTX)
 
 b("m4-compat", "API compat guard + drift policy", "feature", 1, "m4-api", ["m4-methods"],
-  "On connect: status.server -> compare protocol/schema version against\n"
-  "compiled-in compat range -> mismatch = clear 'update herdcluster' error\n"
-  "(never silent wrong-behavior). Record which schema version tested; CI\n"
-  "fixture of recorded responses for regression. Document compat policy in\n"
-  "docs/herdcluster/COMPAT.md.\n" + CTX)
+  "On connect: status.server -> compare protocol/schema version vs\n"
+  "compiled-in compat range -> mismatch = clear 'update herdcluster'\n"
+  "error (never silent wrong-behavior). Record tested schema version; CI\n"
+  "fixture of recorded responses for regression. docs/herdcluster/\n"
+  "COMPAT.md policy doc.\n" + CTX)
 
 # ============ EPIC M5: fleet UX ============
-b("m5-fleet", "M5: Fleet UX — global IDs, list --all, spawn", "epic", 1, None,
+b("m5-fleet", "M5: cluster-fleet crate — global IDs, list --all, spawn", "epic", 1, None,
   ["m4-compat"],
-  "Global agent IDs {machine}/{name}, `agent list --all` fan-out, one-step\n"
-  "`spawn` helper composing workspace+pane+agent.start over the API client.\n" + CTX)
+  "crates/cluster-fleet: global agent IDs {machine}/{name}, `agent list\n"
+  "--all` fan-out, agent ops routing, one-step `spawn` composer over the\n"
+  "api-client.\n" + CTX)
 
 b("m5-global-id", "Global agent ID scheme + resolution", "feature", 1, "m5-fleet", ["m4-methods"],
-  "ID {machine-label}/{agent-name-or-terminal-id}; resolution: local herdr\n"
-  "API first -> parallel worker queries (short timeout) -> unique hit or\n"
-  "ambiguity error listing candidates; offline -> worker_unreachable.\n"
-  "Tests: resolution matrix (local hit, remote hit, ambiguous, offline).\n" + CTX)
+  "crates/cluster-fleet/src/ids.rs: ID {machine-label}/{agent-name-or-\n"
+  "terminal-id}; resolution: local herdr API first -> parallel worker\n"
+  "queries (short timeout) -> unique hit or ambiguity error listing\n"
+  "candidates; offline -> worker_unreachable. Tests: resolution matrix\n"
+  "(local hit, remote hit, ambiguous, offline, malformed ID).\n" + CTX)
 
 b("m5-list-all", "`agent list --all` fan-out merge", "feature", 1, "m5-fleet", ["m5-global-id"],
-  "Parallel agent.list to local + enabled workers; merge rows injecting\n"
-  "machine field; offline workers -> {machine,status:unreachable}; --json\n"
-  "stable schema; total budget <10s. Tests: merge ordering, offline,\n"
-  "timeout.\n" + CTX)
+  "crates/cluster-fleet/src/fleet.rs: parallel agent.list to local +\n"
+  "enabled workers; merge rows injecting machine field; offline workers\n"
+  "-> {machine,status:unreachable} placeholders; --json stable schema;\n"
+  "total budget <10s; deterministic ordering (machine label, then agent).\n"
+  "Tests: merge ordering, offline, timeout, empty fleet.\n" + CTX)
 
 b("m5-agent-ops", "agent ops accept global IDs", "feature", 1, "m5-fleet", ["m5-global-id"],
-  "herdcluster agent {get,read,wait,prompt,send-keys,rename} resolve global\n"
-  "ID -> machine -> API client (local or worker bridge). wait stays\n"
-  "per-machine. Typed JSON errors for unknown machine/ambiguous/offline.\n" + CTX)
+  "crates/cluster-fleet agent ops: get/read/wait/prompt/send-keys/rename\n"
+  "resolve global ID -> machine -> api-client endpoint (local socket or\n"
+  "worker bridge). wait stays per-machine (no cross-machine wait MVP).\n"
+  "Typed JSON errors: unknown_machine, ambiguous_agent, worker_unreachable.\n" + CTX)
 
 b("m5-spawn", "`herdcluster spawn` one-step helper", "feature", 1, "m5-fleet", ["m5-agent-ops"],
-  "spawn <NAME> --kind <KIND> --machine <label|auto> --repo <path>\n"
-  "[--branch] [--agent-arg...] [--json]: resolve machine -> pre-flight kind\n"
-  "support + agent CLI presence -> ensure workspace (list by cwd else\n"
-  "workspace.create) -> ensure dedicated pane -> agent.start -> wait\n"
-  "interactive_ready -> print global ID+machine+pane. --repo is TARGET-\n"
-  "LOCAL path (document). Default timeout 35s.\n" + CTX)
+  "crates/cluster-fleet/src/spawn.rs: spawn <NAME> --kind <KIND> --machine\n"
+  "<label|auto> --repo <path> [--branch] [--agent-arg...] [--json]: resolve\n"
+  "machine -> pre-flight kind support (server.agent_manifests) + agent CLI\n"
+  "presence (worker resources) -> ensure workspace (list by cwd else\n"
+  "workspace.create) -> ensure dedicated pane (pane.split or root pane —\n"
+  "document choice) -> agent.start -> wait interactive_ready -> print\n"
+  "global ID+machine+pane. --repo is TARGET-LOCAL path (document).\n"
+  "Default timeout 35s, --json machine-readable.\n" + CTX)
 
 b("m5-spawn-e2e", "E2E: spawn agents on both machines", "task", 0, "m5-fleet", ["m5-spawn"],
   "Real e2e: spawn claude on mac + codex on wsl; prompt, wait idle, agent\n"
@@ -281,44 +350,48 @@ b("m5-spawn-e2e", "E2E: spawn agents on both machines", "task", 0, "m5-fleet", [
   "Capture logs for docs.\n" + CTX)
 
 # ============ EPIC M6: scheduler ============
-b("m6-sched", "M6: Scheduler (--machine auto)", "epic", 2, None, ["m5-list-all"],
-  "Capacity-aware placement via worker-reported resources + kind support +\n"
-  "per-machine caps. Local machine competes equally.\n" + CTX)
+b("m6-sched", "M6: scheduler --machine auto", "epic", 2, None, ["m5-list-all"],
+  "Wire cluster-core scheduler scoring into placement: --machine auto\n"
+  "picks worker by reported resources + kind support + per-machine caps.\n" + CTX)
 
 b("m6-resources", "Worker resource reporting", "feature", 1, "m6-sched", ["m3-worker"],
-  "Worker daemon samples cpu_cores/mem_total/mem_available (portable:\n"
-  "sysinfo crate or /proc+sysctl), agent_count (local API), kinds (agent\n"
-  "manifests ∩ PATH), load_avg. Piggyback heartbeat Resources msg 15s +\n"
-  "on-change; controller caches last-seen in workers.json.\n" + CTX)
+  "crates/cluster-node/src/resources.rs: sample cpu_cores/mem_total/\n"
+  "mem_available (sysinfo crate or /proc+sysctl — pick portable),\n"
+  "agent_count (local API agent.list len), kinds (agent_manifests ∩ PATH),\n"
+  "load_avg. Piggyback heartbeat Resources msg 15s + on-change; controller\n"
+  "caches last-seen in workers.json. Local machine reports same shape.\n" + CTX)
 
-b("m6-policy", "Placement policy + `--machine auto`", "feature", 1, "m6-sched", ["m6-resources", "m5-spawn"],
-  "src/cluster/scheduler.rs: filter online+enabled+kind-supported+under-cap;\n"
-  "score mem headroom/slot -> lowest agent_count -> label; deterministic;\n"
-  "--machine auto resolves same path as explicit label; no candidate ->\n"
-  "error listing per-machine rejection reasons. Unit tests over fixtures.\n" + CTX)
+b("m6-policy", "Placement policy + `--machine auto` wiring", "feature", 1, "m6-sched", ["m6-resources", "m5-spawn"],
+  "crates/cluster-node placement: build WorkerCaps per machine (registry\n"
+  "resources + config caps + local stats) -> cluster-core scheduler ->\n"
+  "--machine auto resolves same path as explicit label in spawn/agent ops;\n"
+  "no candidate -> error listing per-machine rejection reasons.\n" + CTX)
 
 b("m6-caps", "Per-machine agent caps config", "task", 2, "m6-sched", ["m6-policy"],
   "cluster.json machines.<label>.{max_agents,kinds_override}; defaults\n"
   "max_agents=4 hard ceiling 8; `herdcluster config set` later — MVP edit\n"
-  "JSON + doctor validates. Tests: cap enforcement, config roundtrip.\n" + CTX)
+  "JSON + doctor validates ranges. Tests: cap enforcement in scheduler,\n"
+  "config roundtrip, invalid values rejected.\n" + CTX)
 
 # ============ EPIC M7: doctor ============
 b("m7-doctor", "M7: `herdcluster doctor [--fix]`", "epic", 2, None, ["m5-spawn-e2e"],
-  "Layered self-diagnostics, plain-language output, safe auto-fix.\n" + CTX)
+  "crates/cluster-node/src/doctor.rs: layered self-diagnostics, plain-\n"
+  "language output, safe auto-fix.\n" + CTX)
 
 b("m7-checks", "Doctor check suite", "feature", 1, "m7-doctor", ["m3-e2e"],
-  "Checks: cluster config -> discovery -> controller reachable / workers\n"
-  "registered -> auth/session -> TLS -> herdr server on worker -> herdr API\n"
-  "reachable + protocol compat -> per-kind agent CLI on PATH -> repo path\n"
-  "exists -> resources (disk>2GB, mem) -> worker daemon health -> orch\n"
-  "skill present. Each: name, status, plain-language reason, fix hint.\n"
-  "--machine scopes; default whole cluster; --json mode.\n" + CTX)
+  "Checks in order: cluster config -> discovery -> controller reachable /\n"
+  "workers registered -> auth/session -> TLS -> herdr server on worker ->\n"
+  "herdr API reachable + protocol compat -> per-kind agent CLI on PATH ->\n"
+  "repo path exists (if given) -> resources (disk>2GB, mem) -> worker\n"
+  "daemon health -> orchestration skill present. Each: name, status,\n"
+  "plain-language reason, fix hint. --machine scopes; default whole\n"
+  "cluster; --json mode; exit code reflects failures.\n" + CTX)
 
 b("m7-fix", "Doctor --fix remediations", "feature", 1, "m7-doctor", ["m7-checks"],
   "Safe auto-fix: restart worker daemon, guided re-pair on auth failure,\n"
-  "reload agent manifests, create state dirs, fix catalog perms, offer\n"
+  "reload agent manifests (via API), create state dirs, fix perms, offer\n"
   "skill install. Every fix prints what+why; --yes non-interactive; NEVER\n"
-  "fix silently. Tests per remediation.\n" + CTX)
+  "fix silently. Per-remediation tests.\n" + CTX)
 
 b("m7-fresh", "Fresh-machine doctor acceptance", "task", 0, "m7-doctor", ["m7-fix"],
   "Wipe WSL2 herdcluster state -> join -> doctor --fix -> all green without\n"
@@ -326,30 +399,31 @@ b("m7-fresh", "Fresh-machine doctor acceptance", "task", 0, "m7-doctor", ["m7-fi
   "becomes a bug bead.\n" + CTX)
 
 # ============ EPIC M8: packaging ============
-b("m8-release", "M8: Packaging, install, release, compat tracking", "epic", 2, None, ["m7-fresh"],
+b("m8-release", "M8: packaging, install, release, compat tracking", "epic", 2, None, ["m7-fresh"],
   "Installable herdcluster for macOS arm64 + Linux x64 (WSL2), release\n"
   "workflow, herdr-API compat tracking.\n" + CTX)
 
 b("m8-bins", "Release builds: macOS arm64 + Linux x64", "task", 1, "m8-release", ["m3-cli"],
-  "cargo build --release for aarch64-apple-darwin + x86_64-unknown-linux-gnu;\n"
-  "strip; size check; justfile targets; verify WSL2 run. Single static-ish\n"
-  "binary, no runtime deps.\n" + CTX)
+  "cargo build --release --workspace; cross-compile aarch64-apple-darwin +\n"
+  "x86_64-unknown-linux-gnu (zig or cross — pick pragmatic); strip; size\n"
+  "check; justfile targets; verify WSL2 run. Single binary output\n"
+  "(herdcluster bin only — lib crates are deps).\n" + CTX)
 
 b("m8-install", "Install script + WSL2 docs", "feature", 1, "m8-release", ["m8-bins"],
   "install.sh (curl|sh): detect OS/arch, download release asset, verify\n"
   "checksum, install ~/.local/bin, run `herdcluster doctor`. WSL2 guide:\n"
-  "mirrored networking if discovery fails, systemd user service autostart.\n"
-  "Docs in docs/herdcluster/.\n" + CTX)
+  "mirrored networking if discovery fails, systemd user service autostart,\n"
+  "uninstall path. Docs in docs/herdcluster/.\n" + CTX)
 
 b("m8-ci", "Release workflow + checksums", "feature", 1, "m8-release", ["m8-install"],
   ".github/workflows/release.yml: tag -> build mac+linux -> gh release +\n"
-  "checksums + install script. Version handshake: protocol_version in\n"
-  "WorkerHello/PairAccept; mismatch -> 'update herdcluster on X'.\n" + CTX)
+  "checksums + install script. protocol_version in WorkerHello/PairAccept;\n"
+  "mismatch -> 'update herdcluster on X'. cargo test --workspace in CI.\n" + CTX)
 
 b("m8-compat-track", "herdr API compat tracking", "task", 2, "m8-release", ["m4-compat"],
   "Track upstream herdrdev/herdr releases: watch api schema changes\n"
   "(docs/next/api/herdr-api.schema.json + Method enum), maintain compat\n"
-  "range in herdcluster, add fixture tests per schema version, document\n"
+  "range in api-client, add fixture tests per schema version, document\n"
   "policy in COMPAT.md. Alert path when newest herdr breaks compat range.\n" + CTX)
 
 # ---------- create ----------

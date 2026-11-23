@@ -53,6 +53,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "api-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -93,6 +101,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0921b3876b3a1df8a1c9f912e7f94342458022c2e84288015893d83c4d62a79"
 
 [[package]]
+name = "cluster-bridge"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cluster-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cluster-fleet"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cluster-net"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "cluster-node"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -108,7 +156,13 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "herdcluster"
 version = "0.1.0"
 dependencies = [
+ "api-client",
  "clap",
+ "cluster-bridge",
+ "cluster-core",
+ "cluster-fleet",
+ "cluster-net",
+ "cluster-node",
  "serde",
  "serde_json",
 ]
