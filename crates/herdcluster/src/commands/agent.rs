@@ -4,15 +4,16 @@
 //! herdr (`agent list` without `--all`, addressed as `local/<name>`).
 //! `get`/`read`/`prompt`/`send-keys`/`rename` take a global agent
 //! ID (`{machine}/{agent}`) and forward through `cluster-fleet` ops.
-//! `wait`/`watch` poll `agent.get` fleet-aware via [`cluster_fleet::agent_poll`].
-
-use std::collections::BTreeSet;
+//! `wait`/`watch` use herdr's event APIs (`agent.wait` / `events.subscribe`)
+//! fleet-aware via [`cluster_fleet::agent_wait_live`] /
+//! [`cluster_fleet::agent_watch_live`], falling back to `agent.get`
+//! polling on endpoints that can't express them.
 
 use api_client::methods::ReadSource;
 use cluster_fleet::{
-    agent_get, agent_poll, agent_prompt, agent_read, agent_rename, agent_send_keys,
-    list_all_agents, parse_duration, parse_until, AgentListRow, FleetContext, FleetError,
-    PollEvent, PollResult, WatchTuning, LOCAL_LABEL, WATCH_TERMINAL_STATUSES,
+    agent_get, agent_prompt, agent_read, agent_rename, agent_send_keys, agent_wait_live,
+    agent_watch_live, list_all_agents, parse_duration, parse_until, AgentListRow, FleetContext,
+    FleetError, PollEvent, PollResult, WatchTuning, LOCAL_LABEL,
 };
 
 use super::render::render_table;
@@ -163,7 +164,7 @@ fn wait_agent(
         } => stuck_warning(&id_owned, &status, elapsed_secs),
     };
 
-    match agent_poll(&ctx, &id_owned, &until_set, &tuning, &mut emit) {
+    match agent_wait_live(&ctx, &id_owned, &until_set, &tuning, &mut emit) {
         Ok(PollResult::Matched { status, agent }) => {
             if json {
                 emit_result(&agent, true);
@@ -206,13 +207,9 @@ fn wait_agent(
 }
 
 /// `agent watch` — stream status transitions until the agent reaches a
-/// terminal status ([`WATCH_TERMINAL_STATUSES`]), disappears, or the
-/// process is interrupted. `--json` emits one JSON object per line.
+/// terminal status, disappears, or the process is interrupted.
+/// `--json` emits one JSON object per line.
 fn watch_agent(id: &str, stuck_after: Option<&str>, json: bool, verbose: bool) -> i32 {
-    let until: BTreeSet<String> = WATCH_TERMINAL_STATUSES
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
     let mut tuning = match watch_tuning(None, stuck_after) {
         Ok(t) => t,
         Err(e) => {
@@ -268,7 +265,7 @@ fn watch_agent(id: &str, stuck_after: Option<&str>, json: bool, verbose: bool) -
         }
     };
 
-    let end_status = match agent_poll(&ctx, &id_owned, &until, &tuning, &mut emit) {
+    let end_status = match agent_watch_live(&ctx, &id_owned, &tuning, &mut emit) {
         Ok(PollResult::Matched { status, .. }) => Some(status),
         Ok(PollResult::Gone) => None,
         Ok(PollResult::TimedOut { .. }) => unreachable!("watch sets no timeout"),

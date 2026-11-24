@@ -58,6 +58,7 @@ pub use ops::{
 };
 pub use spawn::{spawn, MachineTarget, SpawnError, SpawnRequest, SpawnResult};
 pub use watch::{
-    agent_poll, agent_status, parse_duration, parse_until, poll_until, PollEvent, PollResult,
-    WatchTuning, DEFAULT_STUCK_AFTER, POLL_INTERVAL, WATCH_TERMINAL_STATUSES,
+    agent_pane_id, agent_poll, agent_status, agent_wait_live, agent_watch_live, parse_duration,
+    parse_until, poll_until, until_agent_statuses, PollEvent, PollResult, WatchTuning,
+    DEFAULT_STUCK_AFTER, POLL_INTERVAL, WATCH_TERMINAL_STATUSES,
 };

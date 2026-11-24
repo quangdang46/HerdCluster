@@ -180,7 +180,7 @@ pub(crate) enum AgentCommands {
         json: bool,
     },
     /// Wait for an agent to reach one of the given statuses
-    /// (fleet-aware: polls agent.get across local/remote endpoints)
+    /// (fleet-aware: herdr `agent.wait` with `agent.get` poll fallback)
     Wait {
         /// Global agent id `{machine}/{agent}` (e.g. `local/claude-1`)
         id: String,

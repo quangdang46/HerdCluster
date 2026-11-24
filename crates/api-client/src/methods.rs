@@ -16,10 +16,12 @@
 //! (matching upstream's optional/nullable conventions).
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::platform;
 use crate::{ApiClient, ApiError, DEFAULT_TIMEOUT};
 
 // ---------------------------------------------------------------------------
@@ -45,6 +47,36 @@ pub enum AgentStatus {
     Done,
     /// Status could not be determined.
     Unknown,
+}
+
+impl AgentStatus {
+    /// Parse a lowercase status string (`"idle"`, `"working"`, ...).
+    ///
+    /// Returns `None` for anything outside the upstream enum — callers
+    /// that match on raw status strings should treat that as "cannot be
+    /// expressed in `agent.wait`/`events.wait` params" and keep their
+    /// string-based path.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "idle" => AgentStatus::Idle,
+            "working" => AgentStatus::Working,
+            "blocked" => AgentStatus::Blocked,
+            "done" => AgentStatus::Done,
+            "unknown" => AgentStatus::Unknown,
+            _ => return None,
+        })
+    }
+
+    /// The wire string (inverse of [`AgentStatus::parse`]).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AgentStatus::Idle => "idle",
+            AgentStatus::Working => "working",
+            AgentStatus::Blocked => "blocked",
+            AgentStatus::Done => "done",
+            AgentStatus::Unknown => "unknown",
+        }
+    }
 }
 
 /// Pane read source (upstream `ReadSource`).
@@ -540,5 +572,215 @@ impl ApiClient {
     /// herdcluster-facing name `api_snapshot` for call-site clarity.
     pub fn api_snapshot(&self) -> Result<serde_json::Value, ApiError> {
         req(self, "session.snapshot", &EmptyParams {})
+    }
+}
+
+// ---------------------------------------------------------------------------
+// events.*
+// ---------------------------------------------------------------------------
+
+/// One subscription filter for [`ApiClient::events_subscribe`].
+///
+/// Upstream `Subscription` has many more variants (workspace/tab/pane
+/// lifecycle, `pane.output_matched`, `layout.updated`, ...); only the
+/// ones herdcluster consumes are modeled here. Wire names are the
+/// dotted upstream strings (`pane.agent_status_changed`, not the
+/// underscored event names used in streamed envelopes).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum Subscription {
+    /// Agent status changes on one pane. `agent_status: None` matches
+    /// every transition; `Some` filters server-side.
+    #[serde(rename = "pane.agent_status_changed")]
+    PaneAgentStatusChanged {
+        /// Pane to watch (from `agent.get`'s `pane_id`).
+        pane_id: String,
+        /// Optional status filter.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent_status: Option<AgentStatus>,
+    },
+    /// A pane's process exited (global subscription — filter by
+    /// `data.pane_id` client-side).
+    #[serde(rename = "pane.exited")]
+    PaneExited,
+    /// A pane was closed (global subscription — filter by
+    /// `data.pane_id` client-side).
+    #[serde(rename = "pane.closed")]
+    PaneClosed,
+}
+
+/// Params for [`ApiClient::events_subscribe`].
+#[derive(Debug, Clone, Serialize)]
+pub struct EventsSubscribeParams {
+    /// Subscription filters; events matching any of them are streamed.
+    pub subscriptions: Vec<Subscription>,
+}
+
+/// A live `events.subscribe` stream.
+///
+/// Unlike [`ApiClient::request`], the connection stays open and yields
+/// one subscription-event envelope per line. Verified on herdr 0.9.5:
+/// the first response line is the ack
+/// `{"id": ..., "result": {"type": "subscription_started"}}` (consumed
+/// by [`ApiClient::events_subscribe`]); every subsequent line is a bare
+/// `{"event": ..., "data": {...}}` envelope with **no** `id`/`result`
+/// wrapper (see the `subscription_event` schema in `herdr api schema`).
+pub struct EventStream {
+    reader: BufReader<Box<dyn platform::IoStream>>,
+}
+
+impl EventStream {
+    /// Read the next streamed event envelope.
+    ///
+    /// * `Ok(Some(value))` — one `{"event","data"}` envelope.
+    /// * `Ok(None)` — clean EOF: the server (or bridge) closed the
+    ///   stream. Callers may resubscribe.
+    /// * `Err(ApiError::Timeout)` — no line arrived within the read
+    ///   timeout the stream was opened with; treat as a tick and call
+    ///   `next_event` again.
+    /// * `Err(_)` — transport or parse failure; the stream is unusable.
+    pub fn next_event(&mut self) -> Result<Option<serde_json::Value>, ApiError> {
+        loop {
+            let mut line = String::new();
+            match self.reader.read_line(&mut line) {
+                Ok(0) => return Ok(None),
+                Ok(_) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(serde_json::from_str(trimmed)?));
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    return Err(ApiError::Timeout)
+                }
+                Err(e) => return Err(ApiError::Io(e)),
+            }
+        }
+    }
+}
+
+impl ApiClient {
+    /// `events.subscribe` — open a streaming event subscription.
+    ///
+    /// `timeout` becomes the stream's per-read idle timeout: once the
+    /// ack is consumed, [`EventStream::next_event`] returns
+    /// [`ApiError::Timeout`] whenever no event arrives within `timeout`,
+    /// which callers can use as a periodic tick (e.g. for stuck-agent
+    /// warnings) without dropping the subscription.
+    ///
+    /// On endpoints that don't implement `events.subscribe` (older
+    /// herdr, restricted bridges) this fails with
+    /// [`ApiError::Server`] — callers should treat that as "fall back to
+    /// polling".
+    pub fn events_subscribe(
+        &self,
+        params: &EventsSubscribeParams,
+        timeout: Duration,
+    ) -> Result<EventStream, ApiError> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request = serde_json::json!({
+            "id": format!("hc-{id}"),
+            "method": "events.subscribe",
+            "params": serde_json::to_value(params)?,
+        });
+        let mut line = serde_json::to_vec(&request)?;
+        line.push(b'\n');
+
+        let mut stream = platform::connect(&self.socket_path, timeout)?;
+        stream.write_all(&line)?;
+        stream.flush()?;
+
+        // Consume the ack line, which shares the request/response
+        // envelope: {"id","result":{"type":"subscription_started"}} or
+        // {"id","error":{...}}.
+        let mut reader = BufReader::new(stream);
+        let mut ack = String::new();
+        match reader.read_line(&mut ack) {
+            Ok(0) => {
+                return Err(ApiError::Server {
+                    code: "connection_closed".to_string(),
+                    message: "herdr closed the connection without a response".to_string(),
+                })
+            }
+            Ok(_) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(ApiError::Timeout)
+            }
+            Err(e) => return Err(ApiError::Io(e)),
+        }
+        let envelope: serde_json::Value = serde_json::from_str(ack.trim_end())?;
+        if let Some(error) = envelope.get("error") {
+            let code = error
+                .get("code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("herdr API error")
+                .to_string();
+            return Err(ApiError::Server { code, message });
+        }
+        if envelope.get("result").is_none() {
+            return Err(ApiError::Server {
+                code: "invalid_response".to_string(),
+                message: "herdr subscribe response had neither 'result' nor 'error'".to_string(),
+            });
+        }
+        Ok(EventStream { reader })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_status_parse_roundtrip() {
+        for s in ["idle", "working", "blocked", "done", "unknown"] {
+            let parsed = AgentStatus::parse(s).unwrap();
+            assert_eq!(parsed.as_str(), s);
+        }
+        assert!(AgentStatus::parse("paused").is_none());
+        assert!(AgentStatus::parse("Idle").is_none());
+        assert!(AgentStatus::parse("").is_none());
+    }
+
+    #[test]
+    fn subscription_wire_shape() {
+        let params = EventsSubscribeParams {
+            subscriptions: vec![
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: "w2:p1".into(),
+                    agent_status: Some(AgentStatus::Done),
+                },
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: "w2:p2".into(),
+                    agent_status: None,
+                },
+                Subscription::PaneExited,
+                Subscription::PaneClosed,
+            ],
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"subscriptions": [
+                {"type": "pane.agent_status_changed", "pane_id": "w2:p1", "agent_status": "done"},
+                {"type": "pane.agent_status_changed", "pane_id": "w2:p2"},
+                {"type": "pane.exited"},
+                {"type": "pane.closed"},
+            ]})
+        );
     }
 }

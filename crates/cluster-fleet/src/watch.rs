@@ -1,26 +1,40 @@
-//! Fleet-aware `agent wait` / `agent watch`: client-side polling of
-//! `agent.get` through the resolved machine endpoint.
+//! Fleet-aware `agent wait` / `agent watch`.
 //!
-//! [`ops::agent_wait`] forwards to the machine's own blocking
-//! `agent.wait` method. This module instead polls `agent.get` on a fixed
-//! interval ([`POLL_INTERVAL`]) so the orchestrator gets uniform behavior
-//! across the local socket and remote bridge endpoints — and can detect
-//! stuck agents, which a blocking server-side wait cannot.
+//! Both prefer herdr's real event/wait APIs routed through the resolved
+//! machine endpoint (local socket or worker bridge — the bridge pipes
+//! bytes verbatim, so streaming subscriptions work remotely too):
 //!
-//! The poll loop ([`poll_until`]) is generic over the fetch closure so
-//! unit tests drive it with a fake `agent.get` — no sockets involved.
-//! [`agent_poll`] is the production wiring: it resolves the global ID
-//! once via [`ops::resolve_and_connect`] (local socket or bridge, same
-//! routing as `agent get`/`read`) and polls `agent.get` on that endpoint.
+//! * [`agent_wait_live`] uses the server-side blocking `agent.wait`
+//!   method. When `--stuck-after` is enabled a lightweight `agent.get`
+//!   monitor runs concurrently (on this thread) purely to emit
+//!   [`PollEvent::Status`]/[`PollEvent::Stuck`]; the server call stays
+//!   authoritative for the outcome. With stuck detection off it is a
+//!   single blocking request — no polling at all.
+//! * [`agent_watch_live`] streams `events.subscribe` filtered to the
+//!   agent's pane, with `pane.exited`/`pane.closed` for gone-detection.
+//!
+//! Both fall back to the client-side poll loop ([`agent_poll`], fixed
+//! [`POLL_INTERVAL`]) when the endpoint can't express the request —
+//! older herdr without `agent.wait`/`events.subscribe`, an `--until`
+//! status outside the upstream `AgentStatus` enum, or a missing
+//! `pane_id`. The poll loop ([`poll_until`]) is generic over the fetch
+//! closure so unit tests drive it with a fake `agent.get` — no sockets
+//! involved. [`agent_poll`] is the production wiring: it resolves the
+//! global ID once via [`ops::resolve_and_connect`] (local socket or
+//! bridge, same routing as `agent get`/`read`) and polls `agent.get` on
+//! that endpoint.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
+use api_client::methods::{AgentStatus, EventsSubscribeParams, Subscription, WaitOptions};
+use api_client::ApiError;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::endpoint::FleetContext;
 use crate::error::FleetError;
+use crate::ids::ResolvedAgent;
 use crate::ops;
 use crate::parse;
 
@@ -295,6 +309,515 @@ pub fn agent_poll(
     poll_until(&mut fetch, until, tuning, emit)
 }
 
+// ---------------------------------------------------------------------------
+// Event-API fast paths (`agent.wait` / `events.subscribe`) with poll fallback
+// ---------------------------------------------------------------------------
+
+/// Read timeout for `events.subscribe` streams. Doubles as the
+/// stuck-check tick: [`api_client::methods::EventStream::next_event`]
+/// returns [`ApiError::Timeout`] whenever no event arrives within this
+/// window.
+const STREAM_TICK: Duration = Duration::from_secs(1);
+/// Pause between resubscribe/retry attempts after a dropped stream or a
+/// transient `agent.get` failure mid-watch.
+const RESUBSCRIBE_DELAY: Duration = Duration::from_millis(500);
+/// Consecutive subscribe/resolve failures tolerated mid-watch before
+/// surfacing a real error (covers bridge reconnects, herdr restarts).
+const MAX_STREAM_RETRIES: u32 = 5;
+/// Client-side slack added on top of the server-side `agent.wait`
+/// `timeout_ms`, so the server's own timeout error wins the race.
+const WAIT_CLIENT_SLACK: Duration = Duration::from_secs(30);
+/// Far-future client bound for waits with no `--timeout`: the server
+/// waits indefinitely, so this only guards against a wedged connection.
+const WAIT_CLIENT_MAX: Duration = Duration::from_secs(31_536_000); // ~1 year
+
+/// Map a `--until` status set to upstream [`AgentStatus`] values.
+///
+/// Returns `None` when any token has no upstream equivalent — the poll
+/// loop accepts arbitrary status strings, `agent.wait` cannot.
+pub fn until_agent_statuses(until: &BTreeSet<String>) -> Option<Vec<AgentStatus>> {
+    until.iter().map(|s| AgentStatus::parse(s)).collect()
+}
+
+/// Extract `pane_id` from an `agent.get` (`agent_info`) response,
+/// tolerating the `{"agent": {...}}` envelope.
+pub fn agent_pane_id(value: &Value) -> Option<String> {
+    let inner = parse::unwrap_entity(value, "agent");
+    parse::str_field(inner, &["pane_id"])
+        .or_else(|| parse::str_field(value, &["pane_id"]))
+        .map(str::to_string)
+}
+
+/// Server error codes meaning "this endpoint has no `agent.wait`" —
+/// herdr rejects unknown method variants as `invalid_request`, and
+/// older/alternate servers may use explicit unsupported markers. Any of
+/// these → caller falls back to polling (which is always correct).
+fn is_unsupported_wait_code(code: &str) -> bool {
+    matches!(
+        code,
+        "invalid_request"
+            | "unknown_method"
+            | "method_not_found"
+            | "unsupported_method"
+            | "unimplemented"
+    ) || code.contains("unsupported")
+}
+
+/// True when an [`ApiError`] is the *server-side* wait timeout
+/// (`{"code":"timeout"}`), as opposed to a client-side read timeout
+/// ([`ApiError::Timeout`]), which is a reachability failure.
+fn is_server_timeout(e: &ApiError) -> bool {
+    matches!(e, ApiError::Server { code, .. } if code == "timeout")
+}
+
+/// Map an `agent.wait` API error to a wait outcome:
+///
+/// * `Ok(None)` — endpoint can't do server-side waits; caller polls.
+/// * `Ok(Some(PollResult::Gone))` — agent target does not exist.
+/// * `Ok(Some(PollResult::TimedOut))` — server-side `timeout_ms` elapsed.
+/// * `Err` — real failure (unreachable, protocol, ...).
+///
+/// `last_status` fills [`PollResult::TimedOut`]; callers pass the last
+/// observed status (monitor loop) or fetch one best-effort.
+fn classify_wait_error(
+    resolved: &ResolvedAgent,
+    e: ApiError,
+    last_status: Option<String>,
+) -> Result<Option<PollResult>, FleetError> {
+    if let ApiError::Server { code, .. } = &e {
+        // Order matters: unsupported checks run before the not-found
+        // predicate because codes like `unknown_method` contain
+        // "unknown", which the not-found family also matches.
+        if is_unsupported_wait_code(code) {
+            return Ok(None);
+        }
+        if crate::ids::agent_not_found(&resolved.machine, &resolved.agent, code).is_some() {
+            return Ok(Some(PollResult::Gone));
+        }
+        if code == "timeout" {
+            return Ok(Some(PollResult::TimedOut { last_status }));
+        }
+    }
+    Err(ops::op_error(resolved, e))
+}
+
+/// Best-effort current status, used to fill `TimedOut.last_status`.
+fn last_agent_status(client: &api_client::ApiClient, target: &str) -> Option<String> {
+    client.agent_get(target).ok().and_then(|v| agent_status(&v))
+}
+
+/// Try herdr's server-side `agent.wait` for `global_id`.
+///
+/// `until` must already be mapped via [`until_agent_statuses`]. Returns
+/// `Ok(Some(PollResult))` when the wait resolved server-side,
+/// `Ok(None)` when the endpoint rejected `agent.wait` (caller falls back
+/// to [`agent_poll`]), `Err` on real failures.
+///
+/// With `tuning.stuck_after` set, the blocking call runs on a helper
+/// thread while this thread polls `agent.get` at `tuning.interval` —
+/// solely to emit [`PollEvent::Status`]/[`PollEvent::Stuck`]; the server
+/// call decides the outcome. Without it this is a single blocking
+/// request — no polling at all.
+fn agent_wait_server(
+    ctx: &FleetContext,
+    global_id: &str,
+    until: &[AgentStatus],
+    tuning: &WatchTuning,
+    emit: &mut dyn FnMut(PollEvent),
+) -> Result<Option<PollResult>, FleetError> {
+    let (resolved, client) = ops::resolve_and_connect(ctx, global_id)?;
+    let target = resolved.agent.clone();
+
+    let timeout_ms = tuning
+        .timeout
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let wait = WaitOptions {
+        timeout_ms,
+        until: Some(until.to_vec()),
+    };
+    // The client-side bound must exceed the server-side timeout_ms or
+    // the client gives up first; with no --timeout the server waits
+    // indefinitely, so use a far-future bound.
+    let client_timeout = tuning
+        .timeout
+        .map(|t| t + WAIT_CLIENT_SLACK)
+        .unwrap_or(WAIT_CLIENT_MAX);
+
+    if tuning.stuck_after.is_none() {
+        // Pure server-side wait — no polling at all.
+        return match client.agent_wait_with_timeout(&target, Some(wait), client_timeout) {
+            Ok(v) => Ok(Some(PollResult::Matched {
+                status: agent_status(&v).unwrap_or_else(|| "unknown".to_string()),
+                agent: v,
+            })),
+            Err(e) => {
+                let last = if is_server_timeout(&e) {
+                    last_agent_status(&client, &target)
+                } else {
+                    None
+                };
+                classify_wait_error(&resolved, e, last)
+            }
+        };
+    }
+
+    // Stuck detection enabled: block on agent.wait in a helper thread and
+    // monitor agent.get here for Status/Stuck events. The spawned thread
+    // is detached — if we return early it dies with the process and its
+    // in-flight server-side wait is harmless.
+    let wait_client = resolved.endpoint.client()?;
+    let wait_target = target.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let res = wait_client.agent_wait_with_timeout(&wait_target, Some(wait), client_timeout);
+        let _ = tx.send(res);
+    });
+
+    let start = Instant::now();
+    let monitor_deadline = client_timeout;
+    let mut prev_status: Option<String> = None;
+    let mut status_since = start;
+    let mut stuck_warned = false;
+    let mut last_status: Option<String> = None;
+
+    let server_result = loop {
+        if start.elapsed() >= monitor_deadline {
+            break None;
+        }
+        // One observation per interval. Fetch errors are ignored — the
+        // server wait is authoritative and surfaces real failures.
+        if let Ok(v) = client.agent_get(&target) {
+            let status = agent_status(&v).unwrap_or_else(|| "unknown".to_string());
+            last_status = Some(status.clone());
+            if prev_status.as_deref() != Some(status.as_str()) {
+                emit(PollEvent::Status {
+                    from: prev_status.clone(),
+                    to: status.clone(),
+                });
+                prev_status = Some(status.clone());
+                status_since = Instant::now();
+                stuck_warned = false;
+            }
+            if let Some(threshold) = tuning.stuck_after {
+                let busy = BUSY_STATUSES.contains(&status.as_str());
+                if busy && !stuck_warned && status_since.elapsed() >= threshold {
+                    emit(PollEvent::Stuck {
+                        status: status.clone(),
+                        elapsed_secs: status_since.elapsed().as_secs(),
+                    });
+                    stuck_warned = true;
+                }
+            }
+        }
+        let remaining = monitor_deadline.saturating_sub(start.elapsed());
+        let nap = tuning.interval.min(remaining);
+        if nap.is_zero() {
+            break None;
+        }
+        match rx.recv_timeout(nap) {
+            Ok(res) => break Some(res),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Wait thread died without sending (panic) — keep
+                // monitoring until the deadline.
+                std::thread::sleep(nap);
+            }
+        }
+    };
+
+    match server_result {
+        Some(Ok(v)) => Ok(Some(PollResult::Matched {
+            status: agent_status(&v).unwrap_or_else(|| "unknown".to_string()),
+            agent: v,
+        })),
+        Some(Err(e)) => classify_wait_error(&resolved, e, last_status),
+        // Server never answered within the client bound — report as a
+        // wait timeout with the last observed status.
+        None => Ok(Some(PollResult::TimedOut { last_status })),
+    }
+}
+
+/// `agent wait` entry point: prefer herdr's server-side `agent.wait`
+/// ([`agent_wait_server`]); fall back to the client-side [`agent_poll`]
+/// loop when the until-set can't be expressed upstream or the endpoint
+/// rejects the method. Matched/gone/timeout semantics are identical
+/// either way.
+pub fn agent_wait_live(
+    ctx: &FleetContext,
+    global_id: &str,
+    until: &BTreeSet<String>,
+    tuning: &WatchTuning,
+    emit: &mut dyn FnMut(PollEvent),
+) -> Result<PollResult, FleetError> {
+    let Some(statuses) = until_agent_statuses(until) else {
+        return agent_poll(ctx, global_id, until, tuning, emit);
+    };
+    match agent_wait_server(ctx, global_id, &statuses, tuning, emit)? {
+        Some(result) => Ok(result),
+        None => agent_poll(ctx, global_id, until, tuning, emit),
+    }
+}
+
+/// What one streamed `{"event","data"}` subscription envelope means for
+/// `agent watch`.
+enum StreamEvent {
+    /// `pane_agent_status_changed` for our pane — carries the new status
+    /// and the event's `data` payload (used as the `Matched.agent` value).
+    Status { status: String, data: Value },
+    /// `pane_exited`/`pane.closed` for our pane — the agent's pane is gone.
+    Gone,
+    /// Anything else (other panes' lifecycle events, unknown kinds).
+    Ignore,
+}
+
+/// Classify one subscription envelope against the pane being watched.
+/// `pane.agent_status_changed` arrives server-filtered to `pane_id`;
+/// `pane.exited`/`pane.closed` are global subscriptions, so their
+/// `data.pane_id` is checked here.
+fn classify_stream_event(event: &Value, pane_id: &str) -> StreamEvent {
+    let kind = event.get("event").and_then(Value::as_str);
+    let data = event.get("data");
+    let data_pane = data.and_then(|d| d.get("pane_id")).and_then(Value::as_str);
+    match kind {
+        Some("pane_agent_status_changed") => {
+            if data_pane != Some(pane_id) {
+                return StreamEvent::Ignore;
+            }
+            let status = data
+                .and_then(|d| d.get("agent_status").or_else(|| d.get("status")))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_lowercase();
+            StreamEvent::Status {
+                status,
+                data: data.cloned().unwrap_or(Value::Null),
+            }
+        }
+        Some("pane_exited") | Some("pane_closed") => {
+            if data_pane == Some(pane_id) {
+                StreamEvent::Gone
+            } else {
+                StreamEvent::Ignore
+            }
+        }
+        _ => StreamEvent::Ignore,
+    }
+}
+
+/// `agent watch` via `events.subscribe`: resolve the agent's pane, then
+/// stream `pane.agent_status_changed` (pane-filtered server-side) plus
+/// global `pane.exited`/`pane.closed` (filtered client-side) for
+/// gone-detection.
+///
+/// Returns `Ok(Some(PollResult))` on terminal status or gone,
+/// `Ok(None)` when the endpoint can't stream (caller falls back to
+/// [`agent_poll`] — nothing has been emitted yet at that point, so the
+/// fallback doesn't duplicate events), `Err` on real mid-stream
+/// failures. A clean EOF (server/bridge closed the stream) triggers
+/// resubscribe with a fresh `agent.get`, which also re-resolves the pane
+/// if the agent moved.
+///
+/// Known limitation: while a stream is live the pane is not re-resolved;
+/// an agent that moves panes mid-watch stops producing events until the
+/// next reconnect.
+fn agent_watch_stream(
+    ctx: &FleetContext,
+    global_id: &str,
+    tuning: &WatchTuning,
+    emit: &mut dyn FnMut(PollEvent),
+) -> Result<Option<PollResult>, FleetError> {
+    let (resolved, client) = ops::resolve_and_connect(ctx, global_id)?;
+    let target = resolved.agent.clone();
+
+    let mut prev_status: Option<String> = None;
+    let mut status_since = Instant::now();
+    let mut stuck_warned = false;
+    let mut emitted_initial = false;
+    let mut subscribe_failures = 0u32;
+    let mut resolve_failures = 0u32;
+
+    loop {
+        // (Re)resolve the agent: fresh pane_id + baseline status. On
+        // reconnects this also picks up pane moves.
+        let info = match client.agent_get(&target) {
+            Ok(v) => {
+                resolve_failures = 0;
+                v
+            }
+            Err(e) => {
+                if let ApiError::Server { code, .. } = &e {
+                    if crate::ids::agent_not_found(&resolved.machine, &resolved.agent, code)
+                        .is_some()
+                    {
+                        return Ok(Some(PollResult::Gone));
+                    }
+                }
+                if !emitted_initial {
+                    // Nothing emitted yet — let the poll loop produce
+                    // the proper typed error.
+                    return Ok(None);
+                }
+                // Mid-watch fetch failure — retry through transient
+                // bridge/socket drops rather than erroring out.
+                resolve_failures += 1;
+                if resolve_failures > MAX_STREAM_RETRIES {
+                    return Err(ops::op_error(&resolved, e));
+                }
+                std::thread::sleep(RESUBSCRIBE_DELAY);
+                continue;
+            }
+        };
+        let Some(pane_id) = agent_pane_id(&info) else {
+            if !emitted_initial {
+                return Ok(None);
+            }
+            // Mid-watch: a response without pane_id is malformed —
+            // count it like a resolve failure.
+            resolve_failures += 1;
+            if resolve_failures > MAX_STREAM_RETRIES {
+                return Err(FleetError::Api {
+                    message: format!("agent {target:?} response has no pane_id"),
+                });
+            }
+            std::thread::sleep(RESUBSCRIBE_DELAY);
+            continue;
+        };
+        let baseline = agent_status(&info).unwrap_or_else(|| "unknown".to_string());
+
+        let params = EventsSubscribeParams {
+            subscriptions: vec![
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: pane_id.clone(),
+                    agent_status: None,
+                },
+                Subscription::PaneExited,
+                Subscription::PaneClosed,
+            ],
+        };
+
+        let mut stream = loop {
+            match client.events_subscribe(&params, STREAM_TICK) {
+                Ok(s) => {
+                    subscribe_failures = 0;
+                    break s;
+                }
+                Err(_) if !emitted_initial => return Ok(None),
+                Err(e) => {
+                    subscribe_failures += 1;
+                    if subscribe_failures > MAX_STREAM_RETRIES {
+                        return Err(ops::op_error(&resolved, e));
+                    }
+                    std::thread::sleep(RESUBSCRIBE_DELAY);
+                }
+            }
+        };
+
+        // Baseline observation — same shape the poll loop emits on its
+        // first fetch (from: null). On reconnects, a status that drifted
+        // while the stream was down surfaces as a normal transition.
+        if !emitted_initial {
+            emit(PollEvent::Status {
+                from: None,
+                to: baseline.clone(),
+            });
+            prev_status = Some(baseline.clone());
+            status_since = Instant::now();
+            emitted_initial = true;
+        } else if prev_status.as_deref() != Some(baseline.as_str()) {
+            emit(PollEvent::Status {
+                from: prev_status.clone(),
+                to: baseline.clone(),
+            });
+            prev_status = Some(baseline.clone());
+            status_since = Instant::now();
+            stuck_warned = false;
+        }
+        // The agent may already be terminal (fresh agent.get or drift
+        // during a reconnect) — don't wait for a transition that will
+        // never come.
+        if WATCH_TERMINAL_STATUSES.contains(&baseline.as_str()) {
+            return Ok(Some(PollResult::Matched {
+                status: baseline,
+                agent: info,
+            }));
+        }
+
+        // Read events until EOF (resubscribe), a fatal error, or a
+        // terminal status / gone.
+        loop {
+            let event = match stream.next_event() {
+                Ok(Some(v)) => Some(v),
+                Ok(None) => break, // EOF → outer loop resubscribes
+                // Read tick: no event within STREAM_TICK.
+                Err(ApiError::Timeout) => None,
+                Err(e) => return Err(ops::op_error(&resolved, e)),
+            };
+            if let Some(v) = event {
+                match classify_stream_event(&v, &pane_id) {
+                    StreamEvent::Status { status, data } => {
+                        let changed = prev_status.as_deref() != Some(status.as_str());
+                        if changed {
+                            emit(PollEvent::Status {
+                                from: prev_status.clone(),
+                                to: status.clone(),
+                            });
+                            prev_status = Some(status.clone());
+                            status_since = Instant::now();
+                            stuck_warned = false;
+                        }
+                        if WATCH_TERMINAL_STATUSES.contains(&status.as_str()) {
+                            return Ok(Some(PollResult::Matched {
+                                status,
+                                agent: data,
+                            }));
+                        }
+                    }
+                    StreamEvent::Gone => return Ok(Some(PollResult::Gone)),
+                    StreamEvent::Ignore => {}
+                }
+            }
+            // Stuck check runs on every wake — event or tick.
+            if let Some(threshold) = tuning.stuck_after {
+                let busy = prev_status
+                    .as_deref()
+                    .map(|s| BUSY_STATUSES.contains(&s))
+                    .unwrap_or(false);
+                if busy && !stuck_warned && status_since.elapsed() >= threshold {
+                    if let Some(status) = prev_status.clone() {
+                        emit(PollEvent::Stuck {
+                            status,
+                            elapsed_secs: status_since.elapsed().as_secs(),
+                        });
+                        stuck_warned = true;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(RESUBSCRIBE_DELAY);
+    }
+}
+
+/// `agent watch` entry point: stream pane agent-status events via
+/// `events.subscribe` ([`agent_watch_stream`]); fall back to the
+/// client-side [`agent_poll`] loop when the endpoint can't stream.
+/// Terminates on [`WATCH_TERMINAL_STATUSES`], agent gone, or error —
+/// same outcomes as the poll loop.
+pub fn agent_watch_live(
+    ctx: &FleetContext,
+    global_id: &str,
+    tuning: &WatchTuning,
+    emit: &mut dyn FnMut(PollEvent),
+) -> Result<PollResult, FleetError> {
+    let until: BTreeSet<String> = WATCH_TERMINAL_STATUSES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    match agent_watch_stream(ctx, global_id, tuning, emit)? {
+        Some(result) => Ok(result),
+        None => agent_poll(ctx, global_id, &until, tuning, emit),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +1084,124 @@ mod tests {
         )
         .unwrap();
         assert!(!events.iter().any(|e| matches!(e, PollEvent::Stuck { .. })));
+    }
+
+    // ---- event-API helpers -------------------------------------------------
+
+    fn resolved() -> ResolvedAgent {
+        ResolvedAgent {
+            machine: "local".into(),
+            agent: "a".into(),
+            endpoint: crate::endpoint::MachineEndpoint {
+                label: "local".into(),
+                socket_path: "/tmp/nonexistent.sock".into(),
+                kind: crate::endpoint::MachineKind::Local,
+            },
+        }
+    }
+
+    fn server_err(code: &str) -> ApiError {
+        ApiError::Server {
+            code: code.into(),
+            message: "boom".into(),
+        }
+    }
+
+    #[test]
+    fn until_agent_statuses_maps_known_and_rejects_unknown() {
+        let set = until(&["done", "idle", "blocked", "working", "unknown"]);
+        let mapped = until_agent_statuses(&set).unwrap();
+        assert_eq!(mapped.len(), 5);
+        assert!(until_agent_statuses(&until(&["done", "paused"])).is_none());
+        assert!(until_agent_statuses(&until(&["Done-Case"])).is_none());
+    }
+
+    #[test]
+    fn agent_pane_id_reads_agent_info_envelope() {
+        let v =
+            json!({"type": "agent_info", "agent": {"pane_id": "w2:p1", "agent_status": "idle"}});
+        assert_eq!(agent_pane_id(&v).as_deref(), Some("w2:p1"));
+        assert_eq!(
+            agent_pane_id(&json!({"pane_id": "w1:p9"})).as_deref(),
+            Some("w1:p9")
+        );
+        assert_eq!(agent_pane_id(&json!({"agent": {}})), None);
+    }
+
+    #[test]
+    fn classify_wait_error_unsupported_codes_fall_back() {
+        for code in [
+            "invalid_request",
+            "unknown_method",
+            "method_not_found",
+            "unsupported_method",
+            "unsupported_thing",
+        ] {
+            let out = classify_wait_error(&resolved(), server_err(code), None).unwrap();
+            assert!(out.is_none(), "expected fallback for {code}");
+        }
+    }
+
+    #[test]
+    fn classify_wait_error_timeout_and_gone() {
+        // Server-side timeout → TimedOut carrying last_status.
+        let out = classify_wait_error(&resolved(), server_err("timeout"), Some("working".into()))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            out,
+            PollResult::TimedOut { ref last_status } if last_status.as_deref() == Some("working")
+        ));
+        // Agent not found → Gone (same as poll loop).
+        let out = classify_wait_error(&resolved(), server_err("agent_not_found"), None)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(out, PollResult::Gone));
+        // Unknown codes → real error, not a silent fallback.
+        let e = classify_wait_error(&resolved(), server_err("internal"), None).unwrap_err();
+        assert_eq!(e.code(), "api_error");
+        // Client-side timeout is a reachability error, not a wait timeout.
+        let e = classify_wait_error(&resolved(), ApiError::Timeout, None).unwrap_err();
+        assert_eq!(e.code(), "worker_unreachable");
+    }
+
+    #[test]
+    fn classify_stream_event_status_gone_ignore() {
+        let pane = "w2:p1";
+        // Status change for our pane.
+        let ev = json!({"event": "pane_agent_status_changed", "data": {
+            "pane_id": pane, "agent_status": "working", "agent": "devin"}});
+        match classify_stream_event(&ev, pane) {
+            StreamEvent::Status { status, data } => {
+                assert_eq!(status, "working");
+                assert_eq!(data["agent_status"], "working");
+            }
+            _ => panic!("expected Status"),
+        }
+        // pane.exited for our pane → Gone; for another pane → Ignore.
+        let ev = json!({"event": "pane_exited", "data": {"pane_id": pane}});
+        assert!(matches!(
+            classify_stream_event(&ev, pane),
+            StreamEvent::Gone
+        ));
+        let ev = json!({"event": "pane_exited", "data": {"pane_id": "w2:p2"}});
+        assert!(matches!(
+            classify_stream_event(&ev, pane),
+            StreamEvent::Ignore
+        ));
+        // Status event for a different pane is ignored (defensive — the
+        // subscription is pane-filtered server-side).
+        let ev = json!({"event": "pane_agent_status_changed", "data": {
+            "pane_id": "w2:p2", "agent_status": "done"}});
+        assert!(matches!(
+            classify_stream_event(&ev, pane),
+            StreamEvent::Ignore
+        ));
+        // Unrelated event kinds are ignored.
+        let ev = json!({"event": "layout_updated", "data": {}});
+        assert!(matches!(
+            classify_stream_event(&ev, pane),
+            StreamEvent::Ignore
+        ));
     }
 }
