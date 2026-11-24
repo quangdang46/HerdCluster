@@ -30,7 +30,10 @@ pub fn run(command: AgentCommands, verbose: bool) -> i32 {
         AgentCommands::List { all, json } => list(all, json, verbose),
         AgentCommands::Get { id, json } => with_ctx(verbose, json, |ctx| agent_get(ctx, &id)),
         AgentCommands::Read { id, lines, json } => with_ctx(verbose, json, |ctx| {
-            agent_read(ctx, &id, ReadSource::Visible, None, lines, None)
+            // `recent` (upstream herdr default) returns real scrollback and
+            // honors `--lines`; `visible` only sees the alt-screen viewport,
+            // which for TUIs like Devin is just the footer (issue #9).
+            agent_read(ctx, &id, ReadSource::Recent, None, lines, None)
         }),
         AgentCommands::Wait {
             id,

@@ -102,8 +102,40 @@ pub fn agent_wait_with_timeout(
         .map_err(|e| op_error(&resolved, e))
 }
 
+/// How long [`agent_prompt`] watches for a turn to start before pressing
+/// `Enter` as a submit retry, and again before declaring the prompt
+/// stalled (issue #9).
+const PROMPT_VERIFY_TIMEOUT: Duration = Duration::from_secs(8);
+const PROMPT_VERIFY_POLL: Duration = Duration::from_millis(400);
+/// Scrollback re-read cadence inside the verify loop — `agent.read` is
+/// heavier than `agent.get`, so it runs less often.
+const PROMPT_VERIFY_READ_INTERVAL: Duration = Duration::from_millis(1200);
+/// Lines of recent scrollback sampled for the content-change signal.
+const PROMPT_VERIFY_READ_LINES: u32 = 60;
+/// `agent.get` statuses that prove the prompt started (or is running) a
+/// turn. `idle`/`done`/`unknown` are deliberately excluded: an idle
+/// agent that never leaves idle is exactly the stall this guards.
+const TURN_ACTIVE_STATUSES: &[&str] = &["working", "blocked"];
+/// Settle delay after `agent.prompt` returns before sampling the
+/// scrollback baseline, so parked (typed-but-unsubmitted) text is already
+/// in the baseline and cannot fake a "turn started" diff.
+const PROMPT_BASELINE_SETTLE: Duration = Duration::from_millis(1000);
+
 /// `agent.prompt <global-id> <text>` — send a prompt, optionally waiting
 /// for a resulting status via `wait`.
+///
+/// With `wait: None` the prompt is still *verified* before reporting
+/// success: herdr's `agent.prompt` types the text but some agent TUIs
+/// never observe the submit, leaving the text parked in the input box
+/// while the call returns `agent_prompted` (issue #9). A turn counts as
+/// started when `agent.get` shows working/blocked, `state_change_seq`
+/// moves, or the recent scrollback changes — the last signal covers
+/// agents whose panes are too small for herdr's status detection (the
+/// `agent.explain` region collapses to the TUI footer). If nothing
+/// moves we press `Enter` once — the parked text then submits — and
+/// watch again. Still nothing → [`FleetError::PromptStalled`]. An
+/// explicit `wait` is passed through untouched: upstream already
+/// verifies in that mode.
 pub fn agent_prompt(
     ctx: &FleetContext,
     global_id: &str,
@@ -111,9 +143,136 @@ pub fn agent_prompt(
     wait: Option<WaitOptions>,
 ) -> Result<Value, FleetError> {
     let (resolved, client) = resolve_and_connect(ctx, global_id)?;
-    client
-        .agent_prompt(&resolved.agent, text, wait)
-        .map_err(|e| op_error(&resolved, e))
+    let target = resolved.agent.clone();
+    let seq_before = agent_state_seq(&client, &target);
+
+    let prompt_result = client.agent_prompt(&target, text, wait.clone());
+    if wait.is_some() {
+        // Upstream `wait` already turns a non-starting prompt into
+        // `agent_prompt_stalled`/`timeout` — pass the verdict through.
+        return prompt_result.map_err(|e| op_error(&resolved, e));
+    }
+
+    let ok_value = match prompt_result {
+        Ok(v) => v,
+        Err(e) if is_prompt_stalled(&e) => {
+            // Upstream already detected the stall; the text is typed but
+            // unsubmitted — skip straight to the Enter retry below.
+            serde_json::json!({ "type": "agent_prompted" })
+        }
+        Err(e) => return Err(op_error(&resolved, e)),
+    };
+
+    std::thread::sleep(PROMPT_BASELINE_SETTLE);
+    let baseline = recent_tail(&client, &target);
+    if prompt_turn_started(&client, &target, seq_before, baseline.as_deref()) {
+        return Ok(ok_value);
+    }
+    // One submit retry: `agent.send_keys Enter` flushes text parked in
+    // the agent's input box (verified against devin TUIs, issue #9).
+    let _ = client.agent_send_keys(&target, &["Enter".to_string()]);
+    std::thread::sleep(PROMPT_BASELINE_SETTLE);
+    let baseline = recent_tail(&client, &target);
+    if prompt_turn_started(&client, &target, seq_before, baseline.as_deref()) {
+        return Ok(serde_json::json!({
+            "type": "agent_prompted",
+            "submitted_via": "enter",
+        }));
+    }
+    Err(FleetError::PromptStalled {
+        machine: resolved.machine.clone(),
+        agent: resolved.agent.clone(),
+    })
+}
+
+/// True when the error is upstream's `agent_prompt_stalled` (prompt
+/// accepted but no working/blocked state observed within its window).
+fn is_prompt_stalled(e: &ApiError) -> bool {
+    matches!(e, ApiError::Server { code, .. } if code == "agent_prompt_stalled")
+}
+
+/// `state_change_seq` from `agent.get`, if readable. `None` when the
+/// agent is gone or the field is absent — verification then relies on
+/// status alone.
+fn agent_state_seq(client: &api_client::ApiClient, target: &str) -> Option<u64> {
+    let v = client.agent_get(target).ok()?;
+    v.pointer("/agent/state_change_seq")
+        .or_else(|| v.get("state_change_seq"))
+        .and_then(Value::as_u64)
+}
+
+/// `agent_status` from `agent.get`, if readable.
+fn agent_status_of(v: &Value) -> Option<&str> {
+    v.pointer("/agent/agent_status")
+        .or_else(|| v.pointer("/agent/status"))
+        .or_else(|| v.get("agent_status"))
+        .and_then(Value::as_str)
+}
+
+/// Tail of `agent.read source=recent` for content-diff verification.
+/// `None` when the read fails — callers then rely on status/seq only.
+fn recent_tail(client: &api_client::ApiClient, target: &str) -> Option<String> {
+    let v = client
+        .agent_read(
+            target,
+            ReadSource::Recent,
+            None,
+            Some(PROMPT_VERIFY_READ_LINES),
+            None,
+        )
+        .ok()?;
+    v.pointer("/read/text")
+        .or_else(|| v.get("text"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Poll until the agent shows a working/blocked status, its
+/// `state_change_seq` moves off `seq_before`, or the recent scrollback
+/// differs from `baseline`. The content signal covers agents whose panes
+/// are too small for herdr's status detection — `agent.explain` then
+/// sees only the TUI footer and `agent_status` never leaves `idle`
+/// (issue #9). A fast turn that returns to `idle` between polls still
+/// bumps the seq or the scrollback, so it counts.
+fn prompt_turn_started(
+    client: &api_client::ApiClient,
+    target: &str,
+    seq_before: Option<u64>,
+    baseline: Option<&str>,
+) -> bool {
+    let deadline = std::time::Instant::now() + PROMPT_VERIFY_TIMEOUT;
+    let mut last_read = std::time::Instant::now() - PROMPT_VERIFY_READ_INTERVAL;
+    loop {
+        if let Ok(v) = client.agent_get(target) {
+            if agent_status_of(&v).is_some_and(|s| TURN_ACTIVE_STATUSES.contains(&s)) {
+                return true;
+            }
+            if let (Some(before), Some(now)) = (
+                seq_before,
+                v.pointer("/agent/state_change_seq")
+                    .or_else(|| v.get("state_change_seq"))
+                    .and_then(Value::as_u64),
+            ) {
+                if now != before {
+                    return true;
+                }
+            }
+        }
+        if let Some(base) = baseline {
+            if last_read.elapsed() >= PROMPT_VERIFY_READ_INTERVAL {
+                last_read = std::time::Instant::now();
+                if let Some(cur) = recent_tail(client, target) {
+                    if cur != base {
+                        return true;
+                    }
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(PROMPT_VERIFY_POLL);
+    }
 }
 
 /// `agent.send_keys <global-id> <keys...>` — send key names (e.g.

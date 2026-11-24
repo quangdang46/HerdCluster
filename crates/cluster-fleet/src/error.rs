@@ -47,6 +47,15 @@ pub enum FleetError {
         /// Human-readable cause.
         reason: String,
     },
+    /// `agent.prompt` was accepted but the agent never showed a
+    /// working/blocked status or a `state_change_seq` bump — the text is
+    /// most likely parked unsubmitted in the agent's input box (issue #9).
+    PromptStalled {
+        /// Machine label.
+        machine: String,
+        /// Machine-local agent identifier.
+        agent: String,
+    },
     /// An underlying `api-client` failure that is not a reachability issue
     /// (protocol incompatibility, malformed response, server-side error).
     Api {
@@ -77,6 +86,7 @@ impl FleetError {
             FleetError::AmbiguousAgent { .. } => "ambiguous_agent",
             FleetError::AgentNotFound { .. } => "agent_not_found",
             FleetError::WorkerUnreachable { .. } => "worker_unreachable",
+            FleetError::PromptStalled { .. } => "prompt_stalled",
             FleetError::Api { .. } => "api_error",
             FleetError::Config { .. } => "config_error",
             FleetError::InvalidArgument { .. } => "invalid_argument",
@@ -120,6 +130,12 @@ impl std::fmt::Display for FleetError {
             FleetError::WorkerUnreachable { machine, reason } => {
                 write!(f, "machine {machine:?} is unreachable: {reason}")
             }
+            FleetError::PromptStalled { machine, agent } => write!(
+                f,
+                "prompt to {agent:?} on {machine:?} was accepted but the agent \
+                 never started working — the text may be sitting unsubmitted \
+                 in the agent's input"
+            ),
             FleetError::Api { message } => write!(f, "herdr API error: {message}"),
             FleetError::Config { message } => write!(f, "herdcluster config error: {message}"),
             FleetError::InvalidArgument { message } => write!(f, "invalid argument: {message}"),

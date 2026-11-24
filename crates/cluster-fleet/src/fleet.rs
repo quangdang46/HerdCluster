@@ -143,7 +143,11 @@ pub fn parse_agent_list(machine: &str, value: &Value) -> Vec<FleetAgent> {
 }
 
 /// Raw field aliases tried, in order, for the machine-local agent id.
-const AGENT_ID_KEYS: &[&str] = &["name", "terminal_id", "id", "agent_id"];
+///
+/// `pane_id` outranks `terminal_id`: herdr `agent.*` targets resolve
+/// agent name or pane id, but NOT terminal id — an unnamed agent listed
+/// by `terminal_id` answered every op with `agent_not_found` (issue #9).
+const AGENT_ID_KEYS: &[&str] = &["name", "pane_id", "terminal_id", "id", "agent_id"];
 /// Raw field aliases for agent kind.
 ///
 /// herdr 0.9.5 `agent.list` rows (`AgentInfo`) carry the kind under
@@ -429,14 +433,15 @@ mod tests {
         json!({"agents": [
             {"name": "claude-1", "kind": "claude", "status": "idle", "pane_id": "p1"},
             {"terminal_id": "term-9", "kind": "codex", "state": "working"},
-            {"pane_id": "no-id-here"} // skipped: no usable identifier
+            {"pane_id": "w9:p3"}, // pane_id fallback: valid agent target
+            {"cwd": "/nowhere"} // skipped: no usable identifier
         ]})
     }
 
     #[test]
     fn parse_agent_list_extracts_ids_and_fields() {
         let rows = parse_agent_list("local", &agents_value());
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].machine, "local");
         assert_eq!(rows[0].id, "local/claude-1");
         assert_eq!(rows[0].agent, "claude-1");
@@ -453,6 +458,11 @@ mod tests {
         assert_eq!(rows[1].agent, "term-9");
         assert_eq!(rows[1].id, "local/term-9");
         assert_eq!(rows[1].status.as_deref(), Some("working"));
+
+        // pane_id outranks terminal_id when `name` is absent: it is a
+        // valid `agent.*` target where terminal_id is not.
+        assert_eq!(rows[2].agent, "w9:p3");
+        assert_eq!(rows[2].id, "local/w9:p3");
     }
 
     #[test]
@@ -561,6 +571,7 @@ mod tests {
             vec![
                 "alpha:claude-1",
                 "alpha:term-9",
+                "alpha:w9:p3",
                 "mid:UNREACHABLE",
                 "zeta:z-agent"
             ]
