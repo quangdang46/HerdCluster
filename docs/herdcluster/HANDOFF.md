@@ -73,6 +73,20 @@ herdcluster doctor              # layered checks; --fix for safe remediations
 herdcluster agent list --all    # agents on BOTH machines, ids like mac.local/xxx
 ```
 
+## 3b. Cluster config overrides
+
+Per-machine caps live in `cluster.json` (`machines.<label>.max_agents`,
+`.kinds_override`) and are editable without hand-editing JSON:
+
+```bash
+herdcluster config get machines.wsl2.max_agents
+herdcluster config set machines.wsl2.max_agents 6
+herdcluster config unset machines.wsl2.kinds_override
+```
+
+Invalid values (e.g. `max_agents > 8`, blank kinds) are rejected at write
+time and flagged by `herdcluster doctor` ("machine caps" check).
+
 ## 4. Daily use
 
 ```bash
@@ -102,3 +116,17 @@ herdcluster agent list --all
 
 State dirs: Mac `~/Library/Application Support/herdcluster/`,
 WSL2 `~/.config/herdcluster/` (override with `HERDCLUSTER_STATE_DIR`).
+
+## Verified so far (loopback e2e, single host)
+
+Two `herdcluster` state dirs on one machine + real `herdr 0.9.5` verified:
+pairing → TLS → worker online with CPU/MEM/kinds → `agent list --all` →
+`doctor` green → `spawn --kind claude --machine auto` completes and returns
+a global ID; `agent read` shows the live claude UI (`agent_status:
+blocked` at the trust/login prompt — spawn treats post-launch interactive
+states as ready). This surfaced and fixed several herdr-0.9.5-shape and
+transport bugs (see git log around `baf0b0b`, `1a25fce`).
+
+Still needs a real two-machine run: `m3-services-47p.10` (Mac↔WSL2
+pairing), `m5-fleet-tnl.5` (spawn + prompt/read on both machines with an
+authenticated agent CLI), `m7-doctor-hzs.3` (fresh-machine acceptance).
