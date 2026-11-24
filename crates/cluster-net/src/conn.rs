@@ -255,10 +255,11 @@ impl Session {
     /// Time since the last inbound control message (or since connect).
     pub fn since_last_inbound(&self) -> Duration {
         let ms = self.last_inbound_ms.load(Ordering::Acquire);
+        let now = self.started.elapsed();
         if ms == u64::MAX {
-            self.started.elapsed()
+            now
         } else {
-            Duration::from_millis(ms)
+            now.saturating_sub(Duration::from_millis(ms))
         }
     }
 
@@ -1114,10 +1115,41 @@ mod tests {
             old_session.open_stream(),
             Err(ConnError::WorkerUnreachable)
         ));
-        // New session is usable.
+        // New session is usable: round-trip a byte stream through the
+        // controller's side of the reconnected session. Wait for the
+        // second WorkerConnected event — it is emitted only after the
+        // controller registers the new session.
         let s = new_session.open_stream().unwrap();
         s.send(Bytes::from_static(b"x")).await.unwrap();
-        let _ = s.recv().await;
+        // Skip the disconnect event; the reconnect emits WorkerConnected.
+        let c_session = loop {
+            let ev = timeout(Duration::from_secs(5), ctrl.next_event())
+                .await
+                .unwrap();
+            match ev {
+                ControllerEvent::WorkerConnected(_) => {
+                    break ctrl.session(&first_worker_pub).unwrap()
+                }
+                ControllerEvent::WorkerDisconnected { .. } => {}
+            }
+        };
+        let c_stream = timeout(Duration::from_secs(5), c_session.accept_stream())
+            .await
+            .unwrap()
+            .unwrap();
+        let got = timeout(Duration::from_secs(5), c_stream.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got[..], b"x");
+        c_stream.send(Bytes::from_static(b"y")).await.unwrap();
+        let back = timeout(Duration::from_secs(5), s.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&back[..], b"y");
 
         handle.shutdown();
     }
@@ -1161,6 +1193,60 @@ mod tests {
         // Degraded at ~200ms, Offline+reconnect at ~400ms.
         wait_status(&handle, LinkStatus::Degraded).await;
         wait_status(&handle, LinkStatus::Online).await; // reconnected
+
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn heartbeats_keep_session_online_past_offline_threshold() {
+        // Regression: `since_last_inbound` used to report elapsed-since-
+        // connect rather than time-since-last-message, so every session
+        // was declared offline ~`offline_after` after connect even with
+        // heartbeats flowing — workers reconnected every ~30 s forever.
+        let ctrl_dir = tempdir();
+        let work_dir = tempdir();
+        let mut ctrl = Controller::bind(ctrl_dir.path(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        ctrl.set_heartbeat_interval(Duration::from_millis(50));
+        let ctrl = Arc::new(ctrl);
+        let addr = ctrl.local_addr();
+        let c = ctrl.clone();
+        tokio::spawn(async move { c.accept_loop().await });
+
+        let material = ctrl.tls_material();
+        let cred = WorkerCredential {
+            controller_pubkey: protocol::pubkey_to_hex(&ctrl.cluster_pubkey()),
+            ca_fingerprint: material.ca_fingerprint(),
+            ca_cert_pem: material.ca_cert_pem.clone(),
+        };
+        save_worker_credential(work_dir.path(), &cred).unwrap();
+
+        let tuning = WorkerTuning {
+            heartbeat_interval: Duration::from_millis(50),
+            degraded_after: Duration::from_millis(300),
+            offline_after: Duration::from_millis(600),
+            backoff_min: Duration::from_millis(50),
+            backoff_max: Duration::from_millis(200),
+            connect_timeout: Duration::from_secs(5),
+        };
+        let client = Arc::new(
+            WorkerClient::load_with_tuning(work_dir.path(), worker_cfg(), tuning).unwrap(),
+        );
+        let handle = client.spawn(addr);
+
+        wait_status(&handle, LinkStatus::Online).await;
+        let first = handle.session().borrow().clone().unwrap();
+
+        // Well past several offline_after windows with heartbeats flowing.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        assert_eq!(*handle.status().borrow(), LinkStatus::Online);
+        let current = handle.session().borrow().clone().unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &current),
+            "session reconnected despite heartbeats"
+        );
 
         handle.shutdown();
     }

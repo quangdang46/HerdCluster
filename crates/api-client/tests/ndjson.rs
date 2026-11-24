@@ -423,7 +423,21 @@ fn live_ping_against_real_herdr_if_present() {
         eprintln!("skipping live test: no herdr socket at {}", path.display());
         return;
     }
-    let client = ApiClient::connect(&path).unwrap();
-    let info = api_client::compat::check_compat(&client).unwrap();
+    // A stale socket file can exist without a live server — skip rather
+    // than fail when the endpoint doesn't answer.
+    let Ok(client) = ApiClient::connect(&path) else {
+        eprintln!(
+            "skipping live test: herdr socket not accepting at {}",
+            path.display()
+        );
+        return;
+    };
+    let Ok(info) = api_client::compat::check_compat(&client) else {
+        eprintln!(
+            "skipping live test: herdr at {} did not answer compat check",
+            path.display()
+        );
+        return;
+    };
     assert!(info.protocol >= api_client::compat::MIN_SUPPORTED_PROTOCOL);
 }

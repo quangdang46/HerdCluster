@@ -681,7 +681,10 @@ fn ensure_pane(
 }
 
 /// Status strings that mean "the agent CLI is up and interactive".
-const READY_STATUSES: &[&str] = &["idle", "interactive_ready", "ready"];
+/// `blocked` = waiting for input (login/permission prompt) and `done` =
+/// finished its task — both are stable interactive states herdr reports
+/// for a live agent, so spawn should not keep polling through them.
+const READY_STATUSES: &[&str] = &["idle", "interactive_ready", "ready", "blocked", "done"];
 
 /// Extract a readiness signal from an `agent.get` response: the status
 /// string under `status`/`state`, or an `interactive_ready: true` flag.
@@ -948,8 +951,13 @@ mod tests {
         assert!(agent_ready(&json!({"agent": {"status": "idle"}})));
         assert!(agent_ready(&json!({"status": "interactive_ready"})));
         assert!(agent_ready(&json!({"state": "ready"})));
+        // herdr 0.9.5 field name + post-launch interactive states.
+        assert!(agent_ready(&json!({"agent": {"agent_status": "idle"}})));
+        assert!(agent_ready(&json!({"agent": {"agent_status": "blocked"}})));
+        assert!(agent_ready(&json!({"agent": {"agent_status": "done"}})));
         assert!(agent_ready(&json!({"interactive_ready": true})));
         assert!(!agent_ready(&json!({"agent": {"status": "working"}})));
+        assert!(!agent_ready(&json!({"agent": {"agent_status": "working"}})));
         assert!(!agent_ready(&json!({"agent": {}})));
     }
 
