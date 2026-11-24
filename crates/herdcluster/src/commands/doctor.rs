@@ -12,13 +12,21 @@ use super::{block_on, print_json, vlog};
 
 const HEADERS: &[&str] = &["CHECK", "STATUS", "DETAIL", "FIX"];
 
-/// `herdcluster doctor [--fix] [--yes] [--machine <label>] [--json]`
-pub fn run(fix: bool, yes: bool, machine: Option<String>, json: bool, verbose: bool) -> i32 {
+/// `herdcluster doctor [--fix] [--yes] [--machine <label>] [--repo <path>] [--json]`
+pub fn run(
+    fix: bool,
+    yes: bool,
+    machine: Option<String>,
+    repo: Option<String>,
+    json: bool,
+    verbose: bool,
+) -> i32 {
     let opts = DoctorOptions {
         machine,
         fix,
         yes,
         json,
+        repo,
     };
 
     vlog(verbose, "running doctor check suite");

@@ -59,6 +59,9 @@ pub(crate) enum Commands {
         yes: bool,
         #[arg(long)]
         machine: Option<String>,
+        /// Repo path to verify exists (checked on the machine running doctor)
+        #[arg(long)]
+        repo: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -68,6 +71,11 @@ pub(crate) enum Commands {
         label: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Manage cluster configuration (cluster.json)
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
     },
     /// Manage worker autostart (launch at login/boot)
     Autostart {
@@ -147,6 +155,32 @@ pub(crate) enum AgentCommands {
     SendKeys { id: String, keys: String },
     /// Rename an agent
     Rename { id: String, name: String },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ConfigCommands {
+    /// Show cluster configuration and machine overrides
+    Get {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set a config value, e.g. `machines.<label>.max_agents 6`
+    /// or `machines.<label>.kinds_override claude,codex`
+    Set {
+        /// Config key
+        key: String,
+        /// Value to set
+        value: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a machines.<label> override entirely
+    Unset {
+        /// Config key (machines.<label>)
+        key: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

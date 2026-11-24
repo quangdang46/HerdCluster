@@ -112,13 +112,51 @@ pub fn derive_status(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Wo
 /// `machines.<label>` (PLAN.md §3.7 caps).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MachineOverride {
-    /// Cap on concurrent agents for this machine (clamped to the hard
-    /// ceiling by the scheduler caller).
+    /// Cap on concurrent agents for this machine. `0` is valid and means
+    /// the machine accepts no agents (the scheduler reports it at
+    /// capacity). Values above [`crate::scheduler::MAX_AGENTS_CEILING`]
+    /// are invalid — see [`MachineOverride::problems`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_agents: Option<u32>,
     /// If set, replaces the machine's reported `kinds[]` for placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kinds_override: Option<Vec<String>>,
+}
+
+impl MachineOverride {
+    /// Validate override values against scheduler policy (PLAN.md §3.7).
+    ///
+    /// Returns human-readable problems — an empty vec means the override
+    /// is sane. This is the "reject invalid values" layer: JSON parsing
+    /// accepts any `u32`, so range/semantic checks live here and are
+    /// surfaced by `herdcluster doctor` (the scheduler still clamps
+    /// defensively at scoring time).
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if let Some(max) = self.max_agents {
+            if max > crate::scheduler::MAX_AGENTS_CEILING {
+                problems.push(format!(
+                    "max_agents {max} exceeds the hard ceiling of {}",
+                    crate::scheduler::MAX_AGENTS_CEILING
+                ));
+            }
+        }
+        if let Some(kinds) = &self.kinds_override {
+            if kinds.is_empty() {
+                problems.push(
+                    "kinds_override is an empty list — the machine would match no agent kinds"
+                        .to_string(),
+                );
+            }
+            for kind in kinds {
+                if kind.trim().is_empty() {
+                    problems.push("kinds_override contains an empty kind".to_string());
+                    break;
+                }
+            }
+        }
+        problems
+    }
 }
 
 /// `cluster.json` — cluster identity created by `init`.
@@ -137,6 +175,21 @@ pub struct ClusterInfo {
     /// Per-machine scheduler overrides keyed by machine label.
     #[serde(default)]
     pub machines: BTreeMap<String, MachineOverride>,
+}
+
+impl ClusterInfo {
+    /// Validate every `machines.<label>` override. Returns
+    /// `(label, problem)` pairs in label order — empty when all
+    /// overrides are sane. Surfaced by `herdcluster doctor`.
+    pub fn machine_override_problems(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (label, o) in &self.machines {
+            for p in o.problems() {
+                out.push((label.clone(), p));
+            }
+        }
+        out
+    }
 }
 
 /// One row of `workers.json`.
@@ -616,6 +669,84 @@ mod tests {
             Some(&["claude".to_string()][..])
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn machine_override_problems_reject_invalid_values() {
+        use crate::scheduler::MAX_AGENTS_CEILING;
+
+        // Valid: absent fields, in-range cap, real kinds, and 0 (pause).
+        assert!(MachineOverride::default().problems().is_empty());
+        assert!(MachineOverride {
+            max_agents: Some(MAX_AGENTS_CEILING),
+            kinds_override: Some(vec!["claude".into(), "codex".into()]),
+        }
+        .problems()
+        .is_empty());
+        assert!(MachineOverride {
+            max_agents: Some(0),
+            kinds_override: None,
+        }
+        .problems()
+        .is_empty());
+
+        // Over the hard ceiling → rejected.
+        let p = MachineOverride {
+            max_agents: Some(MAX_AGENTS_CEILING + 1),
+            kinds_override: None,
+        }
+        .problems();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("ceiling"));
+
+        // Empty kinds_override and blank kind entries → rejected.
+        let p = MachineOverride {
+            max_agents: None,
+            kinds_override: Some(vec![]),
+        }
+        .problems();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("empty list"));
+
+        let p = MachineOverride {
+            max_agents: None,
+            kinds_override: Some(vec!["claude".into(), "  ".into()]),
+        }
+        .problems();
+        assert_eq!(p.len(), 1);
+        assert!(p[0].contains("empty kind"));
+    }
+
+    #[test]
+    fn cluster_info_machine_override_problems_carry_labels() {
+        let mut info = ClusterInfo {
+            cluster_id: "x".into(),
+            name: "x".into(),
+            port: 1,
+            protocol_version: 1,
+            created_at: Utc::now(),
+            machines: BTreeMap::new(),
+        };
+        assert!(info.machine_override_problems().is_empty());
+
+        info.machines.insert(
+            "wsl".into(),
+            MachineOverride {
+                max_agents: Some(99),
+                kinds_override: None,
+            },
+        );
+        info.machines.insert(
+            "mac".into(),
+            MachineOverride {
+                max_agents: Some(4),
+                kinds_override: None,
+            },
+        );
+        let problems = info.machine_override_problems();
+        assert_eq!(problems.len(), 1);
+        assert_eq!(problems[0].0, "wsl"); // BTreeMap order: mac first but only wsl has problems
+        assert!(problems[0].1.contains("99"));
     }
 
     #[test]

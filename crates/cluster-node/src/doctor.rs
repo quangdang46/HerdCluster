@@ -54,6 +54,9 @@ pub struct DoctorOptions {
     pub yes: bool,
     /// JSON output mode (suppresses fix narration prompts' stdout use).
     pub json: bool,
+    /// Optional repo path to verify exists — checked on the machine
+    /// running doctor (PLAN.md §3.9 "repo path exists (if given)").
+    pub repo: Option<String>,
 }
 
 /// Outcome of one doctor check.
@@ -129,6 +132,7 @@ pub async fn run_doctor(opts: DoctorOptions) -> Result<DoctorReport, DoctorError
 
     // ---- phase 1: checks ----
     let cluster = check_cluster_config(&state_dir, &mut checks);
+    check_machine_caps(cluster.as_ref(), &mut checks);
     check_state_layout(&state_dir, &mut checks);
     check_sensitive_perms(&state_dir, &mut checks);
     check_local_herdr(&mut checks);
@@ -136,6 +140,7 @@ pub async fn run_doctor(opts: DoctorOptions) -> Result<DoctorReport, DoctorError
     let workers = check_workers_registered(&state_dir, opts.machine.as_deref(), &mut checks);
     check_machine_endpoints(&state_dir, &workers, &mut checks);
     check_agent_clis(&mut checks);
+    check_repo_path(opts.repo.as_deref(), &mut checks);
     check_disk_space(&state_dir, &mut checks);
     check_memory(&mut checks);
     check_worker_pairing(&state_dir, &mut checks);
@@ -259,6 +264,52 @@ fn check_cluster_config(
             );
             None
         }
+    }
+}
+
+// ---- 1b. machine caps (cluster.json machines.<label> overrides) ----
+
+/// Validate `machines.<label>` scheduler overrides (beads `m6-caps`):
+/// out-of-range `max_agents` or malformed `kinds_override` would be
+/// silently clamped/ignored by the scheduler, so doctor fails loudly.
+fn check_machine_caps(cluster: Option<&registry::ClusterInfo>, checks: &mut Vec<CheckResult>) {
+    let Some(info) = cluster else {
+        return; // the "cluster config" check already reported why
+    };
+    if info.machines.is_empty() {
+        push(
+            checks,
+            "machine caps",
+            CheckStatus::Pass,
+            "no per-machine overrides configured",
+        );
+        return;
+    }
+    let problems = info.machine_override_problems();
+    if problems.is_empty() {
+        push(
+            checks,
+            "machine caps",
+            CheckStatus::Pass,
+            format!(
+                "{} machine override(s) valid (max_agents ≤ {})",
+                info.machines.len(),
+                cluster_core::scheduler::MAX_AGENTS_CEILING
+            ),
+        );
+    } else {
+        let detail = problems
+            .iter()
+            .map(|(label, p)| format!("{label}: {p}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        push_hint(
+            checks,
+            "machine caps",
+            CheckStatus::Fail,
+            format!("invalid machines.<label> overrides — {detail}"),
+            "edit cluster.json: max_agents must be 0..=8, kinds_override a non-empty list of kind names",
+        );
     }
 }
 
@@ -714,6 +765,39 @@ fn check_agent_clis(checks: &mut Vec<CheckResult>) {
     }
 }
 
+// ---- 8b. repo path (only when --repo is given) ----
+
+/// Verify `--repo` exists as a directory on the machine running doctor.
+/// Remote-machine paths cannot be checked from here — the detail says so.
+fn check_repo_path(repo: Option<&str>, checks: &mut Vec<CheckResult>) {
+    let Some(repo) = repo else { return };
+    let path = Path::new(repo);
+    if path.is_dir() {
+        push(
+            checks,
+            "repo path",
+            CheckStatus::Pass,
+            format!("{repo} exists on this machine"),
+        );
+    } else if path.exists() {
+        push_hint(
+            checks,
+            "repo path",
+            CheckStatus::Fail,
+            format!("{repo} exists but is not a directory"),
+            "pass the repo root directory, not a file inside it",
+        );
+    } else {
+        push_hint(
+            checks,
+            "repo path",
+            CheckStatus::Fail,
+            format!("{repo} does not exist on this machine"),
+            "check the path — for a remote machine, run doctor there or verify the path is correct for that machine's filesystem",
+        );
+    }
+}
+
 // ---- 9/10. disk + memory ----
 
 fn check_disk_space(state_dir: &Path, checks: &mut Vec<CheckResult>) {
@@ -1144,6 +1228,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn repo_path_check_only_runs_when_given() {
+        let mut checks = Vec::new();
+        check_repo_path(None, &mut checks);
+        assert!(checks.is_empty());
+
+        let dir = tmpdir("repo");
+        let file = dir.join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let mut checks = Vec::new();
+        check_repo_path(Some(dir.to_str().unwrap()), &mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Pass);
+
+        let mut checks = Vec::new();
+        check_repo_path(Some(file.to_str().unwrap()), &mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(checks[0].detail.contains("not a directory"));
+
+        let mut checks = Vec::new();
+        check_repo_path(Some(dir.join("nope").to_str().unwrap()), &mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(checks[0].detail.contains("does not exist"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn doctor_machine_caps_flags_invalid_overrides() {
+        let _g1 = STATE_DIR_ENV_LOCK.lock().await;
+        let _g2 = ENV_LOCK.lock().await;
+        let dir = tmpdir("caps");
+        std::env::set_var(cluster_core::config::ENV_STATE_DIR, &dir);
+
+        // Valid override first: machine caps must pass.
+        std::fs::write(
+            dir.join("cluster.json"),
+            serde_json::json!({
+                "cluster_id": "c1",
+                "name": "c1",
+                "port": 47820,
+                "protocol_version": 1,
+                "created_at": "2024-01-01T00:00:00Z",
+                "machines": { "wsl": { "max_agents": 4, "kinds_override": ["claude"] } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let report = run_doctor(DoctorOptions::default()).await.unwrap();
+        let caps = report
+            .checks
+            .iter()
+            .find(|c| c.name == "machine caps")
+            .unwrap();
+        assert_eq!(caps.status, CheckStatus::Pass, "{}", caps.detail);
+
+        // Out-of-range max_agents → Fail with the label + reason.
+        std::fs::write(
+            dir.join("cluster.json"),
+            serde_json::json!({
+                "cluster_id": "c1",
+                "name": "c1",
+                "port": 47820,
+                "protocol_version": 1,
+                "created_at": "2024-01-01T00:00:00Z",
+                "machines": { "wsl": { "max_agents": 99 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let report = run_doctor(DoctorOptions::default()).await.unwrap();
+        let caps = report
+            .checks
+            .iter()
+            .find(|c| c.name == "machine caps")
+            .unwrap();
+        assert_eq!(caps.status, CheckStatus::Fail, "{}", caps.detail);
+        assert!(caps.detail.contains("wsl"));
+        assert!(caps.detail.contains("99"));
+        assert!(!report.ok);
+
+        std::env::remove_var(cluster_core::config::ENV_STATE_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn doctor_fix_creates_layout_and_installs_skill() {
         let _g1 = STATE_DIR_ENV_LOCK.lock().await;
@@ -1163,6 +1332,7 @@ mod tests {
             fix: true,
             yes: true,
             json: true,
+            repo: None,
         })
         .await
         .unwrap();
@@ -1198,6 +1368,7 @@ mod tests {
             fix: false,
             yes: false,
             json: false,
+            repo: None,
         })
         .await
         .unwrap();

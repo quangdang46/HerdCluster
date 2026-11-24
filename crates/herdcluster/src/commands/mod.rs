@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod autostart;
+pub mod config;
 pub mod doctor;
 pub mod init;
 pub mod join;
@@ -49,8 +50,10 @@ pub fn dispatch(command: Commands, verbose: bool) -> i32 {
             fix,
             yes,
             machine,
+            repo,
             json,
-        } => doctor::run(fix, yes, machine, json, verbose),
+        } => doctor::run(fix, yes, machine, repo, json, verbose),
+        Commands::Config { command } => config::run(command, verbose),
         Commands::Revoke { label, json } => revoke::run(&label, json),
         Commands::Autostart { command } => autostart::run(command),
         Commands::Machines { json } => machines::run(json, verbose),

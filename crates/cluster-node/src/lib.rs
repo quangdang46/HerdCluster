@@ -8,6 +8,7 @@
 //! the full module surface up front so parallel work stays conflict-free.
 
 pub mod autostart;
+pub mod cluster_config;
 pub mod controller;
 pub mod doctor;
 pub mod join_ux;
