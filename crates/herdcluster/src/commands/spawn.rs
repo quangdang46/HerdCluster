@@ -5,6 +5,7 @@
 //! a [`SpawnRequest`], and renders the [`SpawnResult`].
 
 use cluster_fleet::{spawn, FleetContext, MachineTarget, SpawnRequest};
+use cluster_node::project_state::{self, SpawnedAgent};
 
 use super::{load_ctx, report_spawn_error, vlog};
 
@@ -25,6 +26,15 @@ pub fn run(
         Err(code) => return code,
     };
 
+    // `--repo` omitted → a `.herdcluster/config.json` mapping for the
+    // target machine wins over the fleet default (sole workspace /
+    // server-default cwd). `auto` has no target yet, so it is skipped.
+    let cwd = std::env::current_dir().ok();
+    let repo = repo.or_else(|| {
+        cwd.as_deref()
+            .and_then(|c| project_state::repo_override_for(c, machine))
+    });
+
     let req = SpawnRequest {
         name: name.to_string(),
         kind: kind.to_string(),
@@ -41,6 +51,7 @@ pub fn run(
 
     match spawn(&ctx, &req) {
         Ok(result) => {
+            record_spawn(&result, cwd.as_deref(), verbose);
             if json {
                 super::print_json(&result);
             } else {
@@ -57,6 +68,37 @@ pub fn run(
             0
         }
         Err(e) => report_spawn_error(&e, json),
+    }
+}
+
+/// Best-effort: append the spawn to `.herdcluster/agents.json` when the
+/// cwd sits inside a project (`.git`/`.herdcluster` marker). Never fails
+/// the spawn — state bookkeeping is advisory.
+fn record_spawn(result: &cluster_fleet::SpawnResult, cwd: Option<&std::path::Path>, verbose: bool) {
+    let Some(cwd) = cwd else { return };
+    let Some(project) = project_state::find_project_dir(cwd) else {
+        return;
+    };
+    let agent = SpawnedAgent::now(
+        &result.machine,
+        &result.agent,
+        &result.kind,
+        &result.workspace_id,
+        &result.pane_id,
+    );
+    match project_state::record_spawn(&project, &result.global_id, agent) {
+        Ok(()) => vlog(
+            verbose,
+            format!(
+                "recorded {} in {}",
+                result.global_id,
+                project_state::agents_path(&project).display()
+            ),
+        ),
+        Err(e) => vlog(
+            verbose,
+            format!("could not record spawn in agents.json: {e}"),
+        ),
     }
 }
 

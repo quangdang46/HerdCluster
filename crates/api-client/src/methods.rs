@@ -299,6 +299,17 @@ impl ApiClient {
         }
         req(self, "agent.explain", &P { target })
     }
+
+    /// `pane.close` — close a pane (terminating any agent running in it).
+    /// There is no dedicated `agent.stop`/`agent.close` upstream method;
+    /// closing the hosting pane is the teardown path.
+    pub fn pane_close(&self, pane_id: &str) -> Result<serde_json::Value, ApiError> {
+        #[derive(Serialize)]
+        struct P<'a> {
+            pane_id: &'a str,
+        }
+        req(self, "pane.close", &P { pane_id })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +357,30 @@ impl ApiClient {
             workspace_id: &'a str,
         }
         req(self, "workspace.get", &P { workspace_id })
+    }
+
+    /// `workspace.close` — close a workspace (and optionally its whole
+    /// worktree group via `close_group`). Closes Herdr state only; it
+    /// does not delete files on disk.
+    pub fn workspace_close(
+        &self,
+        workspace_id: &str,
+        close_group: Option<bool>,
+    ) -> Result<serde_json::Value, ApiError> {
+        #[derive(Serialize)]
+        struct P<'a> {
+            workspace_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            close_group: Option<bool>,
+        }
+        req(
+            self,
+            "workspace.close",
+            &P {
+                workspace_id,
+                close_group,
+            },
+        )
     }
 }
 

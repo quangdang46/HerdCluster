@@ -3,6 +3,8 @@
 //!
 //! Supported keys (MVP — `config set` for other fields can come later):
 //!
+//! - `keepawake <true|false>` — cluster-wide keep-awake flag (daemons
+//!   inhibit sleep while local agents work; see `cluster_node::keepawake`)
 //! - `machines.<label>.max_agents <0..=8>` — per-machine agent cap
 //! - `machines.<label>.kinds_override <k1,k2,...>` — replace reported kinds
 //! - `config unset machines.<label>` — drop the whole override
@@ -31,8 +33,9 @@ pub enum ClusterConfigError {
     /// controller (workers have no cluster config of their own).
     #[error("no cluster.json at {0} — run `herdcluster config` on the controller machine")]
     NoCluster(PathBuf),
-    /// Key is not one of the supported `machines.<label>.<field>` forms.
-    #[error("unknown config key '{0}' (supported: machines.<label>.max_agents, machines.<label>.kinds_override)")]
+    /// Key is not one of the supported forms (`keepawake`,
+    /// `machines.<label>.<field>`).
+    #[error("unknown config key '{0}' (supported: keepawake, machines.<label>.max_agents, machines.<label>.kinds_override)")]
     UnknownKey(String),
     /// Value failed to parse for the given key.
     #[error("invalid value for {key}: {reason}")]
@@ -68,6 +71,8 @@ pub struct ConfigView {
     pub protocol_version: u32,
     /// Per-machine overrides, keyed by label.
     pub machines: BTreeMap<String, MachineOverride>,
+    /// Keep-awake sleep-inhibition flag (cluster-wide).
+    pub keepawake: bool,
 }
 
 impl From<&ClusterInfo> for ConfigView {
@@ -78,6 +83,7 @@ impl From<&ClusterInfo> for ConfigView {
             port: info.port,
             protocol_version: info.protocol_version,
             machines: info.machines.clone(),
+            keepawake: info.keepawake,
         }
     }
 }
@@ -92,6 +98,21 @@ pub fn get() -> Result<ConfigView, ClusterConfigError> {
 /// Set `machines.<label>.<field>` to `value`, validate, and persist.
 pub fn set(key: &str, value: &str) -> Result<(), ClusterConfigError> {
     let mut info = load_existing()?;
+
+    // Top-level scalar flags (no machines.<label> prefix).
+    if key == "keepawake" {
+        let v: bool = value
+            .trim()
+            .parse()
+            .map_err(|_| ClusterConfigError::BadValue {
+                key: key.to_string(),
+                reason: format!("'{value}' is not a boolean (true/false)"),
+            })?;
+        info.keepawake = v;
+        core_config::save_cluster(&info)?;
+        return Ok(());
+    }
+
     let (label, field) = parse_key(key)?;
     let entry = info.machines.entry(label.clone()).or_default();
 
@@ -230,6 +251,7 @@ mod tests {
             protocol_version: 1,
             created_at: chrono::Utc::now(),
             machines: BTreeMap::new(),
+            keepawake: true,
         };
         cluster_core::registry::save_cluster_info(&dir.join("cluster.json"), &info).unwrap();
     }

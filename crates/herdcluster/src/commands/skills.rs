@@ -1,20 +1,22 @@
-//! `herdcluster skills install|status` — orchestration skill provisioning.
+//! `herdcluster skills install|status` — bundled skill provisioning.
 //!
 //! Thin wrapper over [`cluster_node::skills`]: the service owns the
-//! bundled skill payload, divergence detection, and install paths
-//! (`.agents/skills/herdr-orchestrator`, `.claude/skills/herdr-orchestrator`
-//! per the M3 bead); this module only prompts and renders.
+//! bundled skill payloads (`herdr-orchestrator` + `herdcluster`),
+//! divergence detection, and install paths
+//! (`.agents/skills/<skill>`, `.claude/skills/<skill>` per the M3 bead);
+//! this module only prompts and renders.
 
 use std::path::Path;
 
 use cluster_node::join_ux::confirm;
-use cluster_node::skills::{self, InstallOutcome, SkillStatus};
-
-/// Canonical project-relative install location (also probed under
-/// `.claude/skills/` by the provisioning code).
-const SKILL_REL: &str = ".agents/skills/herdr-orchestrator";
+use cluster_node::skills::{self, InstallOutcome, SkillStatus, SKILL_NAMES};
 
 /// `herdcluster skills install [--yes] [--overwrite]`
+///
+/// Installs every bundled skill ([`SKILL_NAMES`]). Skills that are
+/// already `Installed` are skipped; `Diverged` copies are only replaced
+/// with consent (`--overwrite`, `--yes`, or an interactive prompt) —
+/// matching the previous single-skill semantics.
 pub fn install(yes: bool, overwrite: bool) -> i32 {
     let dir = match std::env::current_dir() {
         Ok(d) => d,
@@ -23,52 +25,83 @@ pub fn install(yes: bool, overwrite: bool) -> i32 {
             return 1;
         }
     };
-    match skills::skill_status(&dir) {
-        SkillStatus::Installed => {
-            println!("orchestration skill already installed");
-            println!("  path: {}", dir.join(SKILL_REL).display());
-            0
+
+    // One consent decision covers every diverged skill — the prompt
+    // names the skills so the user knows what would be replaced.
+    let statuses: Vec<(&str, SkillStatus)> = SKILL_NAMES
+        .iter()
+        .map(|name| (*name, skills::skill_status(&dir, name)))
+        .collect();
+    let diverged: Vec<&str> = statuses
+        .iter()
+        .filter(|(_, s)| *s == SkillStatus::Diverged)
+        .map(|(n, _)| *n)
+        .collect();
+
+    let mut overwrite_diverged = false;
+    if !diverged.is_empty() {
+        // Diverged = a local copy exists but differs from the bundled
+        // version. Never clobber it silently.
+        let proceed = overwrite
+            || yes
+            || confirm(
+                &format!(
+                    "Diverged local skill copy/copies exist ({}). Overwrite with the bundled version?",
+                    diverged.join(", ")
+                ),
+                false,
+            );
+        if !proceed {
+            println!(
+                "skipped: diverged skill(s) left untouched (use --overwrite to replace): {}",
+                diverged.join(", ")
+            );
         }
-        SkillStatus::Missing => install_at(&dir, false),
-        SkillStatus::Diverged => {
-            // Diverged = a local copy exists but differs from the bundled
-            // version. Never clobber it silently.
-            let proceed = overwrite
-                || yes
-                || confirm(
-                    "A diverged local skill copy exists. Overwrite it with the bundled version?",
-                    false,
+        overwrite_diverged = proceed;
+    }
+
+    let mut rc = 0;
+    for (name, status) in &statuses {
+        match status {
+            SkillStatus::Installed => {
+                println!("{name}: already installed");
+                println!(
+                    "  path: {}",
+                    dir.join(".agents").join("skills").join(name).display()
                 );
-            if proceed {
-                install_at(&dir, true)
-            } else {
-                println!("skipped: diverged skill left untouched (use --overwrite to replace)");
-                0
             }
+            SkillStatus::Missing => {
+                rc = rc.max(install_at(&dir, name, false));
+            }
+            SkillStatus::Diverged if overwrite_diverged => {
+                rc = rc.max(install_at(&dir, name, true));
+            }
+            SkillStatus::Diverged => {}
         }
     }
+    rc
 }
 
-fn install_at(dir: &Path, overwrite_diverged: bool) -> i32 {
-    match skills::install_skill(dir, overwrite_diverged) {
+fn install_at(dir: &Path, skill: &str, overwrite_diverged: bool) -> i32 {
+    match skills::install_skill(dir, skill, overwrite_diverged) {
         Ok(InstallOutcome {
             path,
             created,
             skipped_reason,
         }) => {
             if let Some(reason) = skipped_reason {
-                println!("skill install skipped: {reason}");
+                println!("{skill}: install skipped: {reason}");
             } else if created {
-                println!("installed orchestration skill");
+                println!("{skill}: installed");
                 println!("  path: {}", path.display());
             } else {
-                println!("skill already present");
+                println!("{skill}: already present");
                 println!("  path: {}", path.display());
             }
             0
         }
         Err(e) => {
-            eprintln!("error: skill install failed: {e}");
+            eprintln!("error: {skill} skill install failed: {e}");
             1
         }
     }
@@ -84,46 +117,71 @@ pub fn status() -> i32 {
         }
     };
 
-    let (label, detail) = match skills::skill_status(&dir) {
-        SkillStatus::Installed => ("installed", "matches bundled version"),
-        SkillStatus::Missing => ("missing", "not provisioned in this project"),
-        SkillStatus::Diverged => ("diverged", "local copy differs from bundled version"),
-    };
-    println!("orchestration skill: {label} ({detail})");
-    println!("  expected path: {}", dir.join(SKILL_REL).display());
+    for name in SKILL_NAMES {
+        let (label, detail) = match skills::skill_status(&dir, name) {
+            SkillStatus::Installed => ("installed", "matches bundled version"),
+            SkillStatus::Missing => ("missing", "not provisioned in this project"),
+            SkillStatus::Diverged => ("diverged", "local copy differs from bundled version"),
+        };
+        println!("{name} skill: {label} ({detail})");
+        println!(
+            "  expected path: {}",
+            dir.join(".agents").join("skills").join(name).display()
+        );
+    }
     0
 }
 
 /// Consent-gated skill offer used by `herdcluster init` (and reusable by
 /// `join` flows). Returns 0 always — provisioning must never fail the
 /// daemon startup that triggered it.
+///
+/// Installs every bundled skill: missing ones are offered once (a single
+/// prompt covers all); diverged copies are replaced only after consent
+/// (`assume_yes` or an interactive prompt), preserving the previous
+/// single-skill consent boundary.
 pub(crate) fn offer(project_dir: &Path, assume_yes: bool) -> i32 {
-    match skills::skill_status(project_dir) {
-        SkillStatus::Installed => 0,
-        SkillStatus::Missing => {
-            let proceed = assume_yes
-                || confirm(
-                    "Install the herdcluster orchestration skill into this project?",
-                    true,
-                );
-            if proceed {
-                install_at(project_dir, false)
-            } else {
-                println!("skipped skill install (run `herdcluster skills install` later)");
-                0
+    let statuses: Vec<(&str, SkillStatus)> = SKILL_NAMES
+        .iter()
+        .map(|name| (*name, skills::skill_status(project_dir, name)))
+        .collect();
+    let missing: Vec<&str> = statuses
+        .iter()
+        .filter(|(_, s)| *s == SkillStatus::Missing)
+        .map(|(n, _)| *n)
+        .collect();
+    let diverged: Vec<&str> = statuses
+        .iter()
+        .filter(|(_, s)| *s == SkillStatus::Diverged)
+        .map(|(n, _)| *n)
+        .collect();
+
+    if !missing.is_empty() {
+        let proceed =
+            assume_yes || confirm("Install the herdcluster skills into this project?", true);
+        if proceed {
+            for name in &missing {
+                install_at(project_dir, name, false);
             }
+        } else {
+            println!("skipped skill install (run `herdcluster skills install` later)");
         }
-        SkillStatus::Diverged => {
-            let proceed = assume_yes
-                || confirm(
-                    "A diverged orchestration skill exists here. Overwrite with the bundled version?",
-                    false,
-                );
-            if proceed {
-                install_at(project_dir, true)
-            } else {
-                0
+    }
+
+    if !diverged.is_empty() {
+        let proceed = assume_yes
+            || confirm(
+                &format!(
+                    "Diverged skill copy/copies exist ({}). Overwrite with the bundled version?",
+                    diverged.join(", ")
+                ),
+                false,
+            );
+        if proceed {
+            for name in &diverged {
+                install_at(project_dir, name, true);
             }
         }
     }
+    0
 }

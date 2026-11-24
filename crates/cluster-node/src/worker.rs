@@ -744,11 +744,42 @@ pub async fn run_daemon_until(
         tracing::warn!("cluster bridge requires unix; API streams unavailable");
     }
 
-    // 7. Run until shutdown.
+    // 7. Keep-awake supervisor: while any local herdr agent reports
+    //    `working`, hold a platform sleep-inhibition assertion so this
+    //    machine does not sleep mid-task (cluster.json `keepawake`,
+    //    default on). Stopped + released below on shutdown.
+    let ka_handle = if crate::keepawake::enabled() {
+        let (ka_stop_tx, ka_stop_rx) = watch::channel(false);
+        let handle = crate::keepawake::spawn(
+            Arc::new(crate::keepawake::LocalHerdrProbe::new()),
+            crate::keepawake::platform_asserter(),
+            crate::keepawake::POLL_INTERVAL,
+            crate::keepawake::RELEASE_GRACE,
+            ka_stop_rx,
+        );
+        Some((ka_stop_tx, handle))
+    } else {
+        tracing::debug!("keep-awake disabled by cluster config");
+        None
+    };
+
+    // 8. Run until shutdown.
     shutdown.await;
     tracing::info!("worker daemon shutting down");
     handle.shutdown();
     monitor.shutdown();
+    if let Some((ka_stop_tx, mut ka_handle)) = ka_handle {
+        let _ = ka_stop_tx.send(true);
+        // Wait for the supervisor to release the assertion (bounded by
+        // the probe timeout); abort as a fallback — the asserter's Drop
+        // kills the helper either way.
+        if tokio::time::timeout(Duration::from_secs(15), &mut ka_handle)
+            .await
+            .is_err()
+        {
+            ka_handle.abort();
+        }
+    }
     Ok(())
 }
 

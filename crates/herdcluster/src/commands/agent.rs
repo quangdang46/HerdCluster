@@ -2,13 +2,17 @@
 //!
 //! `list` fans out to every machine (`--all`) or queries only the local
 //! herdr (`agent list` without `--all`, addressed as `local/<name>`).
-//! `get`/`read`/`wait`/`prompt`/`send-keys`/`rename` take a global agent
+//! `get`/`read`/`prompt`/`send-keys`/`rename` take a global agent
 //! ID (`{machine}/{agent}`) and forward through `cluster-fleet` ops.
+//! `wait`/`watch` poll `agent.get` fleet-aware via [`cluster_fleet::agent_poll`].
+
+use std::collections::BTreeSet;
 
 use api_client::methods::ReadSource;
 use cluster_fleet::{
-    agent_get, agent_prompt, agent_read, agent_rename, agent_send_keys, agent_wait,
-    list_all_agents, AgentListRow, FleetContext, FleetError, LOCAL_LABEL,
+    agent_get, agent_poll, agent_prompt, agent_read, agent_rename, agent_send_keys,
+    list_all_agents, parse_duration, parse_until, AgentListRow, FleetContext, FleetError,
+    PollEvent, PollResult, WatchTuning, LOCAL_LABEL, WATCH_TERMINAL_STATUSES,
 };
 
 use super::render::render_table;
@@ -25,9 +29,25 @@ pub fn run(command: AgentCommands, verbose: bool) -> i32 {
         AgentCommands::Read { id, json } => with_ctx(verbose, json, |ctx| {
             agent_read(ctx, &id, ReadSource::Visible, None, None, None)
         }),
-        AgentCommands::Wait { id, json } => {
-            with_ctx(verbose, json, |ctx| agent_wait(ctx, &id, None))
-        }
+        AgentCommands::Wait {
+            id,
+            until,
+            timeout,
+            stuck_after,
+            json,
+        } => wait_agent(
+            &id,
+            &until,
+            timeout.as_deref(),
+            stuck_after.as_deref(),
+            json,
+            verbose,
+        ),
+        AgentCommands::Watch {
+            id,
+            json,
+            stuck_after,
+        } => watch_agent(&id, stuck_after.as_deref(), json, verbose),
         AgentCommands::Prompt { id, text } => {
             with_ctx(verbose, false, |ctx| agent_prompt(ctx, &id, &text, None))
         }
@@ -62,6 +82,216 @@ fn with_ctx(
         }
         Err(e) => report_fleet_error(&e, json),
     }
+}
+
+/// RFC 3339 millisecond timestamp for watch/event output.
+fn now_ts() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Build a [`WatchTuning`] from the `--timeout`/`--stuck-after` flag
+/// values. `stuck_after` accepts a duration (`2m`) or `off`/`0` to
+/// disable; `None` keeps the 10-minute default.
+fn watch_tuning(
+    timeout: Option<&str>,
+    stuck_after: Option<&str>,
+) -> Result<WatchTuning, FleetError> {
+    let mut tuning = WatchTuning::default();
+    if let Some(t) = timeout {
+        tuning.timeout = Some(parse_duration(t)?);
+    }
+    if let Some(raw) = stuck_after {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("off") || raw == "0" {
+            tuning.stuck_after = None;
+        } else {
+            let d = parse_duration(raw)?;
+            tuning.stuck_after = (!d.is_zero()).then_some(d);
+        }
+    }
+    Ok(tuning)
+}
+
+/// Print a stuck warning. Shared by wait (stderr always) and watch text
+/// mode; watch `--json` emits it as an event instead.
+fn stuck_warning(id: &str, status: &str, elapsed_secs: u64) {
+    eprintln!(
+        "warning: {id} has been '{status}' unchanged for {}s",
+        elapsed_secs
+    );
+}
+
+/// `agent wait` — poll `agent.get` until the status enters `--until`,
+/// the agent disappears, or `--timeout` elapses. Exit 0 on match/gone,
+/// 1 on timeout or fleet error, 2 on bad flags.
+fn wait_agent(
+    id: &str,
+    until: &str,
+    timeout: Option<&str>,
+    stuck_after: Option<&str>,
+    json: bool,
+    verbose: bool,
+) -> i32 {
+    let until_set = match parse_until(until) {
+        Ok(set) => set,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let tuning = match watch_tuning(timeout, stuck_after) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let ctx = match load_ctx(verbose, json) {
+        Ok(ctx) => ctx,
+        Err(code) => return code,
+    };
+
+    let id_owned = id.to_string();
+    let mut emit = |ev: PollEvent| match ev {
+        PollEvent::Status { from, to } => vlog(
+            verbose,
+            format!("{id_owned}: {} -> {to}", from.unwrap_or_else(|| "-".into())),
+        ),
+        PollEvent::Stuck {
+            status,
+            elapsed_secs,
+        } => stuck_warning(&id_owned, &status, elapsed_secs),
+    };
+
+    match agent_poll(&ctx, &id_owned, &until_set, &tuning, &mut emit) {
+        Ok(PollResult::Matched { status, agent }) => {
+            if json {
+                emit_result(&agent, true);
+            } else {
+                println!("{id_owned}: {status}");
+            }
+            0
+        }
+        Ok(PollResult::Gone) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "id": id_owned, "outcome": "agent_gone" })
+                );
+            } else {
+                println!("{id_owned}: agent is gone");
+            }
+            0
+        }
+        Ok(PollResult::TimedOut { last_status }) => {
+            let msg = format!(
+                "timed out waiting for {id_owned} \
+                 (last status: {})",
+                last_status.as_deref().unwrap_or("unknown")
+            );
+            if json {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "error": { "code": "wait_timeout", "message": msg }
+                    })
+                );
+            } else {
+                eprintln!("error: {msg}");
+            }
+            1
+        }
+        Err(e) => report_fleet_error(&e, json),
+    }
+}
+
+/// `agent watch` — stream status transitions until the agent reaches a
+/// terminal status ([`WATCH_TERMINAL_STATUSES`]), disappears, or the
+/// process is interrupted. `--json` emits one JSON object per line.
+fn watch_agent(id: &str, stuck_after: Option<&str>, json: bool, verbose: bool) -> i32 {
+    let until: BTreeSet<String> = WATCH_TERMINAL_STATUSES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut tuning = match watch_tuning(None, stuck_after) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    tuning.timeout = None; // watch runs until interrupted or terminal
+    let ctx = match load_ctx(verbose, json) {
+        Ok(ctx) => ctx,
+        Err(code) => return code,
+    };
+
+    let id_owned = id.to_string();
+    let mut emit = |ev: PollEvent| match ev {
+        PollEvent::Status { from, to } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ts": now_ts(),
+                        "id": id_owned,
+                        "event": "status",
+                        "from": from,
+                        "to": to,
+                    })
+                );
+            } else {
+                match from {
+                    Some(prev) => println!("{} {id_owned}: {prev} -> {to}", now_ts()),
+                    None => println!("{} {id_owned}: {to}", now_ts()),
+                }
+            }
+        }
+        PollEvent::Stuck {
+            status,
+            elapsed_secs,
+        } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ts": now_ts(),
+                        "id": id_owned,
+                        "event": "stuck",
+                        "status": status,
+                        "elapsed_secs": elapsed_secs,
+                    })
+                );
+            } else {
+                stuck_warning(&id_owned, &status, elapsed_secs);
+            }
+        }
+    };
+
+    let end_status = match agent_poll(&ctx, &id_owned, &until, &tuning, &mut emit) {
+        Ok(PollResult::Matched { status, .. }) => Some(status),
+        Ok(PollResult::Gone) => None,
+        Ok(PollResult::TimedOut { .. }) => unreachable!("watch sets no timeout"),
+        Err(e) => return report_fleet_error(&e, json),
+    };
+
+    // Terminal marker so scripts can detect clean stream end.
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ts": now_ts(),
+                "id": id_owned,
+                "event": "end",
+                "status": end_status,
+            })
+        );
+    } else if let Some(status) = &end_status {
+        println!("{} {id_owned}: finished ({status})", now_ts());
+    } else {
+        println!("{} {id_owned}: agent is gone", now_ts());
+    }
+    0
 }
 
 /// `agent list` — local only, or `--all` fleet-wide fan-out.

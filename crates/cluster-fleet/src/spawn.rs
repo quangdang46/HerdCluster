@@ -1084,6 +1084,7 @@ mod tests {
             protocol_version: 1,
             created_at: chrono::Utc::now(),
             machines: BTreeMap::new(),
+            keepawake: true,
         }
     }
 

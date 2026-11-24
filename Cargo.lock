@@ -634,6 +634,7 @@ name = "herdcluster"
 version = "0.1.0"
 dependencies = [
  "api-client",
+ "chrono",
  "clap",
  "cluster-core",
  "cluster-fleet",

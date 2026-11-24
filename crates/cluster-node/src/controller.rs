@@ -536,6 +536,23 @@ impl ControllerHandle {
             }
         };
 
+        // ---- keep-awake supervisor: inhibit local sleep while agents work ----
+        // Polls the local herdr `agent.list`; holds a platform assertion
+        // while any agent is `working` (cluster.json `keepawake`, default
+        // on). The stop receiver fires on `shutdown()`; aborting the task
+        // (also done by `shutdown()`) releases via the asserter's Drop.
+        if cluster.keepawake {
+            tasks.push(crate::keepawake::spawn(
+                Arc::new(crate::keepawake::LocalHerdrProbe::new()),
+                crate::keepawake::platform_asserter(),
+                crate::keepawake::POLL_INTERVAL,
+                crate::keepawake::RELEASE_GRACE,
+                shutdown_tx.subscribe(),
+            ));
+        } else {
+            tracing::debug!("keep-awake disabled by cluster config");
+        }
+
         // ---- status lines ----
         println!(
             "HerdCluster controller '{}' listening on {}",

@@ -187,6 +187,25 @@ pub fn save_cluster(info: &ClusterInfo) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Whether keep-awake sleep inhibition is enabled
+/// (`cluster.json`'s `keepawake` flag, default `true`).
+///
+/// Read-only and non-creating: a missing, unreadable, or malformed
+/// `cluster.json` yields `true` (feature on unless explicitly disabled).
+/// Used by worker machines that may not have a `cluster.json` at all —
+/// unlike [`load_cluster`] this never persists a fresh identity.
+pub fn keepawake_enabled() -> bool {
+    let Ok(path) = cluster_json_path() else {
+        return true;
+    };
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    serde_json::from_str::<registry::ClusterInfo>(&raw)
+        .map(|info| info.keepawake)
+        .unwrap_or(true)
+}
+
 /// Open the worker registry at `<state_dir>/workers.json`.
 pub fn open_workers() -> Result<WorkerRegistry, ConfigError> {
     Ok(WorkerRegistry::open(workers_json_path()?)?)
@@ -325,6 +344,37 @@ mod tests {
         let outcome = load_cluster().unwrap();
         assert!(outcome.warning.is_some());
         assert!(dir.join("cluster.json.bad").exists());
+        std::env::remove_var(ENV_STATE_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keepawake_enabled_defaults_and_reads_flag() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir("keepawake");
+        std::env::set_var(ENV_STATE_DIR, &dir);
+
+        // No cluster.json → default true, and nothing is created.
+        assert!(keepawake_enabled());
+        assert!(!dir.join("cluster.json").exists());
+
+        // Explicit false is honored; absent field (old file) → true.
+        std::fs::write(
+            dir.join("cluster.json"),
+            r#"{"cluster_id":"c","name":"n","port":1,"protocol_version":1,"created_at":"2024-01-01T00:00:00Z","keepawake":false}"#,
+        )
+        .unwrap();
+        assert!(!keepawake_enabled());
+        std::fs::write(
+            dir.join("cluster.json"),
+            r#"{"cluster_id":"c","name":"n","port":1,"protocol_version":1,"created_at":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(keepawake_enabled());
+        // Malformed → default true (feature on unless explicitly off).
+        std::fs::write(dir.join("cluster.json"), "{bad").unwrap();
+        assert!(keepawake_enabled());
+
         std::env::remove_var(ENV_STATE_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }

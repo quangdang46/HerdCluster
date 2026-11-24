@@ -964,7 +964,7 @@ fn check_worker_pairing(state_dir: &Path, checks: &mut Vec<CheckResult>) {
 
 fn check_orchestration_skill(checks: &mut Vec<CheckResult>) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match crate::skills::skill_status(&cwd) {
+    match crate::skills::skills_status(&cwd) {
         crate::skills::SkillStatus::Installed => push(
             checks,
             "orchestration skill",
@@ -1073,46 +1073,64 @@ fn apply_fixes(
     if let Some((status, _)) = skill_check {
         if status != CheckStatus::Pass {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            match crate::skills::skill_status(&cwd) {
+            match crate::skills::skills_status(&cwd) {
                 crate::skills::SkillStatus::Missing => {
                     let proceed = opts.yes
                         || crate::join_ux::confirm(
-                            "Install the herdcluster orchestration skill into this project?",
+                            "Install the herdcluster skills into this project?",
                             true,
                         );
                     if proceed {
-                        match crate::skills::install_skill(&cwd, false) {
-                            Ok(outcome) if outcome.skipped_reason.is_none() => {
-                                update_check(
-                                    checks,
-                                    "orchestration skill",
-                                    CheckStatus::Pass,
-                                    format!(
-                                        "installed bundled skill at {}",
-                                        outcome.path.display()
-                                    ),
-                                );
-                                fixed.push("installed orchestration skill".to_string());
+                        // Install every bundled skill that is still missing.
+                        let mut installed = Vec::new();
+                        let mut failed = false;
+                        for name in crate::skills::SKILL_NAMES {
+                            if crate::skills::skill_status(&cwd, name)
+                                != crate::skills::SkillStatus::Missing
+                            {
+                                continue;
                             }
-                            Ok(outcome) => {
-                                update_check(
-                                    checks,
-                                    "orchestration skill",
-                                    CheckStatus::Warn,
-                                    format!(
-                                        "skill install skipped: {}",
-                                        outcome.skipped_reason.unwrap_or_default()
-                                    ),
-                                );
+                            match crate::skills::install_skill(&cwd, name, false) {
+                                Ok(outcome) if outcome.skipped_reason.is_none() => {
+                                    installed.push(name);
+                                }
+                                Ok(outcome) => {
+                                    update_check(
+                                        checks,
+                                        "orchestration skill",
+                                        CheckStatus::Warn,
+                                        format!(
+                                            "{name} skill install skipped: {}",
+                                            outcome.skipped_reason.unwrap_or_default()
+                                        ),
+                                    );
+                                }
+                                Err(e) => {
+                                    failed = true;
+                                    update_check(
+                                        checks,
+                                        "orchestration skill",
+                                        CheckStatus::Warn,
+                                        format!("{name} skill install failed: {e}"),
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                update_check(
-                                    checks,
-                                    "orchestration skill",
-                                    CheckStatus::Warn,
-                                    format!("skill install failed: {e}"),
-                                );
-                            }
+                        }
+                        if !installed.is_empty() && !failed {
+                            update_check(
+                                checks,
+                                "orchestration skill",
+                                CheckStatus::Pass,
+                                format!(
+                                    "installed bundled skills at {}: {}",
+                                    cwd.display(),
+                                    installed.join(", ")
+                                ),
+                            );
+                            fixed.push(format!(
+                                "installed orchestration skills: {}",
+                                installed.join(", ")
+                            ));
                         }
                     }
                 }
@@ -1121,24 +1139,38 @@ fn apply_fixes(
                     let proceed = !opts.json
                         && !opts.yes
                         && crate::join_ux::confirm(
-                            "A diverged orchestration skill exists. Overwrite with the bundled version?",
+                            "Diverged skill copy/copies exist. Overwrite with the bundled version?",
                             false,
                         );
                     if proceed {
-                        match crate::skills::install_skill(&cwd, true) {
-                            Ok(outcome) if outcome.skipped_reason.is_none() => {
-                                update_check(
-                                    checks,
-                                    "orchestration skill",
-                                    CheckStatus::Pass,
-                                    format!(
-                                        "replaced diverged skill at {}",
-                                        outcome.path.display()
-                                    ),
-                                );
-                                fixed.push("replaced diverged orchestration skill".to_string());
+                        let mut replaced = Vec::new();
+                        for name in crate::skills::SKILL_NAMES {
+                            if crate::skills::skill_status(&cwd, name)
+                                != crate::skills::SkillStatus::Diverged
+                            {
+                                continue;
                             }
-                            _ => {}
+                            if let Ok(outcome) = crate::skills::install_skill(&cwd, name, true) {
+                                if outcome.skipped_reason.is_none() {
+                                    replaced.push(name);
+                                }
+                            }
+                        }
+                        if !replaced.is_empty() {
+                            update_check(
+                                checks,
+                                "orchestration skill",
+                                CheckStatus::Pass,
+                                format!(
+                                    "replaced diverged skills at {}: {}",
+                                    cwd.display(),
+                                    replaced.join(", ")
+                                ),
+                            );
+                            fixed.push(format!(
+                                "replaced diverged orchestration skills: {}",
+                                replaced.join(", ")
+                            ));
                         }
                     }
                 }
@@ -1358,9 +1390,11 @@ mod tests {
         assert!(dir.join("runtime").is_dir());
         assert!(report.fixed.iter().any(|f| f.contains("state dirs")));
         // --yes auto-installed the missing skill into the temp project.
-        assert!(crate::skills::agents_skill_dir(&project)
-            .join("SKILL.md")
-            .exists());
+        assert!(
+            crate::skills::agents_skill_dir(&project, crate::skills::SKILL_NAME)
+                .join("SKILL.md")
+                .exists()
+        );
         assert!(report
             .fixed
             .iter()

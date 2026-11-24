@@ -79,6 +79,10 @@ fn default_worker_status() -> WorkerStatus {
     WorkerStatus::Offline
 }
 
+fn default_keepawake() -> bool {
+    true
+}
+
 /// Worker lifecycle status, derived from `last_seen` age.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -175,6 +179,11 @@ pub struct ClusterInfo {
     /// Per-machine scheduler overrides keyed by machine label.
     #[serde(default)]
     pub machines: BTreeMap<String, MachineOverride>,
+    /// Keep-awake: daemons hold a platform sleep-inhibition assertion
+    /// while local agents are `working`. `false` disables; absent in
+    /// older `cluster.json` files → `true`.
+    #[serde(default = "default_keepawake")]
+    pub keepawake: bool,
 }
 
 impl ClusterInfo {
@@ -328,6 +337,7 @@ pub fn load_or_init_cluster(
         protocol_version: crate::protocol::PROTOCOL_VERSION,
         created_at: Utc::now(),
         machines: BTreeMap::new(),
+        keepawake: true,
     })
 }
 
@@ -726,6 +736,7 @@ mod tests {
             protocol_version: 1,
             created_at: Utc::now(),
             machines: BTreeMap::new(),
+            keepawake: true,
         };
         assert!(info.machine_override_problems().is_empty());
 

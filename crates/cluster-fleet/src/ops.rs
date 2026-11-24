@@ -21,8 +21,9 @@ use crate::error::FleetError;
 use crate::ids::{agent_not_found, map_api_error, resolve_global_id};
 
 /// Shared preamble: parse + resolve the global ID, short-circuit offline
-/// workers, and connect the endpoint.
-fn resolve_and_connect(
+/// workers, and connect the endpoint. `pub(crate)` so [`crate::watch`]
+/// can reuse the same routing for its polling loops.
+pub(crate) fn resolve_and_connect(
     ctx: &FleetContext,
     global_id: &str,
 ) -> Result<(crate::ids::ResolvedAgent, api_client::ApiClient), FleetError> {
@@ -41,7 +42,8 @@ fn resolve_and_connect(
 
 /// Map an `ApiError` from an agent op: not-found server codes become
 /// [`FleetError::AgentNotFound`]; the rest go through [`map_api_error`].
-fn op_error(resolved: &crate::ids::ResolvedAgent, e: ApiError) -> FleetError {
+/// `pub(crate)` for [`crate::watch`].
+pub(crate) fn op_error(resolved: &crate::ids::ResolvedAgent, e: ApiError) -> FleetError {
     if let ApiError::Server { code, .. } = &e {
         if let Some(err) = agent_not_found(&resolved.machine, &resolved.agent, code) {
             return err;
@@ -140,6 +142,56 @@ pub fn agent_rename(
         .map_err(|e| op_error(&resolved, e))
 }
 
+/// Shared preamble for machine-scoped ops that are *not* addressed by a
+/// global agent id: resolve the endpoint by label, short-circuit offline
+/// workers, and connect.
+fn connect_machine(
+    ctx: &FleetContext,
+    machine: &str,
+) -> Result<(crate::endpoint::MachineEndpoint, api_client::ApiClient), FleetError> {
+    let ep = ctx
+        .endpoint_for(machine)
+        .cloned()
+        .ok_or_else(|| FleetError::UnknownMachine {
+            label: machine.to_string(),
+        })?;
+    if ep.kind == crate::endpoint::MachineKind::Remote && ctx.is_offline(machine) {
+        return Err(FleetError::WorkerUnreachable {
+            machine: machine.to_string(),
+            reason: "worker offline (stale heartbeat)".to_string(),
+        });
+    }
+    let client = ep.client()?;
+    Ok((ep, client))
+}
+
+/// `pane.close` on `machine` — tears down the pane (and any agent in it).
+/// Used by `herdcluster clean` for agents recorded in `.herdcluster/`.
+pub fn machine_pane_close(
+    ctx: &FleetContext,
+    machine: &str,
+    pane_id: &str,
+) -> Result<Value, FleetError> {
+    let (ep, client) = connect_machine(ctx, machine)?;
+    client
+        .pane_close(pane_id)
+        .map_err(|e| map_api_error(&ep.label, e))
+}
+
+/// `workspace.close` on `machine` — closes Herdr workspace state only
+/// (never deletes files on disk).
+pub fn machine_workspace_close(
+    ctx: &FleetContext,
+    machine: &str,
+    workspace_id: &str,
+    close_group: Option<bool>,
+) -> Result<Value, FleetError> {
+    let (ep, client) = connect_machine(ctx, machine)?;
+    client
+        .workspace_close(workspace_id, close_group)
+        .map_err(|e| map_api_error(&ep.label, e))
+}
+
 /// `agent.focus <global-id>` — focus the pane hosting the agent. Note this
 /// only makes sense for the local machine's UI; on a worker it focuses the
 /// pane in that worker's herdr session.
@@ -168,6 +220,7 @@ mod tests {
                 protocol_version: 1,
                 created_at: chrono::Utc::now(),
                 machines: BTreeMap::new(),
+                keepawake: true,
             },
             vec![],
         )
@@ -218,6 +271,7 @@ mod tests {
                 protocol_version: 1,
                 created_at: chrono::Utc::now(),
                 machines: BTreeMap::new(),
+                keepawake: true,
             },
             vec![w.clone()],
         )

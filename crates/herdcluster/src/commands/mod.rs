@@ -9,10 +9,12 @@
 
 pub mod agent;
 pub mod autostart;
+pub mod clean;
 pub mod config;
 pub mod doctor;
 pub mod init;
 pub mod join;
+pub mod keepawake;
 pub mod machines;
 pub mod render;
 pub mod revoke;
@@ -68,8 +70,15 @@ pub fn dispatch(command: Commands, verbose: bool) -> i32 {
         } => spawn::run(
             &name, &kind, &machine, repo, branch, json, agent_args, verbose,
         ),
+        Commands::Clean {
+            machine,
+            yes,
+            dry_run,
+            close_workspaces,
+        } => clean::run(machine, yes, dry_run, close_workspaces, verbose, false),
         Commands::Agent { command } => agent::run(command, verbose),
         Commands::Status { all, json } => status::run(all, json, verbose),
+        Commands::Keepawake { command } => keepawake::run(command, verbose),
         Commands::Skills { command } => match command {
             SkillsCommands::Install { yes, overwrite } => skills::install(yes, overwrite),
             SkillsCommands::Status => skills::status(),

@@ -106,6 +106,21 @@ pub(crate) enum Commands {
         #[arg(last = true)]
         agent_args: Vec<String>,
     },
+    /// Tear down agents recorded in this project's `.herdcluster/agents.json`
+    Clean {
+        /// Only clean agents on this machine label
+        #[arg(long)]
+        machine: Option<String>,
+        /// Confirm teardown without prompting
+        #[arg(long)]
+        yes: bool,
+        /// List what would be removed without touching anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also close the workspace each cleaned agent lived in
+        #[arg(long)]
+        close_workspaces: bool,
+    },
     /// Agent operations across the cluster
     Agent {
         #[command(subcommand)]
@@ -117,6 +132,11 @@ pub(crate) enum Commands {
         all: bool,
         #[arg(long)]
         json: bool,
+    },
+    /// Keep-awake: daemons inhibit system sleep while local agents work
+    Keepawake {
+        #[command(subcommand)]
+        command: KeepawakeCommands,
     },
     /// Manage the bundled orchestration skill
     Skills {
@@ -146,11 +166,36 @@ pub(crate) enum AgentCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Wait for an agent state
+    /// Wait for an agent to reach one of the given statuses
+    /// (fleet-aware: polls agent.get across local/remote endpoints)
     Wait {
+        /// Global agent id `{machine}/{agent}` (e.g. `local/claude-1`)
         id: String,
+        /// Comma-separated statuses to wait for
+        #[arg(long, default_value = "done,idle")]
+        until: String,
+        /// Give up after this duration (30s, 5m, 1h); omit to wait forever
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Warn if the status stays working/blocked this long
+        /// (e.g. 2m); default 10m, "off"/"0" disables
+        #[arg(long)]
+        stuck_after: Option<String>,
         #[arg(long)]
         json: bool,
+    },
+    /// Stream an agent's status transitions until it finishes
+    /// (Ctrl-C to stop early)
+    Watch {
+        /// Global agent id `{machine}/{agent}` (e.g. `local/claude-1`)
+        id: String,
+        /// Emit line-delimited JSON events instead of text lines
+        #[arg(long)]
+        json: bool,
+        /// Warn if the status stays working/blocked this long
+        /// (e.g. 2m); default 10m, "off"/"0" disables
+        #[arg(long)]
+        stuck_after: Option<String>,
     },
     /// Send a prompt to an agent
     Prompt { id: String, text: String },
@@ -194,6 +239,15 @@ pub(crate) enum AutostartCommands {
     Uninstall,
     /// Show autostart status
     Status,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum KeepawakeCommands {
+    /// Show keep-awake status (config flag, platform backend, live probe)
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]

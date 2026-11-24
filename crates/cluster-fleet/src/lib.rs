@@ -41,6 +41,7 @@ pub mod ids;
 pub mod ops;
 pub(crate) mod parse;
 pub mod spawn;
+pub mod watch;
 
 pub use endpoint::{
     bridge_socket_path, local_endpoint, remote_endpoint, FleetContext, MachineEndpoint,
@@ -53,5 +54,10 @@ pub use fleet::{
 pub use ids::{format_global_id, parse_global_id, resolve_global_id, GlobalId, ResolvedAgent};
 pub use ops::{
     agent_focus, agent_get, agent_prompt, agent_read, agent_rename, agent_send_keys, agent_wait,
+    machine_pane_close, machine_workspace_close,
 };
 pub use spawn::{spawn, MachineTarget, SpawnError, SpawnRequest, SpawnResult};
+pub use watch::{
+    agent_poll, agent_status, parse_duration, parse_until, poll_until, PollEvent, PollResult,
+    WatchTuning, DEFAULT_STUCK_AFTER, POLL_INTERVAL, WATCH_TERMINAL_STATUSES,
+};

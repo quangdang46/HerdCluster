@@ -59,6 +59,13 @@ pub enum FleetError {
         /// Human-readable cause.
         message: String,
     },
+    /// A CLI argument failed validation (bad duration, empty `--until`
+    /// set, ...). Distinct from [`FleetError::MalformedId`], which is
+    /// specifically about the `{machine}/{agent}` syntax.
+    InvalidArgument {
+        /// Human-readable cause.
+        message: String,
+    },
 }
 
 impl FleetError {
@@ -72,6 +79,7 @@ impl FleetError {
             FleetError::WorkerUnreachable { .. } => "worker_unreachable",
             FleetError::Api { .. } => "api_error",
             FleetError::Config { .. } => "config_error",
+            FleetError::InvalidArgument { .. } => "invalid_argument",
         }
     }
 
@@ -114,6 +122,7 @@ impl std::fmt::Display for FleetError {
             }
             FleetError::Api { message } => write!(f, "herdr API error: {message}"),
             FleetError::Config { message } => write!(f, "herdcluster config error: {message}"),
+            FleetError::InvalidArgument { message } => write!(f, "invalid argument: {message}"),
         }
     }
 }

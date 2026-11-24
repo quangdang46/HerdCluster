@@ -12,6 +12,8 @@ pub mod cluster_config;
 pub mod controller;
 pub mod doctor;
 pub mod join_ux;
+pub mod keepawake;
+pub mod project_state;
 pub mod provisioning;
 pub mod resources;
 pub mod revoke;
