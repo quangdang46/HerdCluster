@@ -48,6 +48,24 @@ pub fn run(
         println!("pairing code: {}", handle.pairing_code());
         println!("press Ctrl-C to stop");
 
+        // Copy-paste block for the other machine — non-technical users
+        // should not have to work out the LAN IP themselves.
+        let port = handle.local_addr().port();
+        match cluster_core::netutil::lan_ipv4() {
+            Some(ip) => {
+                println!();
+                println!("On the OTHER machine, run:");
+                println!("  herdcluster join --controller {ip}:{port}");
+                println!("  (it will ask for the pairing code shown above)");
+            }
+            None => {
+                println!();
+                println!("On the OTHER machine, run:");
+                println!("  herdcluster join --controller <this-machine-LAN-IP>:{port}");
+                println!("  (find the LAN IP with `ipconfig getifaddr en0` on macOS or `hostname -I` on Linux)");
+            }
+        }
+
         if !no_skills {
             if let Ok(cwd) = std::env::current_dir() {
                 // Skill provisioning is best-effort: never take the

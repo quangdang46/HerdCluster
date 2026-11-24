@@ -21,6 +21,7 @@ mod fsutil;
 
 pub mod config;
 pub mod identity;
+pub mod netutil;
 pub mod pairing;
 pub mod protocol;
 pub mod registry;
