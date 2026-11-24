@@ -3,10 +3,10 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/quangdang46/HerdCluster"
+repository = "https://github.com/quangdang46/herd_cluster"
 description = "Distributed coding-agent cluster: Mac controller + remote workers, built on the herdr API"
 
 [profile.release]
