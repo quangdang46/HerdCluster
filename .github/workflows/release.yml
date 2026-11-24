@@ -75,6 +75,8 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
@@ -99,3 +101,20 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
             dist/*
+
+      - name: Enrich release notes with categorized highlights
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          PREV=$(git tag --sort=-v:refname | grep -vx "${GITHUB_REF_NAME}" | head -1 || true)
+          if [ -z "$PREV" ]; then
+            echo "no previous tag — skipping categorized notes"
+            exit 0
+          fi
+          python3 scripts/release_notes.py "$PREV" "${GITHUB_REF_NAME}" > /tmp/notes.md
+          gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --json body -q .body > /tmp/auto.md
+          { cat /tmp/notes.md; echo "---"; echo; cat /tmp/auto.md; } > /tmp/final.md
+          gh release edit "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --notes-file /tmp/final.md
