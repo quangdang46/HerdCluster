@@ -21,6 +21,7 @@ pub mod revoke;
 pub mod skills;
 pub mod spawn;
 pub mod status;
+pub mod update;
 pub mod worker;
 
 use std::fmt::Display;
@@ -79,6 +80,7 @@ pub fn dispatch(command: Commands, verbose: bool) -> i32 {
         Commands::Agent { command } => agent::run(command, verbose),
         Commands::Status { all, json } => status::run(all, json, verbose),
         Commands::Keepawake { command } => keepawake::run(command, verbose),
+        Commands::Update { version, yes, json } => update::run(version, yes, json, verbose),
         Commands::Skills { command } => match command {
             SkillsCommands::Install { yes, overwrite } => skills::install(yes, overwrite),
             SkillsCommands::Status => skills::status(),
