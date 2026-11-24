@@ -78,6 +78,16 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify tag matches crate version
+        run: |
+          set -euo pipefail
+          CRATE=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$CRATE" != "$TAG" ]; then
+            echo "::error::tag $GITHUB_REF_NAME != workspace version $CRATE — bump Cargo.toml first"
+            exit 1
+          fi
+
       - name: Download all build artifacts
         uses: actions/download-artifact@v4
         with:
