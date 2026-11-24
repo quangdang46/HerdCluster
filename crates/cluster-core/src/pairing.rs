@@ -13,15 +13,19 @@
 //!
 //! Security properties (per PLAN.md §3.5 and the m1-pairing spec):
 //! - Code alphabet excludes ambiguous characters `0 O 1 I L`.
-//! - Codes are single-use and expire after [`PAIRING_TTL_MS`] (5 min).
+//! - Codes are single-use — consumed only when a join reaches
+//!   [`PairingPhase::Approved`] — and expire after [`PAIRING_TTL_MS`]
+//!   (5 min). A denied join or an
+//!   unanswered confirm prompt does NOT burn the code: the session
+//!   returns to [`PairingPhase::AwaitingJoin`] and the same code stays
+//!   valid until the TTL elapses.
 //! - Code comparison is constant-time (via [`subtle::ConstantTimeEq`]).
 //! - At most [`MAX_JOIN_ATTEMPTS`] (5) wrong codes per window; the 6th
 //!   attempt... precisely: after 5 failures the server locks out for
 //!   [`LOCKOUT_MS`] (60 s), then grants a fresh window of 5.
 //! - Controller must confirm within [`CONFIRM_TIMEOUT_MS`] (120 s) of a
-//!   valid join or the whole session expires (documented choice: the
-//!   session is single-use, so an unconfirmed join kills it rather than
-//!   silently returning to `AwaitingJoin`).
+//!   valid join; on timeout the pending join is dropped and the session
+//!   returns to `AwaitingJoin` (still bounded by the code TTL).
 
 use rand_core::RngCore;
 use subtle::ConstantTimeEq;
@@ -79,21 +83,18 @@ pub enum PairingPhase {
     AwaitingJoin,
     /// A valid code was presented; waiting for the local user to confirm.
     PendingConfirm,
-    /// User confirmed; pairing approved.
+    /// User confirmed; pairing approved. This is the ONLY transition
+    /// that consumes the pairing code.
     Approved,
-    /// User denied the join.
-    Rejected,
-    /// Code TTL or confirm deadline elapsed.
+    /// Code TTL elapsed. Terminal — the code is dead and the session
+    /// must be restarted with a fresh code.
     Expired,
 }
 
 impl PairingPhase {
     /// Whether this phase is terminal (no further transitions).
     pub fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            PairingPhase::Approved | PairingPhase::Rejected | PairingPhase::Expired
-        )
+        matches!(self, PairingPhase::Approved | PairingPhase::Expired)
     }
 }
 
@@ -271,26 +272,43 @@ impl<C: Clock> PairingServer<C> {
         self.pending.as_ref()
     }
 
-    /// Lazily advance expiry: `AwaitingJoin` dies at `created + PAIRING_TTL_MS`,
-    /// `PendingConfirm` dies at its confirm deadline. Called at the top of
-    /// every public method.
+    /// Lazily advance expiry and pending-join timeouts. Called at the top
+    /// of every public method.
+    ///
+    /// - `AwaitingJoin` dies at `created + PAIRING_TTL_MS` → `Expired`
+    ///   (terminal; the code is consumed by expiry).
+    /// - `PendingConfirm` drops its pending join at the confirm deadline
+    ///   and returns to `AwaitingJoin` — the code is NOT consumed — unless
+    ///   the code TTL has also elapsed, in which case → `Expired`.
+    /// - `Approved`/`Expired` are terminal and never change here.
     fn refresh(&mut self) {
         if self.phase.is_terminal() {
             return;
         }
         let now = self.clock.now_ms();
-        let expired = match self.phase {
-            PairingPhase::AwaitingJoin => now.saturating_sub(self.created_ms) >= PAIRING_TTL_MS,
-            PairingPhase::PendingConfirm => self
-                .pending
-                .as_ref()
-                .map(|p| now >= p.confirm_deadline_ms)
-                .unwrap_or(true),
-            _ => false,
-        };
-        if expired {
-            self.phase = PairingPhase::Expired;
-            self.pending = None;
+        match self.phase {
+            PairingPhase::AwaitingJoin => {
+                if now.saturating_sub(self.created_ms) >= PAIRING_TTL_MS {
+                    self.phase = PairingPhase::Expired;
+                }
+            }
+            PairingPhase::PendingConfirm => {
+                let deadline_passed = self
+                    .pending
+                    .as_ref()
+                    .map(|p| now >= p.confirm_deadline_ms)
+                    .unwrap_or(true);
+                if deadline_passed {
+                    self.pending = None;
+                    if now.saturating_sub(self.created_ms) >= PAIRING_TTL_MS {
+                        self.phase = PairingPhase::Expired;
+                    } else {
+                        // Unanswered confirm does not burn the code.
+                        self.phase = PairingPhase::AwaitingJoin;
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -300,10 +318,7 @@ impl<C: Clock> PairingServer<C> {
         self.refresh();
         match self.phase {
             PairingPhase::AwaitingJoin => {}
-            PairingPhase::PendingConfirm
-            | PairingPhase::Approved
-            | PairingPhase::Rejected
-            | PairingPhase::Expired => {
+            PairingPhase::PendingConfirm | PairingPhase::Approved | PairingPhase::Expired => {
                 return Err(if self.phase == PairingPhase::Expired {
                     PairingError::Expired
                 } else {
@@ -351,7 +366,7 @@ impl<C: Clock> PairingServer<C> {
         if self.phase != PairingPhase::PendingConfirm {
             return Err(match self.phase {
                 PairingPhase::Expired => PairingError::Expired,
-                PairingPhase::Approved | PairingPhase::Rejected => PairingError::AlreadyFinished,
+                PairingPhase::Approved => PairingError::AlreadyFinished,
                 _ => PairingError::WrongState,
             });
         }
@@ -364,18 +379,20 @@ impl<C: Clock> PairingServer<C> {
         })
     }
 
-    /// Deny the pending join.
+    /// Deny the pending join. The pairing code is NOT consumed: the
+    /// session returns to `AwaitingJoin` and the same code remains valid
+    /// for another join attempt until the code TTL elapses.
     pub fn deny(&mut self, _reason: impl Into<String>) -> Result<(), PairingError> {
         self.refresh();
         if self.phase != PairingPhase::PendingConfirm {
             return Err(match self.phase {
                 PairingPhase::Expired => PairingError::Expired,
-                PairingPhase::Approved | PairingPhase::Rejected => PairingError::AlreadyFinished,
+                PairingPhase::Approved => PairingError::AlreadyFinished,
                 _ => PairingError::WrongState,
             });
         }
         self.pending = None;
-        self.phase = PairingPhase::Rejected;
+        self.phase = PairingPhase::AwaitingJoin;
         Ok(())
     }
 }
@@ -570,11 +587,49 @@ mod tests {
     }
 
     #[test]
-    fn deny_path() {
+    fn deny_returns_to_awaiting_join_and_code_stays_valid() {
         let mut server = PairingServer::start_with_code(TestClock::new(0), "ABCD2345");
         server.handle_join(join("abcd-2345", 1)).unwrap(); // normalization
         server.deny("nope").unwrap();
-        assert_eq!(server.phase(), PairingPhase::Rejected);
+        // Deny does not burn the code: the session is awaiting a new join.
+        assert_eq!(server.phase(), PairingPhase::AwaitingJoin);
+        assert!(!server.phase().is_terminal());
+        // The same code can be presented again.
+        server.handle_join(join("ABCD2345", 2)).unwrap();
+        assert_eq!(server.phase(), PairingPhase::PendingConfirm);
+        // And a subsequent approval still works (code burned only now).
+        server.confirm().unwrap();
+        assert_eq!(server.phase(), PairingPhase::Approved);
+    }
+
+    #[test]
+    fn confirm_timeout_does_not_burn_code() {
+        let clock = TestClock::new(0);
+        let mut server = PairingServer::start_with_code(clock.clone(), "ABCD2345");
+        server.handle_join(join("ABCD2345", 2)).unwrap();
+        clock.set(CONFIRM_TIMEOUT_MS);
+        // Confirm deadline elapsed → pending join dropped, back to
+        // AwaitingJoin; the code is still valid (TTL not reached).
+        assert_eq!(server.confirm(), Err(PairingError::WrongState));
+        assert_eq!(server.phase(), PairingPhase::AwaitingJoin);
+        server.handle_join(join("ABCD2345", 3)).unwrap();
+        assert_eq!(server.phase(), PairingPhase::PendingConfirm);
+    }
+
+    #[test]
+    fn confirm_timeout_after_code_ttl_expires_session() {
+        let clock = TestClock::new(0);
+        let mut server = PairingServer::start_with_code(clock.clone(), "ABCD2345");
+        server.handle_join(join("ABCD2345", 2)).unwrap();
+        // Past both the confirm deadline and the code TTL: the next public
+        // call drives refresh → Expired (terminal), so the code is dead.
+        clock.set(PAIRING_TTL_MS + CONFIRM_TIMEOUT_MS);
+        assert_eq!(
+            server.handle_join(join("ABCD2345", 3)),
+            Err(PairingError::Expired)
+        );
+        assert_eq!(server.phase(), PairingPhase::Expired);
+        assert_eq!(server.deny("x"), Err(PairingError::Expired));
     }
 
     #[test]
@@ -636,13 +691,14 @@ mod tests {
     }
 
     #[test]
-    fn confirm_timeout_expires_pending_session() {
+    fn confirm_deadline_within_ttl_returns_to_awaiting() {
         let clock = TestClock::new(0);
         let mut server = PairingServer::start_with_code(clock.clone(), "ABCD2345");
         server.handle_join(join("ABCD2345", 2)).unwrap();
         clock.set(CONFIRM_TIMEOUT_MS);
-        assert_eq!(server.confirm(), Err(PairingError::Expired));
-        assert_eq!(server.phase(), PairingPhase::Expired);
+        assert_eq!(server.confirm(), Err(PairingError::WrongState));
+        assert_eq!(server.phase(), PairingPhase::AwaitingJoin);
+        assert!(server.pending().is_none());
     }
 
     #[test]
