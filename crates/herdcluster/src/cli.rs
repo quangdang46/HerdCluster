@@ -176,6 +176,9 @@ pub(crate) enum AgentCommands {
     /// Read agent terminal output
     Read {
         id: String,
+        /// Max scrollback lines to return (omit for herdr's default window)
+        #[arg(long)]
+        lines: Option<u32>,
         #[arg(long)]
         json: bool,
     },

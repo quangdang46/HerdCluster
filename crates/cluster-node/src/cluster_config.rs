@@ -56,6 +56,15 @@ pub enum ClusterConfigError {
     /// `unset` named a label with no override.
     #[error("no machines.{0} override exists")]
     NoOverride(String),
+    /// `machines.<label>` names no known machine — likely a typo; the
+    /// override would be dead config.
+    #[error("unknown machine '{label}' (known: {known})")]
+    UnknownMachine {
+        /// The label that was set.
+        label: String,
+        /// Comma-separated known labels (`local` + registered workers).
+        known: String,
+    },
 }
 
 /// Serializable view of `cluster.json` for `config get --json`.
@@ -114,6 +123,7 @@ pub fn set(key: &str, value: &str) -> Result<(), ClusterConfigError> {
     }
 
     let (label, field) = parse_key(key)?;
+    ensure_known_machine(&label)?;
     let entry = info.machines.entry(label.clone()).or_default();
 
     match field {
@@ -162,6 +172,23 @@ pub fn unset(key: &str) -> Result<(), ClusterConfigError> {
 enum Field {
     MaxAgents,
     KindsOverride,
+}
+
+/// Reject `machines.<label>` overrides for labels that match no known
+/// machine (`local` + registered workers in `workers.json`). Prevents
+/// dead config from typos; an empty/missing registry still allows
+/// `local`.
+fn ensure_known_machine(label: &str) -> Result<(), ClusterConfigError> {
+    let registry = core_config::open_workers()?;
+    let mut known: Vec<String> = vec!["local".to_string()];
+    known.extend(registry.data().workers.iter().map(|w| w.label.clone()));
+    if known.iter().any(|k| k == label) {
+        return Ok(());
+    }
+    Err(ClusterConfigError::UnknownMachine {
+        label: label.to_string(),
+        known: known.join(", "),
+    })
 }
 
 /// Split `machines.<label>.<field>` into `(label, field)`. Labels may
@@ -256,6 +283,27 @@ mod tests {
         cluster_core::registry::save_cluster_info(&dir.join("cluster.json"), &info).unwrap();
     }
 
+    fn seed_workers(dir: &std::path::Path, labels: &[&str]) {
+        use cluster_core::registry::{WorkerEntry, WorkerStatus, WorkersFile};
+        let workers = labels
+            .iter()
+            .map(|label| WorkerEntry {
+                worker_id: format!("id-{label}"),
+                label: label.to_string(),
+                pubkey: "00".repeat(32),
+                paired_at: chrono::Utc::now(),
+                last_seen: None,
+                status: WorkerStatus::Offline,
+                resources: None,
+            })
+            .collect();
+        let file = WorkersFile {
+            version: cluster_core::registry::WORKERS_FILE_VERSION,
+            workers,
+        };
+        cluster_core::registry::save_workers(&dir.join("workers.json"), &file).unwrap();
+    }
+
     #[test]
     fn parse_key_handles_dotted_labels() {
         let (label, field) = parse_key("machines.mac.local.max_agents").unwrap();
@@ -284,6 +332,7 @@ mod tests {
         let _g2 = ENV_LOCK.lock().await;
         let dir = tmpdir("set");
         seed_cluster(&dir);
+        seed_workers(&dir, &["wsl"]);
         std::env::set_var(core_config::ENV_STATE_DIR, &dir);
 
         set("machines.wsl.max_agents", "6").unwrap();
@@ -328,6 +377,32 @@ mod tests {
         let err = set("machines.wsl.max_agents", "4").unwrap_err();
         assert!(matches!(err, ClusterConfigError::NoCluster(_)));
         assert!(!dir.join("cluster.json").exists());
+
+        std::env::remove_var(core_config::ENV_STATE_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn set_rejects_unknown_machine_label() {
+        let _g1 = STATE_DIR_ENV_LOCK.lock().await;
+        let _g2 = ENV_LOCK.lock().await;
+        let dir = tmpdir("badlabel");
+        seed_cluster(&dir);
+        seed_workers(&dir, &["wsl"]);
+        std::env::set_var(core_config::ENV_STATE_DIR, &dir);
+
+        // "local" and registered workers are accepted...
+        set("machines.local.max_agents", "4").unwrap();
+        // ...anything else is rejected before touching cluster.json.
+        let err = set("machines.NOSUCHBOX.max_agents", "3").unwrap_err();
+        match err {
+            ClusterConfigError::UnknownMachine { label, known } => {
+                assert_eq!(label, "NOSUCHBOX");
+                assert!(known.contains("local") && known.contains("wsl"), "{known}");
+            }
+            other => panic!("expected UnknownMachine, got {other}"),
+        }
+        assert!(!get().unwrap().machines.contains_key("NOSUCHBOX"));
 
         std::env::remove_var(core_config::ENV_STATE_DIR);
         let _ = std::fs::remove_dir_all(&dir);

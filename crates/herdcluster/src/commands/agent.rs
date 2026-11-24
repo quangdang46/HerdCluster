@@ -27,8 +27,8 @@ pub fn run(command: AgentCommands, verbose: bool) -> i32 {
     match command {
         AgentCommands::List { all, json } => list(all, json, verbose),
         AgentCommands::Get { id, json } => with_ctx(verbose, json, |ctx| agent_get(ctx, &id)),
-        AgentCommands::Read { id, json } => with_ctx(verbose, json, |ctx| {
-            agent_read(ctx, &id, ReadSource::Visible, None, None, None)
+        AgentCommands::Read { id, lines, json } => with_ctx(verbose, json, |ctx| {
+            agent_read(ctx, &id, ReadSource::Visible, None, lines, None)
         }),
         AgentCommands::Wait {
             id,
