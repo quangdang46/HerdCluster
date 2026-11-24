@@ -138,6 +138,19 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: KeepawakeCommands,
     },
+    /// Update herdcluster to the latest release (alias: `upgrade`)
+    #[command(alias = "upgrade")]
+    Update {
+        /// Pin a release tag (e.g. v0.1.0); default: latest release
+        #[arg(long)]
+        version: Option<String>,
+        /// Apply without a confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// JSON output
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage the bundled orchestration skill
     Skills {
         #[command(subcommand)]

@@ -1053,9 +1053,7 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
             Ok(_) => break,
             Err(e) => {
                 let reason = e.to_string();
-                if reason.contains("agent_pane_busy")
-                    && Instant::now() < pane_busy_deadline
-                {
+                if reason.contains("agent_pane_busy") && Instant::now() < pane_busy_deadline {
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
