@@ -94,8 +94,11 @@ pub(crate) enum Commands {
         kind: String,
         #[arg(long)]
         machine: String,
+        /// Repo path on the target machine ("~" = its home dir). Optional:
+        /// omit to reuse the machine's only workspace, or create one in the
+        /// server's default directory (home).
         #[arg(long)]
-        repo: String,
+        repo: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]

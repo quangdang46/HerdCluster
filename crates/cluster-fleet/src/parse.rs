@@ -79,9 +79,6 @@ pub(crate) fn find_id(value: &Value, keys: &[&str], depth: usize) -> Option<Stri
     }
 }
 
-/// Common identifier key aliases, most-specific first.
-pub(crate) const ID_KEYS: &[&str] = &["pane_id", "workspace_id", "agent_id", "terminal_id", "id"];
-
 /// Agent-status aliases. herdr 0.9.5 reports `agent_status`; `status`/`state`
 /// are kept for older/alternate shapes.
 pub(crate) const STATUS_KEYS: &[&str] = &["agent_status", "status", "state"];

@@ -31,9 +31,10 @@ herdcluster agent prompt <id> "..."  # send a prompt
 herdcluster agent send-keys <id> ... # raw keys
 herdcluster agent rename <id> <new>
 
-herdcluster spawn <name> --kind <kind> --machine <label|auto> --repo <path> [--branch b] [--json] [-- agent args]
+herdcluster spawn <name> --kind <kind> --machine <label|auto> [--repo <path>] [--branch b] [--json] [-- agent args]
                                      # one-step: workspace+pane+agent.start,
-                                     # prints global id when ready (~35s)
+                                     # prints global id when ready (~35s);
+                                     # --repo optional ("~" = home dir)
 
 herdcluster status [--all] [--json]  # cluster overview
 herdcluster doctor [--fix] [--machine <label>] [--json]  # health checks
@@ -47,7 +48,9 @@ herdcluster autostart status|install|uninstall  # worker daemon persistence
 
 1. `herdcluster machines` — pick a target or use `--machine auto`.
 2. `herdcluster spawn <name> --kind claude --machine auto --repo <path>` —
-   `--repo` is a path **on the machine that will run the agent**.
+   `--repo` is a path **on the machine that will run the agent**. Omit it
+   to reuse the machine's only workspace or create one in the server's
+   default (home) directory; `--repo ~` means the target's home dir.
 3. Use the printed global id (`<machine>/<name>`) for all follow-ups.
 4. `herdcluster agent prompt <id> "<task>"` then `agent wait`/`agent read`.
 

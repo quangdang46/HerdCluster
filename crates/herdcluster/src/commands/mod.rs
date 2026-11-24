@@ -66,7 +66,7 @@ pub fn dispatch(command: Commands, verbose: bool) -> i32 {
             json,
             agent_args,
         } => spawn::run(
-            &name, &kind, &machine, &repo, branch, json, agent_args, verbose,
+            &name, &kind, &machine, repo, branch, json, agent_args, verbose,
         ),
         Commands::Agent { command } => agent::run(command, verbose),
         Commands::Status { all, json } => status::run(all, json, verbose),

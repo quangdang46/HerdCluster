@@ -11,8 +11,9 @@
 //!    doubles as the agent-CLI-presence hint). When neither source yields
 //!    any kinds the check is skipped and `agent.start` remains the
 //!    authority — a clear `agent_start_failed` error, never silent.
-//! 3. **Ensure workspace** — `workspace.list` searched by repo path, else
-//!    `workspace.create {cwd}`.
+//! 3. **Ensure workspace** — `workspace.list` searched by repo path (or,
+//!    when `--repo` is omitted, the machine's single existing workspace),
+//!    else `workspace.create`. See [`ensure_workspace`].
 //! 4. **Ensure dedicated pane** — see [`ensure_pane`] for the chosen
 //!    strategy.
 //! 5. **`agent.start`** in that pane, then poll `agent.get` until the
@@ -24,6 +25,18 @@
 //! remote worker that is a WSL2/Linux path, not a macOS path (PLAN.md
 //! §3.8, `--repo-map` is a later option).
 //!
+//! `repo_path` is optional (`None` when `--repo` is omitted):
+//! - Omitted → reuse the target machine's existing workspace when exactly
+//!   one exists; otherwise `workspace.create` **without `cwd`** so the
+//!   herdr server picks its default working directory (the server user's
+//!   home directory in practice — `cwd` is optional in the 0.9.5 schema).
+//! - `"~"` / `"~/…"` → expanded against the target's home directory. For
+//!   the local machine that is `$HOME`; a remote worker's home is not
+//!   discoverable through the API, so `~` there degrades to the same
+//!   default-placement behavior as omitting `--repo`.
+//! - Any other value → find-or-create a workspace for that target-local
+//!   path, exactly as before.
+//!
 //! ## `--branch` semantics
 //!
 //! `branch` is accepted for forward compatibility (a future `--worktree`
@@ -34,7 +47,7 @@
 //! Sync only: `api-client` is synchronous; the CLI calls [`spawn`]
 //! directly.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use api_client::methods::{
@@ -88,7 +101,9 @@ pub struct SpawnRequest {
     /// Machine selection.
     pub machine: MachineTarget,
     /// Repository path **on the target machine** (see module docs).
-    pub repo_path: String,
+    /// `None` = `--repo` omitted: reuse the machine's single workspace or
+    /// create one with the server-default cwd.
+    pub repo_path: Option<String>,
     /// Optional branch — recorded, not yet consumed (see module docs).
     pub branch: Option<String>,
     /// Extra CLI args forwarded to `agent.start`.
@@ -536,26 +551,128 @@ fn check_kind_supported(
     }
 }
 
-/// Path field aliases on workspace list items.
+/// Path field aliases on workspace list items. herdr 0.9.5 `WorkspaceInfo`
+/// has NO top-level cwd — kept for older/alternate shapes.
 const WORKSPACE_PATH_KEYS: &[&str] = &["cwd", "root", "path", "repo_path", "worktree_path"];
-/// Path field aliases on pane list items (unused today; kept for the
-/// workspace-root fallback if pane ids ever need path matching).
-#[allow(dead_code)]
-const PANE_PATH_KEYS: &[&str] = &["cwd", "path"];
+/// Path field aliases nested under `worktree` on a `WorkspaceInfo`
+/// (`WorkspaceWorktreeInfo`: `checkout_path`, `repo_root`). Present only
+/// for workspaces that belong to a Herdr worktree group.
+const WORKTREE_PATH_KEYS: &[&str] = &["checkout_path", "repo_root"];
+/// Pane cwd aliases used for repo matching (`PaneInfo.cwd` /
+/// `foreground_cwd`).
+const PANE_CWD_KEYS: &[&str] = &["cwd", "foreground_cwd"];
 
-/// Find a workspace id whose cwd matches `repo_path`.
+/// Extract the workspace id from a workspace-ish response.
 ///
-/// Matches when the workspace path equals `repo_path` or lies inside it
-/// (`<repo>/…`). Pure — unit-tested.
-fn find_workspace_by_path(list: &Value, repo_path: &str) -> Option<String> {
-    let repo = repo_path.trim_end_matches('/');
-    for item in parse::items_array(list) {
-        let Some(ws_path) = parse::str_field(item, WORKSPACE_PATH_KEYS) else {
+/// herdr 0.9.5 `workspace.create` returns
+/// `{"type":"workspace_created","workspace":{…WorkspaceInfo…},"tab":{…},
+/// "root_pane":{…PaneInfo…}}`. The id MUST come from the `workspace`
+/// object (`workspace_id`, falling back to `id`). A generic id-key search
+/// over the whole response can land on `root_pane.pane_id` ("w2:p1") —
+/// pane and workspace ids share the `w<N>:…` namespace shape only in
+/// appearance; passing a pane id where a workspace id is expected fails
+/// downstream with `workspace_not_found` (the spawn blocker this guards
+/// against). There is deliberately NO fallback to `pane_id`/`agent_id`.
+fn workspace_id_of(value: &Value) -> Option<String> {
+    let ws = parse::unwrap_entity(value, "workspace");
+    parse::find_id(ws, &["workspace_id", "id"], 2)
+        .or_else(|| parse::find_id(value, &["workspace_id"], 3))
+}
+
+/// Extract a pane id from a pane-ish response (`pane.split` →
+/// `{"type":"pane_info","pane":{…}}`, possibly `tab_created` with a
+/// `root_pane`). Prefers `pane_id` inside the `pane` wrapper; the
+/// top-level `pane_id`-only fallback can still find `root_pane.pane_id`,
+/// which IS a pane id — safe here, unlike the workspace case.
+fn pane_id_of(value: &Value) -> Option<String> {
+    let pane = parse::unwrap_entity(value, "pane");
+    parse::find_id(pane, &["pane_id", "id"], 2).or_else(|| parse::find_id(value, &["pane_id"], 3))
+}
+
+/// Path candidates that identify which repo a workspace belongs to:
+/// top-level aliases (older shapes), `worktree.checkout_path` /
+/// `worktree.repo_root` (herdr 0.9.5), plus every pane `cwd` /
+/// `foreground_cwd` reported for the workspace by `pane.list`.
+fn workspace_path_candidates<'a>(
+    item: &'a Value,
+    pane_cwds: &'a HashMap<String, Vec<String>>,
+) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    if let Some(p) = parse::str_field(item, WORKSPACE_PATH_KEYS) {
+        out.push(p);
+    }
+    if let Some(wt) = item.get("worktree") {
+        // Collect EVERY worktree path alias — `checkout_path` (the linked
+        // worktree dir, outside the repo) and `repo_root` (the main
+        // checkout, == the repo) carry different matching value, so the
+        // first-match `str_field` helper is not sufficient here.
+        if let Some(wt_obj) = wt.as_object() {
+            for key in WORKTREE_PATH_KEYS {
+                if let Some(p) = wt_obj.get(*key).and_then(Value::as_str) {
+                    if !p.is_empty() {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(ws_id) = parse::str_field(item, &["workspace_id", "id"]) {
+        if let Some(cwds) = pane_cwds.get(ws_id) {
+            out.extend(cwds.iter().map(String::as_str));
+        }
+    }
+    out
+}
+
+/// `candidate` identifies `repo` when it equals the repo path or lies
+/// inside it (`<repo>/…`) — same rule the original path matcher used.
+fn path_matches_repo(candidate: &str, repo: &str) -> bool {
+    let repo = repo.trim_end_matches('/');
+    let cand = candidate.trim_end_matches('/');
+    cand == repo || cand.starts_with(&format!("{repo}/"))
+}
+
+/// Pure: workspace id to reuse when `--repo` is omitted — exactly one
+/// workspace on the machine, per the spawn contract.
+fn sole_workspace_id(list: &Value) -> Option<String> {
+    let items = parse::items_array(list);
+    if items.len() == 1 {
+        workspace_id_of(&items[0])
+    } else {
+        None
+    }
+}
+
+/// Pure: find the workspace serving `repo_path`.
+///
+/// `list` is a `workspace.list` result; `panes` is an (optional, possibly
+/// empty) `pane.list` result used to recover cwds that `WorkspaceInfo`
+/// does not expose. Matches when any path candidate equals `repo_path`
+/// or lies inside it.
+fn find_workspace_for_repo(list: &Value, panes: &Value, repo_path: &str) -> Option<String> {
+    // workspace_id → pane cwds, from `pane.list` (PaneInfo.cwd /
+    // foreground_cwd). Best-effort: callers pass an empty value on error.
+    let mut pane_cwds: HashMap<String, Vec<String>> = HashMap::new();
+    for p in parse::items_array(panes) {
+        let Some(ws_id) = parse::str_field(p, &["workspace_id"]) else {
             continue;
         };
-        let ws = ws_path.trim_end_matches('/');
-        if ws == repo || ws.starts_with(&format!("{repo}/")) {
-            if let Some(id) = parse::find_id(item, &["workspace_id", "id"], 2) {
+        let entry = pane_cwds.entry(ws_id.to_string()).or_default();
+        for key in PANE_CWD_KEYS {
+            if let Some(cwd) = p.get(*key).and_then(Value::as_str) {
+                if !cwd.is_empty() && !entry.iter().any(|c| c == cwd) {
+                    entry.push(cwd.to_string());
+                }
+            }
+        }
+    }
+
+    for item in parse::items_array(list) {
+        if workspace_path_candidates(item, &pane_cwds)
+            .iter()
+            .any(|c| path_matches_repo(c, repo_path))
+        {
+            if let Some(id) = workspace_id_of(item) {
                 return Some(id);
             }
         }
@@ -563,40 +680,71 @@ fn find_workspace_by_path(list: &Value, repo_path: &str) -> Option<String> {
     None
 }
 
-/// Ensure a workspace exists for `repo_path`; returns `(workspace_id,
-/// created)`.
-fn ensure_workspace(
+/// `workspace.create` wrapper shared by both placement modes. `cwd=None`
+/// omits the field so the herdr server picks its default working
+/// directory (its user's home in practice).
+fn create_workspace(
     client: &api_client::ApiClient,
     ep: &MachineEndpoint,
-    repo_path: &str,
+    cwd: Option<&str>,
     label: &str,
 ) -> Result<(String, bool), SpawnError> {
-    let list = client
-        .workspace_list()
-        .map_err(|e| step_error(ep, "workspace.list", e))?;
-    if let Some(id) = find_workspace_by_path(&list, repo_path) {
-        return Ok((id, false));
-    }
     let created = client
         .workspace_create(&WorkspaceCreateParams {
-            cwd: Some(repo_path.to_string()),
+            cwd: cwd.map(str::to_string),
             label: Some(label.to_string()),
             focus: Some(false),
             env: None,
             source_workspace_id: None,
         })
         .map_err(|e| step_error(ep, "workspace.create", e))?;
-    // `workspace.create` returns `{workspace, tab, root_pane}` — a generic
-    // ID_KEYS search can land on `root_pane.pane_id` ("w2:p1") before the
-    // workspace id, so prefer `workspace_id` explicitly (verified against
-    // herdr 0.9.5 in the loopback e2e).
-    parse::find_id(&created, &["workspace_id"], 3)
-        .or_else(|| parse::find_id(&created, parse::ID_KEYS, 3))
+    workspace_id_of(&created)
         .map(|id| (id, true))
         .ok_or_else(|| SpawnError::WorkspaceFailed {
             machine: ep.label.clone(),
             reason: "workspace.create returned no workspace id".to_string(),
         })
+}
+
+/// Ensure a workspace exists for the requested placement; returns
+/// `(workspace_id, created)`.
+///
+/// `repo` is the effective target-local path (`None` = `--repo` omitted
+/// or unresolvable `~`):
+/// - `None` → reuse the machine's workspace when exactly one exists,
+///   else create with `cwd` omitted (server default).
+/// - `Some(path)` → find a workspace serving that path (workspace list +
+///   pane cwds + worktree provenance), else `workspace.create {cwd}`.
+fn ensure_workspace(
+    client: &api_client::ApiClient,
+    ep: &MachineEndpoint,
+    repo: Option<&str>,
+    label: &str,
+) -> Result<(String, bool), SpawnError> {
+    let list = client
+        .workspace_list()
+        .map_err(|e| step_error(ep, "workspace.list", e))?;
+
+    match repo {
+        None => {
+            if let Some(id) = sole_workspace_id(&list) {
+                return Ok((id, false));
+            }
+            create_workspace(client, ep, None, label)
+        }
+        Some(path) => {
+            // `pane.list` is best-effort: WorkspaceInfo alone cannot prove
+            // a path match for plain (non-worktree) workspaces, but a
+            // failed pane list must not block the create fallback.
+            let panes = client
+                .pane_list(None)
+                .unwrap_or_else(|_| serde_json::json!({"panes": []}));
+            if let Some(id) = find_workspace_for_repo(&list, &panes, path) {
+                return Ok((id, false));
+            }
+            create_workspace(client, ep, Some(path), label)
+        }
+    }
 }
 
 /// Collect pane ids for a workspace, preserving response order.
@@ -609,7 +757,7 @@ fn pane_ids(client: &api_client::ApiClient, workspace_id: &str) -> Result<Vec<St
         })?;
     Ok(parse::items_array(&list)
         .iter()
-        .filter_map(|p| parse::find_id(p, parse::ID_KEYS, 1))
+        .filter_map(pane_id_of)
         .collect())
 }
 
@@ -627,7 +775,7 @@ fn ensure_pane(
     client: &api_client::ApiClient,
     ep: &MachineEndpoint,
     workspace_id: &str,
-    repo_path: &str,
+    repo_path: Option<&str>,
     created_workspace: bool,
 ) -> Result<String, SpawnError> {
     let before = pane_ids(client, workspace_id).map_err(|mut e| {
@@ -648,7 +796,7 @@ fn ensure_pane(
         .pane_split(&PaneSplitParams {
             direction: SplitDirection::Down,
             target_pane_id: before.first().cloned(),
-            cwd: Some(repo_path.to_string()),
+            cwd: repo_path.map(str::to_string),
             env: None,
             focus: Some(false),
             ratio: None,
@@ -659,7 +807,7 @@ fn ensure_pane(
             reason: e.to_string(),
         })?;
 
-    if let Some(id) = parse::find_id(&split, parse::ID_KEYS, 3) {
+    if let Some(id) = pane_id_of(&split) {
         return Ok(id);
     }
 
@@ -765,6 +913,39 @@ fn step_error(ep: &MachineEndpoint, step: &str, e: ApiError) -> SpawnError {
 // Public entry point
 // ---------------------------------------------------------------------------
 
+/// Expand a leading `~` / `~/…` in a `--repo` value against the target
+/// machine's home directory.
+///
+/// Returns `Some(path)` for ordinary absolute/relative target-local paths
+/// and for `~` on the local machine (`$HOME`). Returns `None` — the
+/// default-placement mode — when `--repo` was omitted, was blank, or was
+/// `~`-rooted on a **remote** worker: a remote home directory is not
+/// discoverable through the herdr API, so `~` degrades to the same
+/// behavior as omitting `--repo` (reuse the single workspace, else
+/// `workspace.create` with server-default cwd, which is the remote
+/// server user's home in practice).
+fn effective_repo_path(req_repo: &Option<String>, is_local: bool) -> Option<String> {
+    let raw = req_repo.as_deref()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == "~" || raw.starts_with("~/") {
+        if !is_local {
+            return None;
+        }
+        let home = std::env::home_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| "/".to_string());
+        return Some(if raw == "~" {
+            home
+        } else {
+            format!("{home}/{}", &raw[2..])
+        });
+    }
+    Some(raw.to_string())
+}
+
 /// Compose and run a spawn: resolve machine → pre-flight → workspace →
 /// pane → `agent.start` → wait ready. See module docs.
 pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, SpawnError> {
@@ -789,11 +970,15 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
     // Pre-flight: kind support (manifests ∪ reported kinds).
     check_kind_supported(ctx, &ep, &client, &req.kind)?;
 
-    // Workspace: find by repo path or create.
-    let (workspace_id, created) = ensure_workspace(&client, &ep, &req.repo_path, &req.name)?;
+    // Effective repo placement: `--repo` path, `~` expansion, or default
+    // placement (`None`) when omitted.
+    let repo = effective_repo_path(&req.repo_path, ep.kind == MachineKind::Local);
+
+    // Workspace: find by repo path / sole workspace, or create.
+    let (workspace_id, created) = ensure_workspace(&client, &ep, repo.as_deref(), &req.name)?;
 
     // Dedicated pane.
-    let pane_id = ensure_pane(&client, &ep, &workspace_id, &req.repo_path, created)?;
+    let pane_id = ensure_pane(&client, &ep, &workspace_id, repo.as_deref(), created)?;
 
     // Launch the agent.
     let args = if req.extra_agent_args.is_empty() {
@@ -875,7 +1060,7 @@ mod tests {
             name: "agent-1".into(),
             kind: "claude".into(),
             machine,
-            repo_path: "/repo".into(),
+            repo_path: Some("/repo".into()),
             branch: None,
             extra_agent_args: vec![],
             ready_timeout: Some(Duration::from_millis(10)),
@@ -926,24 +1111,191 @@ mod tests {
         assert!(!kinds.contains(&"checked".to_string()));
     }
 
+    /// Real herdr 0.9.5 `workspace.create` result shape (from the API
+    /// schema `workspace_created`): `{type, workspace, tab, root_pane}`
+    /// where `root_pane` is a full `PaneInfo` carrying BOTH `pane_id`
+    /// ("w2E:p1") and `workspace_id` ("w2E").
+    fn workspace_created_fixture() -> Value {
+        json!({
+            "type": "workspace_created",
+            "workspace": {
+                "workspace_id": "w2E", "number": 17, "label": "agent-1",
+                "focused": false, "pane_count": 1, "tab_count": 1,
+                "active_tab_id": "w2E:t1", "agent_status": "unknown"
+            },
+            "tab": {
+                "tab_id": "w2E:t1", "workspace_id": "w2E", "number": 1,
+                "label": "1", "focused": true, "pane_count": 1,
+                "agent_status": "unknown"
+            },
+            "root_pane": {
+                "pane_id": "w2E:p1", "terminal_id": "term_abc",
+                "workspace_id": "w2E", "tab_id": "w2E:t1", "focused": true,
+                "agent_status": "unknown", "cwd": "/repo", "revision": 0
+            }
+        })
+    }
+
     #[test]
-    fn find_workspace_by_path_matching() {
-        let list = json!({"workspaces": [
-            {"id": "w1", "cwd": "/repo"},
-            {"workspace_id": "w2", "root": "/other"},
-            {"id": "w3", "path": "/repo/sub/dir"}
-        ]});
-        // Exact match wins (first in order that matches).
-        assert_eq!(find_workspace_by_path(&list, "/repo"), Some("w1".into()));
-        // Workspace inside repo matches.
+    fn workspace_id_of_never_returns_pane_id() {
+        // Regression for the spawn blocker: a generic id search over the
+        // workspace.create response lands on root_pane.pane_id ("w2E:p1")
+        // and the pane step then fails with `workspace w2E:p1 not found`.
+        let created = workspace_created_fixture();
+        assert_eq!(workspace_id_of(&created).as_deref(), Some("w2E"));
+        // The buggy generic search demonstrably finds the pane id first —
+        // proving the dedicated extractor is load-bearing.
         assert_eq!(
-            find_workspace_by_path(&list, "/repo/sub"),
+            parse::find_id(&created, &["pane_id", "workspace_id", "id"], 3).as_deref(),
+            Some("w2E:p1")
+        );
+    }
+
+    #[test]
+    fn workspace_id_of_reads_workspace_info_and_list_items() {
+        // `workspace.get`-style single-entity response.
+        let info = json!({"type": "workspace_info", "workspace": {
+            "workspace_id": "w2", "number": 1, "label": "x", "focused": true,
+            "pane_count": 1, "tab_count": 1, "active_tab_id": "w2:t1",
+            "agent_status": "unknown"
+        }});
+        assert_eq!(workspace_id_of(&info).as_deref(), Some("w2"));
+        // Bare WorkspaceInfo item (workspace.list element).
+        let item = json!({"workspace_id": "w3", "label": "y"});
+        assert_eq!(workspace_id_of(&item).as_deref(), Some("w3"));
+        // Garbage → None, never a pane/agent id.
+        assert_eq!(workspace_id_of(&json!({"pane_id": "w9:p1"})), None);
+    }
+
+    #[test]
+    fn sole_workspace_id_requires_exactly_one() {
+        let one = json!({"type": "workspace_list", "workspaces": [
+            {"workspace_id": "w2", "label": "only"}
+        ]});
+        assert_eq!(sole_workspace_id(&one).as_deref(), Some("w2"));
+        let two = json!({"workspaces": [
+            {"workspace_id": "w2"}, {"workspace_id": "w3"}
+        ]});
+        assert_eq!(sole_workspace_id(&two), None);
+        let zero = json!({"workspaces": []});
+        assert_eq!(sole_workspace_id(&zero), None);
+    }
+
+    #[test]
+    fn find_workspace_for_repo_matches_real_095_shapes() {
+        // Real herdr 0.9.5 workspace.list: WorkspaceInfo has NO top-level
+        // cwd; path info lives under `worktree` (worktree groups only) or
+        // is recoverable from pane.list cwds.
+        let list = json!({"type": "workspace_list", "workspaces": [
+            // Plain workspace, no worktree provenance — matched via pane cwd.
+            {"workspace_id": "w2", "label": "proj", "number": 1,
+             "focused": true, "pane_count": 1, "tab_count": 1,
+             "active_tab_id": "w2:t1", "agent_status": "unknown"},
+            // Worktree-group workspace — matched via worktree.repo_root.
+            {"workspace_id": "w3", "label": "wt", "number": 2,
+             "focused": false, "pane_count": 1, "tab_count": 1,
+             "active_tab_id": "w3:t1", "agent_status": "unknown",
+             "worktree": {
+                 "repo_key": "/repo/.git", "repo_name": "repo",
+                 "repo_root": "/repo",
+                 "checkout_path": "/home/u/.herdr/worktrees/repo/wt",
+                 "is_linked_worktree": true
+             }},
+            // Unrelated workspace.
+            {"workspace_id": "w4", "label": "other", "number": 3,
+             "focused": false, "pane_count": 1, "tab_count": 1,
+             "active_tab_id": "w4:t1", "agent_status": "unknown"}
+        ]});
+        let panes = json!({"type": "pane_list", "panes": [
+            {"pane_id": "w2:p1", "workspace_id": "w2", "tab_id": "w2:t1",
+             "cwd": "/repo", "focused": true, "agent_status": "unknown",
+             "revision": 0, "terminal_id": "term_1"},
+            {"pane_id": "w4:p1", "workspace_id": "w4", "tab_id": "w4:t1",
+             "cwd": "/elsewhere", "focused": false, "agent_status": "unknown",
+             "revision": 0, "terminal_id": "term_2"}
+        ]});
+
+        // Pane cwd equality matches the plain workspace (first in order).
+        assert_eq!(
+            find_workspace_for_repo(&list, &panes, "/repo"),
+            Some("w2".into())
+        );
+        // worktree.repo_root equality also matches (w2 wins on order, so
+        // use a repo only w3 serves).
+        let list2 = json!({"workspaces": [
+            {"workspace_id": "w3", "worktree": {"repo_root": "/repo2",
+                "checkout_path": "/wt/x", "repo_key": "/repo2/.git",
+                "repo_name": "r", "is_linked_worktree": true}},
+            {"workspace_id": "w9"}
+        ]});
+        assert_eq!(
+            find_workspace_for_repo(&list2, &json!({"panes": []}), "/repo2"),
             Some("w3".into())
         );
-        // Trailing slash tolerated.
-        assert_eq!(find_workspace_by_path(&list, "/repo/"), Some("w1".into()));
-        // No match.
-        assert_eq!(find_workspace_by_path(&list, "/nowhere"), None);
+        // Inside-repo pane cwd matches; trailing slash tolerated.
+        let panes_sub = json!({"panes": [
+            {"pane_id": "w5:p1", "workspace_id": "w5",
+             "cwd": "/repo/sub/dir"}
+        ]});
+        let list3 = json!({"workspaces": [{"workspace_id": "w5"}]});
+        assert_eq!(
+            find_workspace_for_repo(&list3, &panes_sub, "/repo/"),
+            Some("w5".into())
+        );
+        // No candidates → None.
+        assert_eq!(
+            find_workspace_for_repo(&list3, &json!({"panes": []}), "/nowhere"),
+            None
+        );
+    }
+
+    #[test]
+    fn pane_id_of_reads_pane_info_wrapper() {
+        // pane.split → {"type":"pane_info","pane":{PaneInfo}}.
+        let split = json!({"type": "pane_info", "pane": {
+            "pane_id": "w2:p2", "workspace_id": "w2", "tab_id": "w2:t1",
+            "terminal_id": "term_9", "focused": false,
+            "agent_status": "unknown", "revision": 0
+        }});
+        assert_eq!(pane_id_of(&split).as_deref(), Some("w2:p2"));
+        // tab_created shape: id lives under root_pane.
+        let created = json!({"type": "tab_created",
+            "tab": {"tab_id": "w2:t2", "workspace_id": "w2"},
+            "root_pane": {"pane_id": "w2:p3", "workspace_id": "w2"}});
+        assert_eq!(pane_id_of(&created).as_deref(), Some("w2:p3"));
+        // Bare PaneInfo item.
+        assert_eq!(
+            pane_id_of(&json!({"pane_id": "w1:p1"})).as_deref(),
+            Some("w1:p1")
+        );
+    }
+
+    #[test]
+    fn effective_repo_path_handles_tilde_and_blank() {
+        // Omitted / blank → default placement.
+        assert_eq!(effective_repo_path(&None, true), None);
+        assert_eq!(effective_repo_path(&Some("  ".into()), true), None);
+        // Ordinary path passes through.
+        assert_eq!(
+            effective_repo_path(&Some("/repo".into()), false),
+            Some("/repo".into())
+        );
+        // `~` on a remote worker → default placement (remote home is not
+        // discoverable via the API).
+        assert_eq!(effective_repo_path(&Some("~".into()), false), None);
+        assert_eq!(effective_repo_path(&Some("~/proj".into()), false), None);
+        // `~` on local expands via $HOME (present in test envs; if absent
+        // the fallback is "/").
+        let home = std::env::home_dir().unwrap_or_else(|| "/".into());
+        let home = home.to_string_lossy().into_owned();
+        assert_eq!(
+            effective_repo_path(&Some("~".into()), true),
+            Some(home.clone())
+        );
+        assert_eq!(
+            effective_repo_path(&Some("~/proj".into()), true),
+            Some(format!("{home}/proj"))
+        );
     }
 
     #[test]

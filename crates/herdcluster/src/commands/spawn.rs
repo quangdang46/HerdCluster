@@ -8,13 +8,13 @@ use cluster_fleet::{spawn, FleetContext, MachineTarget, SpawnRequest};
 
 use super::{load_ctx, report_spawn_error, vlog};
 
-/// `herdcluster spawn <name> --kind <k> --machine <m|auto> --repo <path> ...`
+/// `herdcluster spawn <name> --kind <k> --machine <m|auto> [--repo <path>] ...`
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,
     kind: &str,
     machine: &str,
-    repo: &str,
+    repo: Option<String>,
     branch: Option<String>,
     json: bool,
     agent_args: Vec<String>,
@@ -29,7 +29,7 @@ pub fn run(
         name: name.to_string(),
         kind: kind.to_string(),
         machine: parse_machine_target(machine),
-        repo_path: repo.to_string(),
+        repo_path: repo,
         branch,
         extra_agent_args: agent_args,
         ready_timeout: None, // fleet default (35s, PLAN.md §3.8)

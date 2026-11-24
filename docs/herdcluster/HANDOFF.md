@@ -91,6 +91,7 @@ time and flagged by `herdcluster doctor` ("machine caps" check).
 
 ```bash
 herdcluster spawn fix-auth --kind claude --machine auto --repo /home/you/project
+herdcluster spawn fix-auth --kind claude --machine auto   # --repo optional
 herdcluster agent prompt mac.local/fix-auth "implement JWT auth"
 herdcluster agent read mac.local/fix-auth
 herdcluster agent list --all
@@ -98,7 +99,14 @@ herdcluster agent list --all
 
 - `--machine auto` picks the worker with the most free RAM/slots.
 - `--repo` is a path **on the machine that runs the agent** (WSL path for
-  worker-spawned agents).
+  worker-spawned agents). It is optional:
+  - Omit it to reuse the target machine's existing workspace when exactly
+    one exists; otherwise a new workspace is created in the herdr server's
+    default directory (the server user's home).
+  - `--repo ~` (or `~/sub/dir`) means the target's home directory. On
+    remote workers the home dir isn't discoverable via the API, so `~`
+    falls back to the same default-placement behavior as omitting
+    `--repo`; pass absolute remote paths for anything else.
 - Agent CLIs (claude, codex…) must be installed on WSL2 — `herdcluster
   doctor` and the join output list which kinds are missing and how to
   install them. HerdCluster never handles agent logins — run e.g.
