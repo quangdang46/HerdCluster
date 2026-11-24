@@ -38,6 +38,8 @@ use cluster_fleet::endpoint::{bridge_socket_path, LOCAL_LABEL};
 const DISCOVERY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Per-request timeout for bridge `ping` probes.
 const BRIDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Per-request timeout for `agent.list` capacity probes.
+const CAPACITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Free disk below this is a hard fail; below [`DISK_WARN_BYTES`] warns.
 const DISK_FAIL_BYTES: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 const DISK_WARN_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
@@ -142,6 +144,13 @@ pub async fn run_doctor(opts: DoctorOptions) -> Result<DoctorReport, DoctorError
     check_lan_discovery(&mut checks).await;
     let workers = check_workers_registered(&state_dir, opts.machine.as_deref(), &mut checks);
     check_machine_endpoints(&state_dir, &workers, &mut checks);
+    check_machine_capacity(
+        cluster.as_ref(),
+        &workers,
+        &state_dir,
+        opts.machine.as_deref(),
+        &mut checks,
+    );
     check_agent_clis(&mut checks);
     check_repo_path(opts.repo.as_deref(), &mut checks);
     check_disk_space(&state_dir, &mut checks);
@@ -160,7 +169,6 @@ pub async fn run_doctor(opts: DoctorOptions) -> Result<DoctorReport, DoctorError
         apply_fixes(&opts, &state_dir, &mut checks, &mut fixed)?;
     }
 
-    let _ = cluster; // config outcome already recorded as a check
     let ok = !checks.iter().any(|c| c.status == CheckStatus::Fail);
     Ok(DoctorReport { checks, ok, fixed })
 }
@@ -700,6 +708,122 @@ fn status_word(s: WorkerStatus) -> &'static str {
     }
 }
 
+// ---- 7b. machine capacity vs live agent counts ----
+
+/// Count items in a list-style API response (`{"agents": [...]}`, bare
+/// array, …). Mirrors `cluster-fleet`'s defensive `items_array` (private
+/// there); kept local so doctor does not depend on fleet internals.
+fn agent_list_len(value: &serde_json::Value) -> usize {
+    if let Some(a) = value.as_array() {
+        return a.len();
+    }
+    const COLLECTION_KEYS: &[&str] = &["agents", "items", "results", "manifests"];
+    for key in COLLECTION_KEYS {
+        if let Some(a) = value.get(*key).and_then(|v| v.as_array()) {
+            return a.len();
+        }
+    }
+    0
+}
+
+/// Best-effort live `agent.list` count for one connected endpoint.
+fn probe_agent_count(client: &api_client::ApiClient) -> Option<usize> {
+    client
+        .request_with_timeout("agent.list", &serde_json::json!({}), CAPACITY_PROBE_TIMEOUT)
+        .ok()
+        .map(|v| agent_list_len(&v))
+}
+
+/// Compare each in-scope machine's effective `max_agents` against its live
+/// `agent.list` count (issue #7).
+///
+/// `machine caps` above only proves the *configured value* is well-formed;
+/// this check is the one that would have caught a cap being exceeded 4x.
+/// Unreachable machines are skipped — the endpoint checks already report
+/// why — and the verdict is `warn` (not `fail`) because over-cap agents
+/// are still running correctly, just outside policy.
+fn check_machine_capacity(
+    cluster: Option<&registry::ClusterInfo>,
+    workers: &[WorkerEntry],
+    state_dir: &Path,
+    machine: Option<&str>,
+    checks: &mut Vec<CheckResult>,
+) {
+    let Some(info) = cluster else {
+        return; // the "cluster config" check already reported why
+    };
+
+    let include_local = machine.map(|m| m == LOCAL_LABEL).unwrap_or(true);
+    let mut evaluated = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+
+    if include_local {
+        if let Ok(client) = api_client::ApiClient::connect_default() {
+            if let Some(count) = probe_agent_count(&client) {
+                evaluated += 1;
+                let max = crate::scheduler_wire::effective_max_agents(
+                    info.machines.get(LOCAL_LABEL).and_then(|o| o.max_agents),
+                    None,
+                );
+                if count as u32 > max {
+                    violations.push(format!(
+                        "{LOCAL_LABEL} holds {count} agents, max_agents={max}"
+                    ));
+                }
+            }
+        }
+    }
+
+    for w in workers {
+        if w.status == WorkerStatus::Offline {
+            continue; // endpoint check already warned; no live count available
+        }
+        let sock = bridge_socket_path(state_dir, &w.label);
+        let Ok(client) = api_client::ApiClient::connect(&sock) else {
+            continue;
+        };
+        let Some(count) = probe_agent_count(&client) else {
+            continue;
+        };
+        evaluated += 1;
+        let max = crate::scheduler_wire::effective_max_agents(
+            info.machines.get(&w.label).and_then(|o| o.max_agents),
+            w.resources.as_ref().map(|r| r.max_agents),
+        );
+        if count as u32 > max {
+            violations.push(format!(
+                "{} holds {} agents, max_agents={}",
+                w.label, count, max
+            ));
+        }
+    }
+
+    if !violations.is_empty() {
+        push_hint(
+            checks,
+            "machine capacity",
+            CheckStatus::Warn,
+            violations.join("; "),
+            "stop agents or raise machines.<label>.max_agents in cluster.json",
+        );
+    } else if evaluated > 0 {
+        push(
+            checks,
+            "machine capacity",
+            CheckStatus::Pass,
+            format!("{evaluated} machine(s) within agent caps"),
+        );
+    } else {
+        push_hint(
+            checks,
+            "machine capacity",
+            CheckStatus::Warn,
+            "no reachable machine agent counts; caps not verified",
+            "start herdr/the worker bridges, then re-run doctor",
+        );
+    }
+}
+
 // ---- 8. agent CLIs ----
 
 fn check_agent_clis(checks: &mut Vec<CheckResult>) {
@@ -1236,6 +1360,17 @@ mod tests {
         assert_eq!(v["ok"], true);
         assert_eq!(v["checks"][0]["status"], "pass");
         assert_eq!(v["checks"][0]["name"], "x");
+    }
+
+    #[test]
+    fn agent_list_len_counts_list_shapes() {
+        assert_eq!(agent_list_len(&serde_json::json!([])), 0);
+        assert_eq!(
+            agent_list_len(&serde_json::json!({"agents": [{}, {}, {}]})),
+            3
+        );
+        assert_eq!(agent_list_len(&serde_json::json!([{}, {}])), 2);
+        assert_eq!(agent_list_len(&serde_json::json!({"ok": true})), 0);
     }
 
     #[test]

@@ -59,8 +59,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use api_client::methods::{
-    AgentStartParams, PaneSplitParams, ReadFormat, ReadSource, SplitDirection,
-    WorkspaceCreateParams,
+    AgentStartParams, PaneSplitParams, SplitDirection, WorkspaceCreateParams,
 };
 use api_client::ApiError;
 use cluster_core::registry::WorkerStatus;
@@ -83,6 +82,11 @@ const READY_POLL_INTERVAL: Duration = Duration::from_millis(400);
 /// Per-`agent.get` poll request timeout (must be < ready_timeout to allow
 /// retries).
 const READY_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound for the pre-launch handshake (machine → kind → workspace → pane →
+/// `agent.start`). Readiness is bounded separately by `ready_timeout`, so
+/// the worst-case spawn is roughly this plus the ready wait — never the sum
+/// of every per-call default timeout.
+const SPAWN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Fallback `mem_available_mb` for the local machine's scheduler caps.
 ///
 /// std has no portable memory API and the local resource reporter is a
@@ -220,6 +224,32 @@ pub enum SpawnError {
         /// `None` when the pane read failed or returned no text.
         output_tail: Option<String>,
     },
+    /// A pre-launch handshake step exceeded [`SPAWN_HANDSHAKE_TIMEOUT`].
+    ///
+    /// This is the whole-spawn bound issue #8 asked for: workspace/pane/
+    /// `agent.start` calls share one deadline instead of each getting the
+    /// 30 s API default, so a wedged machine cannot hold `spawn` open for
+    /// minutes per step.
+    SpawnTimeout {
+        /// Machine label.
+        machine: String,
+        /// Handshake step that timed out (`"workspace.list"`, `"pane.split"`,
+        /// `"agent.start"`, …).
+        step: String,
+    },
+    /// The target machine already holds `max_agents` agents.
+    ///
+    /// Enforced for explicit `--machine <label>` too (issue #6): the
+    /// scheduler's `AtCapacity` rejection only ran on the `auto` path, so a
+    /// direct spawn could overshoot the configured cap.
+    MaxAgentsExceeded {
+        /// Machine label.
+        machine: String,
+        /// Live `agent.list` count observed before launching.
+        agent_count: u32,
+        /// Effective cap (`cluster.json` override → reported → default).
+        max_agents: u32,
+    },
     /// Underlying API/config failure not attributable to a step.
     Api {
         /// Machine label, if known.
@@ -241,6 +271,8 @@ impl SpawnError {
             SpawnError::PaneFailed { .. } => "pane_failed",
             SpawnError::AgentStartFailed { .. } => "agent_start_failed",
             SpawnError::TimeoutWaitingReady { .. } => "timeout_waiting_ready",
+            SpawnError::SpawnTimeout { .. } => "spawn_timeout",
+            SpawnError::MaxAgentsExceeded { .. } => "max_agents_exceeded",
             SpawnError::Api { .. } => "api_error",
         }
     }
@@ -263,6 +295,17 @@ impl SpawnError {
                 ..
             } => {
                 error["agent_output_tail"] = serde_json::json!(tail);
+            }
+            SpawnError::MaxAgentsExceeded {
+                agent_count,
+                max_agents,
+                ..
+            } => {
+                error["agent_count"] = serde_json::json!(agent_count);
+                error["max_agents"] = serde_json::json!(max_agents);
+            }
+            SpawnError::SpawnTimeout { step, .. } => {
+                error["step"] = serde_json::json!(step);
             }
             _ => {}
         }
@@ -334,6 +377,22 @@ impl std::fmt::Display for SpawnError {
                 }
                 Ok(())
             }
+            SpawnError::SpawnTimeout { machine, step } => {
+                write!(
+                    f,
+                    "spawn timed out during {step} on {machine:?} \
+                     (handshake budget {}s)",
+                    SPAWN_HANDSHAKE_TIMEOUT.as_secs()
+                )
+            }
+            SpawnError::MaxAgentsExceeded {
+                machine,
+                agent_count,
+                max_agents,
+            } => write!(
+                f,
+                "machine {machine:?} is at agent capacity ({agent_count}/{max_agents})"
+            ),
             SpawnError::Api { machine, reason } => match machine {
                 Some(m) => write!(f, "API error on {m:?}: {reason}"),
                 None => write!(f, "API error: {reason}"),
@@ -364,6 +423,17 @@ impl Serialize for SpawnError {
                 ..
             } => {
                 error["agent_output_tail"] = serde_json::json!(tail);
+            }
+            SpawnError::MaxAgentsExceeded {
+                agent_count,
+                max_agents,
+                ..
+            } => {
+                error["agent_count"] = serde_json::json!(agent_count);
+                error["max_agents"] = serde_json::json!(max_agents);
+            }
+            SpawnError::SpawnTimeout { step, .. } => {
+                error["step"] = serde_json::json!(step);
             }
             _ => {}
         }
@@ -443,6 +513,105 @@ fn effective_max_agents(override_max: Option<u32>, reported: Option<u32>) -> u32
 /// reported/manifest set entirely (PLAN.md §3.7).
 fn effective_kinds(override_kinds: &Option<Vec<String>>, reported: &[String]) -> Vec<String> {
     override_kinds.clone().unwrap_or_else(|| reported.to_vec())
+}
+
+/// Effective `max_agents` for one already-resolved machine label.
+///
+/// Same precedence as [`build_worker_caps`]: `cluster.json` override wins,
+/// then the worker-reported cap, then the scheduler default — clamped to
+/// the hard ceiling. The local machine has no worker entry, so its
+/// reported value is always `None` (its `cluster.json` override is the only
+/// non-default source).
+fn configured_max_agents(ctx: &FleetContext, label: &str) -> u32 {
+    let override_max = ctx.machines_overrides.get(label).and_then(|o| o.max_agents);
+    let reported = if label == LOCAL_LABEL {
+        None
+    } else {
+        ctx.worker_entry(label)
+            .and_then(|w| w.resources.as_ref())
+            .map(|r| r.max_agents)
+    };
+    effective_max_agents(override_max, reported)
+}
+
+/// Remaining handshake budget, or a typed [`SpawnError::SpawnTimeout`].
+fn handshake_left(
+    deadline: Instant,
+    ep: &MachineEndpoint,
+    step: &str,
+) -> Result<Duration, SpawnError> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(SpawnError::SpawnTimeout {
+            machine: ep.label.clone(),
+            step: step.to_string(),
+        })
+    } else {
+        Ok(left)
+    }
+}
+
+/// One bounded API call inside the spawn handshake.
+///
+/// `ApiError::Timeout` can only mean the shared handshake deadline fired
+/// (the request timeout *is* the remaining budget), so it maps to
+/// [`SpawnError::SpawnTimeout`] rather than the generic unreachable/api
+/// buckets.
+fn handshake_call<T: Serialize>(
+    client: &api_client::ApiClient,
+    ep: &MachineEndpoint,
+    step: &str,
+    method: &str,
+    params: &T,
+    timeout: Duration,
+) -> Result<Value, SpawnError> {
+    let params = serde_json::to_value(params).map_err(|e| SpawnError::Api {
+        machine: Some(ep.label.clone()),
+        reason: format!("{step}: {e}"),
+    })?;
+    client
+        .request_with_timeout(method, &params, timeout)
+        .map_err(|e| match e {
+            ApiError::Timeout => SpawnError::SpawnTimeout {
+                machine: ep.label.clone(),
+                step: step.to_string(),
+            },
+            other => step_error(ep, step, other),
+        })
+}
+
+/// Enforce `max_agents` for an explicitly resolved machine (issue #6).
+///
+/// The scheduler already filters `agent_count < max_agents` on the `auto`
+/// path, but `--machine <label>` used to skip placement entirely — so a
+/// loop could overshoot the cap. This probes the target's live `agent.list`
+/// (not the possibly-stale heartbeat snapshot) and refuses once the cap is
+/// reached.
+fn enforce_agent_cap(
+    ctx: &FleetContext,
+    ep: &MachineEndpoint,
+    client: &api_client::ApiClient,
+    deadline: Instant,
+) -> Result<(), SpawnError> {
+    let max_agents = configured_max_agents(ctx, &ep.label);
+    let timeout = handshake_left(deadline, ep, "agent.list")?;
+    let value = handshake_call(
+        client,
+        ep,
+        "agent.list",
+        "agent.list",
+        &serde_json::json!({}),
+        timeout,
+    )?;
+    let agent_count = parse::items_array(&value).len() as u32;
+    if agent_count >= max_agents {
+        return Err(SpawnError::MaxAgentsExceeded {
+            machine: ep.label.clone(),
+            agent_count,
+            max_agents,
+        });
+    }
+    Ok(())
 }
 
 /// Build [`WorkerCaps`] for every machine (local included — it competes
@@ -568,10 +737,17 @@ fn check_kind_supported(
     ep: &MachineEndpoint,
     client: &api_client::ApiClient,
     kind: &str,
+    deadline: Instant,
 ) -> Result<(), SpawnError> {
-    let manifests = client
-        .server_agent_manifests()
-        .map_err(|e| step_error(ep, "agent_manifests", e))?;
+    let timeout = handshake_left(deadline, ep, "server.agent_manifests")?;
+    let manifests = handshake_call(
+        client,
+        ep,
+        "server.agent_manifests",
+        "server.agent_manifests",
+        &serde_json::json!({}),
+        timeout,
+    )?;
     let manifest_kinds = manifest_kinds(&manifests);
 
     let reported: Vec<String> = ctx
@@ -773,16 +949,24 @@ fn create_workspace(
     ep: &MachineEndpoint,
     cwd: Option<&str>,
     label: &str,
+    deadline: Instant,
 ) -> Result<(String, Value), SpawnError> {
-    let created = client
-        .workspace_create(&WorkspaceCreateParams {
-            cwd: cwd.map(str::to_string),
-            label: Some(label.to_string()),
-            focus: Some(false),
-            env: None,
-            source_workspace_id: None,
-        })
-        .map_err(|e| step_error(ep, "workspace.create", e))?;
+    let timeout = handshake_left(deadline, ep, "workspace.create")?;
+    let params = WorkspaceCreateParams {
+        cwd: cwd.map(str::to_string),
+        label: Some(label.to_string()),
+        focus: Some(false),
+        env: None,
+        source_workspace_id: None,
+    };
+    let created = handshake_call(
+        client,
+        ep,
+        "workspace.create",
+        "workspace.create",
+        &params,
+        timeout,
+    )?;
     workspace_id_of(&created)
         .map(|id| (id, created))
         .ok_or_else(|| SpawnError::WorkspaceFailed {
@@ -805,34 +989,52 @@ fn ensure_workspace(
     ep: &MachineEndpoint,
     repo: Option<&str>,
     label: &str,
+    deadline: Instant,
 ) -> Result<(String, bool), SpawnError> {
-    let list = client
-        .workspace_list()
-        .map_err(|e| step_error(ep, "workspace.list", e))?;
+    let timeout = handshake_left(deadline, ep, "workspace.list")?;
+    let list = handshake_call(
+        client,
+        ep,
+        "workspace.list",
+        "workspace.list",
+        &serde_json::json!({}),
+        timeout,
+    )?;
 
     match repo {
         None => {
             if let Some(id) = sole_workspace_id(&list) {
                 return Ok((id, false));
             }
-            let (id, _) = create_workspace(client, ep, None, label)?;
+            let (id, _) = create_workspace(client, ep, None, label, deadline)?;
             Ok((id, true))
         }
         Some(path) => {
             // `pane.list` is best-effort: WorkspaceInfo alone cannot prove
             // a path match for plain (non-worktree) workspaces, but a
             // failed pane list must not block the create fallback.
-            let panes = client
-                .pane_list(None)
-                .unwrap_or_else(|_| serde_json::json!({"panes": []}));
+            let panes = handshake_left(deadline, ep, "pane.list")
+                .ok()
+                .and_then(|t| {
+                    handshake_call(
+                        client,
+                        ep,
+                        "pane.list",
+                        "pane.list",
+                        &serde_json::json!({}),
+                        t,
+                    )
+                    .ok()
+                })
+                .unwrap_or_else(|| serde_json::json!({"panes": []}));
             if let Some(id) = find_workspace_for_repo(&list, &panes, path) {
                 return Ok((id, false));
             }
-            let (id, created) = create_workspace(client, ep, Some(path), label)?;
+            let (id, created) = create_workspace(client, ep, Some(path), label, deadline)?;
             // herdr silently falls back to the server user's home when
             // `cwd` does not exist on the target — refuse a `--repo`
             // that landed anywhere else before spawning the agent.
-            verify_workspace_repo_cwd(client, ep, &id, path, &created)?;
+            verify_workspace_repo_cwd(client, ep, &id, path, &created, deadline)?;
             Ok((id, true))
         }
     }
@@ -894,13 +1096,26 @@ fn verify_workspace_repo_cwd(
     workspace_id: &str,
     repo: &str,
     created: &Value,
+    deadline: Instant,
 ) -> Result<(), SpawnError> {
     if !repo.starts_with('/') {
         return Ok(());
     }
     // pane.list is best-effort: the create response's root_pane usually
     // carries the cwd already; a failed list just narrows the evidence.
-    let panes = client.pane_list(Some(workspace_id)).ok();
+    let panes = handshake_left(deadline, ep, "pane.list")
+        .ok()
+        .and_then(|t| {
+            handshake_call(
+                client,
+                ep,
+                "pane.list",
+                "pane.list",
+                &serde_json::json!({"workspace_id": workspace_id}),
+                t,
+            )
+            .ok()
+        });
     let candidates = repo_cwd_candidates(created, panes.as_ref());
     if candidates.is_empty() {
         // No cwd evidence — do not block the spawn on missing data.
@@ -911,47 +1126,89 @@ fn verify_workspace_repo_cwd(
     }
     // The workspace landed somewhere else (home fallback). Close it —
     // it was created moments ago for this spawn and hosts nothing else.
-    let _ = client.workspace_close(workspace_id, None);
+    // Best-effort with whatever handshake budget remains (1s floor so a
+    // spent budget cannot make the cleanup call block indefinitely).
+    let close_timeout =
+        handshake_left(deadline, ep, "workspace.close").unwrap_or(Duration::from_secs(1));
+    let _ = handshake_call(
+        client,
+        ep,
+        "workspace.close",
+        "workspace.close",
+        &serde_json::json!({"workspace_id": workspace_id}),
+        close_timeout,
+    );
     Err(SpawnError::RepoNotFound {
         machine: ep.label.clone(),
         repo: repo.to_string(),
     })
 }
 
-/// Collect pane ids for a workspace, preserving response order.
-fn pane_ids(client: &api_client::ApiClient, workspace_id: &str) -> Result<Vec<String>, SpawnError> {
-    let list = client
-        .pane_list(Some(workspace_id))
-        .map_err(|e| SpawnError::PaneFailed {
-            machine: "?".to_string(),
-            reason: e.to_string(),
-        })?;
-    Ok(parse::items_array(&list)
-        .iter()
-        .filter_map(pane_id_of)
-        .collect())
+/// Map a pane-step API failure: a timeout means the shared handshake
+/// deadline fired; everything else stays a [`SpawnError::PaneFailed`].
+fn pane_step_error(ep: &MachineEndpoint, step: &str, e: ApiError) -> SpawnError {
+    match e {
+        ApiError::Timeout => SpawnError::SpawnTimeout {
+            machine: ep.label.clone(),
+            step: step.to_string(),
+        },
+        other => SpawnError::PaneFailed {
+            machine: ep.label.clone(),
+            reason: format!("{step}: {other}"),
+        },
+    }
 }
 
 /// Pane operations used by [`ensure_pane`], abstracted so tests can fake
 /// the herdr API without a socket. Implemented for
-/// [`api_client::ApiClient`].
+/// [`api_client::ApiClient`]. `timeout` is the remaining shared handshake
+/// budget for that one call.
 trait PaneOps {
     /// Pane ids currently in `workspace_id`, in response order.
-    fn list_pane_ids(&self, workspace_id: &str) -> Result<Vec<String>, SpawnError>;
+    fn list_pane_ids(
+        &self,
+        ep: &MachineEndpoint,
+        workspace_id: &str,
+        timeout: Duration,
+    ) -> Result<Vec<String>, SpawnError>;
     /// `pane.split` — returns the raw response for id extraction.
-    fn split_pane(&self, params: &PaneSplitParams) -> Result<Value, SpawnError>;
+    fn split_pane(
+        &self,
+        ep: &MachineEndpoint,
+        params: &PaneSplitParams,
+        timeout: Duration,
+    ) -> Result<Value, SpawnError>;
 }
 
 impl PaneOps for api_client::ApiClient {
-    fn list_pane_ids(&self, workspace_id: &str) -> Result<Vec<String>, SpawnError> {
-        pane_ids(self, workspace_id)
+    fn list_pane_ids(
+        &self,
+        ep: &MachineEndpoint,
+        workspace_id: &str,
+        timeout: Duration,
+    ) -> Result<Vec<String>, SpawnError> {
+        let params = serde_json::json!({ "workspace_id": workspace_id });
+        let list = self
+            .request_with_timeout("pane.list", &params, timeout)
+            .map_err(|e| pane_step_error(ep, "pane.list", e))?;
+        Ok(parse::items_array(&list)
+            .iter()
+            .filter_map(pane_id_of)
+            .collect())
     }
 
-    fn split_pane(&self, params: &PaneSplitParams) -> Result<Value, SpawnError> {
-        self.pane_split(params).map_err(|e| SpawnError::PaneFailed {
-            machine: "?".to_string(),
-            reason: e.to_string(),
-        })
+    fn split_pane(
+        &self,
+        ep: &MachineEndpoint,
+        params: &PaneSplitParams,
+        timeout: Duration,
+    ) -> Result<Value, SpawnError> {
+        let params = serde_json::to_value(params).map_err(|e| SpawnError::PaneFailed {
+            machine: ep.label.clone(),
+            reason: format!("pane.split params: {e}"),
+        })?;
+        self.request_with_timeout("pane.split", &params, timeout)
+            .map_err(|e| pane_step_error(ep, "pane.split", e))
     }
 }
 
@@ -973,16 +1230,15 @@ fn ensure_pane(
     ep: &MachineEndpoint,
     workspace_id: &str,
     repo_path: Option<&str>,
+    deadline: Instant,
 ) -> Result<String, SpawnError> {
-    let before = client.list_pane_ids(workspace_id).map_err(|mut e| {
-        if let SpawnError::PaneFailed { machine, .. } = &mut e {
-            *machine = ep.label.clone();
-        }
-        e
-    })?;
+    let before_timeout = handshake_left(deadline, ep, "pane.list")?;
+    let before = client.list_pane_ids(ep, workspace_id, before_timeout)?;
 
-    let split = client
-        .split_pane(&PaneSplitParams {
+    let split_timeout = handshake_left(deadline, ep, "pane.split")?;
+    let split = client.split_pane(
+        ep,
+        &PaneSplitParams {
             direction: SplitDirection::Down,
             target_pane_id: before.first().cloned(),
             cwd: repo_path.map(str::to_string),
@@ -990,25 +1246,17 @@ fn ensure_pane(
             focus: Some(false),
             ratio: None,
             workspace_id: Some(workspace_id.to_string()),
-        })
-        .map_err(|mut e| {
-            if let SpawnError::PaneFailed { machine, .. } = &mut e {
-                *machine = ep.label.clone();
-            }
-            e
-        })?;
+        },
+        split_timeout,
+    )?;
 
     if let Some(id) = pane_id_of(&split) {
         return Ok(id);
     }
 
     // Fallback: diff the pane list.
-    let after = client.list_pane_ids(workspace_id).map_err(|mut e| {
-        if let SpawnError::PaneFailed { machine, .. } = &mut e {
-            *machine = ep.label.clone();
-        }
-        e
-    })?;
+    let after_timeout = handshake_left(deadline, ep, "pane.list")?;
+    let after = client.list_pane_ids(ep, workspace_id, after_timeout)?;
     let before_set: BTreeSet<&String> = before.iter().collect();
     after
         .into_iter()
@@ -1051,14 +1299,17 @@ const READY_TIMEOUT_TAIL_MAX_CHARS: usize = 8000;
 /// available when the agent CLI died and herdr unregistered it — the
 /// common cause of a readiness timeout (bad flag, crash on launch).
 fn agent_output_tail(client: &api_client::ApiClient, pane_id: &str) -> Option<String> {
+    // Diagnostics only — bound the read so a wedged pane cannot extend the
+    // spawn timeout path by the 30 s API default.
+    let params = serde_json::json!({
+        "pane_id": pane_id,
+        "source": "recent",
+        "format": "text",
+        "lines": READY_TIMEOUT_TAIL_LINES,
+        "strip_ansi": true,
+    });
     let value = client
-        .pane_read(
-            pane_id,
-            ReadSource::Recent,
-            Some(ReadFormat::Text),
-            Some(READY_TIMEOUT_TAIL_LINES),
-            Some(true),
-        )
+        .request_with_timeout("pane.read", &params, READY_POLL_REQUEST_TIMEOUT)
         .ok()?;
     read_tail_text(&value)
 }
@@ -1244,19 +1495,35 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
         reason: e.to_string(),
     })?;
 
+    // One shared deadline for the whole pre-launch handshake (issue #8):
+    // capacity probe → kind check → workspace → pane → agent.start. The
+    // readiness wait keeps its own `ready_timeout` bound afterwards.
+    let handshake_deadline = Instant::now() + SPAWN_HANDSHAKE_TIMEOUT;
+
+    // Capacity first: refuse before doing workspace/pane work when the
+    // machine is already at `max_agents` (issue #6).
+    enforce_agent_cap(ctx, &ep, &client, handshake_deadline)?;
+
     // Pre-flight: kind support (manifests ∪ reported kinds).
-    check_kind_supported(ctx, &ep, &client, &req.kind)?;
+    check_kind_supported(ctx, &ep, &client, &req.kind, handshake_deadline)?;
 
     // Effective repo placement: `--repo` path, `~` expansion, or default
     // placement (`None`) when omitted.
     let repo = effective_repo_path(&req.repo_path, ep.kind == MachineKind::Local);
 
     // Workspace: find by repo path / sole workspace, or create.
-    let (workspace_id, _created) = ensure_workspace(&client, &ep, repo.as_deref(), &req.name)?;
+    let (workspace_id, _created) =
+        ensure_workspace(&client, &ep, repo.as_deref(), &req.name, handshake_deadline)?;
 
     // Dedicated pane — always a fresh split (see ensure_pane for why the
     // root pane of a new workspace is not reused).
-    let pane_id = ensure_pane(&client, &ep, &workspace_id, repo.as_deref())?;
+    let pane_id = ensure_pane(
+        &client,
+        &ep,
+        &workspace_id,
+        repo.as_deref(),
+        handshake_deadline,
+    )?;
 
     // Launch the agent.
     let args = if req.extra_agent_args.is_empty() {
@@ -1264,22 +1531,39 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
     } else {
         Some(req.extra_agent_args.clone())
     };
+    let agent_start_params = AgentStartParams {
+        pane_id: pane_id.clone(),
+        kind: req.kind.clone(),
+        name: req.name.clone(),
+        args,
+        timeout_ms: Some(AGENT_START_TIMEOUT_MS),
+    };
+    let agent_start_params =
+        serde_json::to_value(&agent_start_params).map_err(|e| SpawnError::Api {
+            machine: Some(ep.label.clone()),
+            reason: format!("agent.start params: {e}"),
+        })?;
     // `pane.split` returns before the new pane's shell is an available
     // target, so `agent.start` can race it with `agent_pane_busy`. Retry
-    // briefly — the shell is ready within a second or two in practice.
+    // briefly — the shell is ready within a second or two in practice —
+    // but never past the shared handshake deadline.
     let pane_busy_deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        match client.agent_start(&AgentStartParams {
-            pane_id: pane_id.clone(),
-            kind: req.kind.clone(),
-            name: req.name.clone(),
-            args: args.clone(),
-            timeout_ms: Some(AGENT_START_TIMEOUT_MS),
-        }) {
+        let timeout = handshake_left(handshake_deadline, &ep, "agent.start")?;
+        match client.request_with_timeout("agent.start", &agent_start_params, timeout) {
             Ok(_) => break,
+            Err(ApiError::Timeout) => {
+                return Err(SpawnError::SpawnTimeout {
+                    machine: ep.label.clone(),
+                    step: "agent.start".to_string(),
+                })
+            }
             Err(e) => {
                 let reason = e.to_string();
-                if reason.contains("agent_pane_busy") && Instant::now() < pane_busy_deadline {
+                if reason.contains("agent_pane_busy")
+                    && Instant::now() < pane_busy_deadline
+                    && Instant::now() < handshake_deadline
+                {
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -1726,6 +2010,58 @@ mod tests {
         let j = e.to_json();
         assert_eq!(j["error"]["code"], "no_placement");
         assert_eq!(j["error"]["rejections"][0]["machine"], "w");
+
+        // Issue #6: explicit-machine capacity refusal has a stable code and
+        // carries both numbers for `--json` consumers.
+        let e = SpawnError::MaxAgentsExceeded {
+            machine: "w1".into(),
+            agent_count: 31,
+            max_agents: 8,
+        };
+        assert_eq!(e.code(), "max_agents_exceeded");
+        let j = e.to_json();
+        assert_eq!(j["error"]["code"], "max_agents_exceeded");
+        assert_eq!(j["error"]["agent_count"], 31);
+        assert_eq!(j["error"]["max_agents"], 8);
+        assert!(e.to_string().contains("31/8"));
+
+        // Issue #8: whole-handshake timeout is a distinct stable code.
+        let e = SpawnError::SpawnTimeout {
+            machine: "w1".into(),
+            step: "agent.start".into(),
+        };
+        assert_eq!(e.code(), "spawn_timeout");
+        assert_eq!(e.to_json()["error"]["step"], "agent.start");
+    }
+
+    #[test]
+    fn configured_max_agents_prefers_override_then_reported() {
+        let mut c = cluster();
+        c.machines.insert(
+            "w1".into(),
+            cluster_core::registry::MachineOverride {
+                max_agents: Some(2),
+                kinds_override: None,
+            },
+        );
+        let ctx = FleetContext::build(
+            PathBuf::from("/tmp/hc"),
+            c,
+            vec![worker("w1", WorkerStatus::Online, vec!["claude".into()])],
+        )
+        .unwrap();
+        // cluster.json override beats the worker-reported cap (4).
+        assert_eq!(configured_max_agents(&ctx, "w1"), 2);
+        // Local has no worker entry: override or scheduler default.
+        assert_eq!(
+            configured_max_agents(&ctx, "local"),
+            scheduler::DEFAULT_MAX_AGENTS
+        );
+        // Unknown labels still resolve to the default rather than panicking.
+        assert_eq!(
+            configured_max_agents(&ctx, "ghost"),
+            scheduler::DEFAULT_MAX_AGENTS
+        );
     }
 
     #[test]
@@ -1775,7 +2111,12 @@ mod tests {
     }
 
     impl PaneOps for FakePaneOps {
-        fn list_pane_ids(&self, _workspace_id: &str) -> Result<Vec<String>, SpawnError> {
+        fn list_pane_ids(
+            &self,
+            _ep: &MachineEndpoint,
+            _workspace_id: &str,
+            _timeout: Duration,
+        ) -> Result<Vec<String>, SpawnError> {
             Ok(self
                 .list_results
                 .borrow_mut()
@@ -1783,7 +2124,12 @@ mod tests {
                 .unwrap_or_default())
         }
 
-        fn split_pane(&self, params: &PaneSplitParams) -> Result<Value, SpawnError> {
+        fn split_pane(
+            &self,
+            _ep: &MachineEndpoint,
+            params: &PaneSplitParams,
+            _timeout: Duration,
+        ) -> Result<Value, SpawnError> {
             self.split_calls.set(self.split_calls.get() + 1);
             *self.last_params.borrow_mut() = Some(params.clone());
             Ok(self.split_response.clone())
@@ -1812,7 +2158,9 @@ mod tests {
                 "agent_status": "unknown", "revision": 0
             }}),
         );
-        let pane = ensure_pane(&fake, &test_endpoint(), "w2", Some("/repo"))
+        let ep = test_endpoint();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pane = ensure_pane(&fake, &ep, "w2", Some("/repo"), deadline)
             .expect("ensure_pane should succeed");
         assert_eq!(pane, "w2:p2");
         assert_eq!(fake.split_calls.get(), 1);
@@ -1834,7 +2182,9 @@ mod tests {
             vec![vec![]],
             json!({"type": "pane_info", "pane": {"pane_id": "w3:p1"}}),
         );
-        let pane = ensure_pane(&fake, &test_endpoint(), "w3", None).unwrap();
+        let ep = test_endpoint();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pane = ensure_pane(&fake, &ep, "w3", None, deadline).unwrap();
         assert_eq!(pane, "w3:p1");
         assert_eq!(fake.split_calls.get(), 1);
         assert_eq!(
@@ -1854,7 +2204,9 @@ mod tests {
             ],
             json!({"type": "ok"}),
         );
-        let pane = ensure_pane(&fake, &test_endpoint(), "w4", None).unwrap();
+        let ep = test_endpoint();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pane = ensure_pane(&fake, &ep, "w4", None, deadline).unwrap();
         assert_eq!(pane, "w4:p2");
     }
 
@@ -1864,7 +2216,9 @@ mod tests {
             vec![vec!["w5:p1".to_string()], vec!["w5:p1".to_string()]],
             json!({"type": "ok"}),
         );
-        let err = ensure_pane(&fake, &test_endpoint(), "w5", None).unwrap_err();
+        let ep = test_endpoint();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = ensure_pane(&fake, &ep, "w5", None, deadline).unwrap_err();
         assert_eq!(err.code(), "pane_failed");
     }
 

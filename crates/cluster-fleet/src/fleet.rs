@@ -102,7 +102,9 @@ pub struct MachineInfo {
     pub status: String,
     /// Whether the live `agent.list` probe succeeded this call.
     pub reachable: bool,
-    /// Number of agents seen by the probe (absent when unreachable).
+    /// Number of addressable agents seen by the live `agent.list` probe —
+    /// the same rows `agent list --all` emits for this machine (absent when
+    /// unreachable). This is *not* the heartbeat `agent_count` snapshot.
     pub agents: Option<u64>,
     /// Last heartbeat-reported running agent count (workers only).
     pub agent_count: Option<u32>,
@@ -380,8 +382,10 @@ pub fn machines_with_timeout(ctx: &FleetContext, timeout: Duration) -> Vec<Machi
             .iter()
             .map(|ep| {
                 s.spawn(move || {
-                    let result =
-                        fetch_agent_list(ep, timeout).map(|v| parse::items_array(&v).len());
+                    // Count the same addressable rows `agent list --all`
+                    // emits so the two commands cannot disagree (issue #8).
+                    let result = fetch_agent_list(ep, timeout)
+                        .map(|v| parse_agent_list(&ep.label, &v).len());
                     (ep.label.clone(), Some(result))
                 })
             })

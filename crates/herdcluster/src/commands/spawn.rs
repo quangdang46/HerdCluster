@@ -7,7 +7,7 @@
 use cluster_fleet::{spawn, FleetContext, MachineTarget, SpawnRequest};
 use cluster_node::project_state::{self, SpawnedAgent};
 
-use super::{load_ctx, report_spawn_error, vlog};
+use super::{load_ctx, vlog};
 
 /// `herdcluster spawn <name> --kind <k> --machine <m|auto> [--repo <path>]
 /// [--branch <b>] [-- <agent args>...]`
@@ -58,7 +58,13 @@ pub fn run(
         Ok(result) => {
             record_spawn(&result, cwd.as_deref(), verbose);
             if json {
-                super::print_json(&result);
+                // `--json` is a line-oriented contract for batch loops
+                // (issue #8): one compact parseable line on stdout, never
+                // pretty-printed multi-line JSON and never empty output.
+                println!(
+                    "{}",
+                    serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string())
+                );
             } else {
                 println!(
                     "spawned {} ({}) on {}\n  id:        {}\n  pane:      {}\n  workspace: {}",
@@ -72,7 +78,20 @@ pub fn run(
             }
             0
         }
-        Err(e) => report_spawn_error(&e, json),
+        Err(e) => {
+            if json {
+                // Same line-oriented contract on failure: the error
+                // envelope goes to stdout so `spawn ... --json | jq` works
+                // for every outcome, not just successes.
+                println!(
+                    "{}",
+                    serde_json::to_string(&e.to_json()).unwrap_or_else(|_| "null".to_string())
+                );
+            } else {
+                eprintln!("error: {e}");
+            }
+            1
+        }
     }
 }
 

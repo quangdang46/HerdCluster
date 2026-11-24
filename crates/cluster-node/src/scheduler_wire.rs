@@ -38,7 +38,7 @@ use cluster_fleet::FleetError;
 /// Effective `max_agents` for a machine: `cluster.json` override wins,
 /// then the worker-reported cap, then the scheduler default — clamped to
 /// the hard ceiling. Mirrors `cluster-fleet`'s private helper.
-fn effective_max_agents(override_max: Option<u32>, reported: Option<u32>) -> u32 {
+pub(crate) fn effective_max_agents(override_max: Option<u32>, reported: Option<u32>) -> u32 {
     let v = override_max
         .or(reported)
         .unwrap_or(scheduler::DEFAULT_MAX_AGENTS);

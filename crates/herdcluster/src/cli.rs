@@ -82,7 +82,8 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: AutostartCommands,
     },
-    /// List cluster machines and their status
+    /// List cluster machines and their status (AGENTS = live agent.list rows,
+    /// the same count `agent list --all` shows per machine)
     Machines {
         #[arg(long)]
         json: bool,
@@ -162,7 +163,8 @@ pub(crate) enum Commands {
 
 #[derive(Subcommand)]
 pub(crate) enum AgentCommands {
-    /// List agents (use --all for every machine)
+    /// List agents (use --all for every machine; unreachable machines appear
+    /// as placeholder rows, so row count can exceed the agent count)
     List {
         #[arg(long)]
         all: bool,

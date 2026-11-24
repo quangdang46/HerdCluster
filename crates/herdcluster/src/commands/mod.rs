@@ -27,7 +27,7 @@ pub mod worker;
 use std::fmt::Display;
 use std::future::Future;
 
-use cluster_fleet::{FleetContext, FleetError, SpawnError};
+use cluster_fleet::{FleetContext, FleetError};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -155,19 +155,6 @@ pub(crate) fn load_ctx(verbose: bool, json: bool) -> Result<FleetContext, i32> {
 pub(crate) fn report_fleet_error(e: &FleetError, json: bool) -> i32 {
     if json {
         // fleet provides the canonical {"error":{code,message}} envelope.
-        eprintln!(
-            "{}",
-            serde_json::to_string(&e.to_json()).unwrap_or_else(|_| e.to_string())
-        );
-    } else {
-        eprintln!("error: {e}");
-    }
-    1
-}
-
-/// Print a [`SpawnError`] and return exit code 1.
-pub(crate) fn report_spawn_error(e: &SpawnError, json: bool) -> i32 {
-    if json {
         eprintln!(
             "{}",
             serde_json::to_string(&e.to_json()).unwrap_or_else(|_| e.to_string())
