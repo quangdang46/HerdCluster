@@ -27,9 +27,9 @@ jobs:
         include:
           # macOS controller — arm64 native, x86_64 cross on the same runner
           # (Xcode CLT clang links both arches; no extra toolchain needed).
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
           # Linux worker (incl. WSL2) — built natively on the runner.
           # Cross-compiling linux-gnu from macOS needs a C toolchain/linker
