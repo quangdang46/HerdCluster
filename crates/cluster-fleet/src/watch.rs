@@ -524,7 +524,7 @@ mod tests {
         ];
         // Pad with "working" so the fake never runs dry before the timeout.
         let mut scripted: Vec<&str> = statuses.to_vec();
-        scripted.extend(std::iter::repeat("working").take(30));
+        scripted.extend(std::iter::repeat_n("working", 30));
         let mut responses: std::collections::VecDeque<Result<Value, FleetError>> =
             scripted.iter().map(|s| Ok(get(s))).collect();
         let mut events = Vec::new();
