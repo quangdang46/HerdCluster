@@ -12,9 +12,11 @@
 use api_client::methods::ReadSource;
 use cluster_fleet::{
     agent_get, agent_prompt, agent_read, agent_rename, agent_send_keys, agent_wait_live,
-    agent_watch_live, list_all_agents, parse_duration, parse_until, AgentListRow, FleetContext,
-    FleetError, PollEvent, PollResult, WatchTuning, LOCAL_LABEL,
+    agent_watch_live, format_global_id, list_all_agents, parse_duration, parse_global_id,
+    parse_until, AgentListRow, FleetContext, FleetError, PollEvent, PollResult, WatchTuning,
+    LOCAL_LABEL,
 };
+use cluster_node::project_state;
 
 use super::render::render_table;
 use super::{emit_result, load_ctx, report_fleet_error, vlog};
@@ -60,9 +62,7 @@ pub fn run(command: AgentCommands, verbose: bool) -> i32 {
             }
             with_ctx(verbose, false, |ctx| agent_send_keys(ctx, &id, &key_list))
         }
-        AgentCommands::Rename { id, name } => {
-            with_ctx(verbose, false, |ctx| agent_rename(ctx, &id, Some(&name)))
-        }
+        AgentCommands::Rename { id, name } => rename(&id, &name, verbose),
     }
 }
 
@@ -289,6 +289,56 @@ fn watch_agent(id: &str, stuck_after: Option<&str>, json: bool, verbose: bool) -
         println!("{} {id_owned}: agent is gone", now_ts());
     }
     0
+}
+
+/// `agent rename` — forward the rename to the hosting machine, then
+/// keep `.herdcluster/agents.json` in sync so `herdcluster clean` still
+/// tracks the live agent under its new global id (a stale record would
+/// leave the renamed agent running forever). The record update is
+/// best-effort: an unrecorded agent or an unwritable state file never
+/// fails the rename itself.
+fn rename(id: &str, name: &str, verbose: bool) -> i32 {
+    let ctx = match load_ctx(verbose, false) {
+        Ok(ctx) => ctx,
+        Err(code) => return code,
+    };
+    match agent_rename(&ctx, id, Some(name)) {
+        Ok(value) => {
+            sync_rename_record(id, name, verbose);
+            emit_result(&value, false);
+            0
+        }
+        Err(e) => report_fleet_error(&e, false),
+    }
+}
+
+/// Best-effort: after a successful `agent rename`, move the spawn
+/// record from the old global id to `{machine}/{new name}`.
+fn sync_rename_record(old_id: &str, new_name: &str, verbose: bool) {
+    let Some(project) = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| project_state::find_project_dir(&cwd))
+    else {
+        return;
+    };
+    // The machine half is unchanged; the agent half becomes the new
+    // name. `agent_rename` already validated `old_id`'s syntax.
+    let Ok(gid) = parse_global_id(old_id) else {
+        return;
+    };
+    let new_id = format_global_id(&gid.machine, new_name);
+    match project_state::rename_agent(&project, old_id, &new_id, new_name) {
+        Ok(true) => vlog(
+            verbose,
+            format!("renamed spawn record {old_id} -> {new_id}"),
+        ),
+        // Not a recorded spawn — nothing to update.
+        Ok(false) => {}
+        Err(e) => vlog(
+            verbose,
+            format!("could not update agents.json after rename: {e}"),
+        ),
+    }
 }
 
 /// `agent list` — local only, or `--all` fleet-wide fan-out.

@@ -224,6 +224,30 @@ pub fn record_spawn(
     save_agents(project_dir, &file)
 }
 
+/// Rename a recorded agent: moves the `agents.json` entry from
+/// `old_global_id` to `new_global_id` and updates the record's `name`
+/// to `new_name`. Used by `agent rename` so `clean` keeps tracking the
+/// live agent under its new global id.
+///
+/// Returns `true` when an entry was renamed; `false` when
+/// `old_global_id` was not recorded — a no-op, not an error (the agent
+/// may predate spawn tracking or live on another project).
+pub fn rename_agent(
+    project_dir: &Path,
+    old_global_id: &str,
+    new_global_id: &str,
+    new_name: &str,
+) -> Result<bool, ProjectStateError> {
+    let mut file = load_agents(project_dir)?;
+    let Some(mut agent) = file.agents.remove(old_global_id) else {
+        return Ok(false);
+    };
+    agent.name = new_name.to_string();
+    file.agents.insert(new_global_id.to_string(), agent);
+    save_agents(project_dir, &file)?;
+    Ok(true)
+}
+
 /// Remove one entry from `agents.json` (used by `clean` after a
 /// successful teardown). Returns `true` when an entry was removed.
 pub fn remove_agent(project_dir: &Path, global_id: &str) -> Result<bool, ProjectStateError> {
@@ -409,6 +433,43 @@ mod tests {
             .map(|(id, _)| id.as_str())
             .collect();
         assert_eq!(w1, vec!["w1/b"]);
+    }
+
+    #[test]
+    fn rename_agent_moves_key_and_updates_name() {
+        let dir = tempdir("rename");
+        let agent = SpawnedAgent {
+            machine: "local".into(),
+            name: "old-name".into(),
+            kind: "claude".into(),
+            workspace_id: "w1".into(),
+            pane_id: "w1:p2".into(),
+            spawned_at: "t".into(),
+        };
+        record_spawn(&dir, "local/old-name", agent).unwrap();
+
+        // Recorded agent: key moves, record name follows, other fields
+        // are preserved.
+        assert!(rename_agent(&dir, "local/old-name", "local/new-name", "new-name").unwrap());
+        let file = load_agents(&dir).unwrap();
+        assert!(!file.agents.contains_key("local/old-name"));
+        let rec = &file.agents["local/new-name"];
+        assert_eq!(rec.name, "new-name");
+        assert_eq!(rec.machine, "local");
+        assert_eq!(rec.pane_id, "w1:p2");
+        assert_eq!(rec.workspace_id, "w1");
+
+        // Unrecorded id: no-op, file untouched.
+        assert!(!rename_agent(&dir, "local/ghost", "local/x", "x").unwrap());
+        assert_eq!(load_agents(&dir).unwrap().agents.len(), 1);
+
+        // Outside any project file: missing agents.json → false, and no
+        // .herdcluster dir is created as a side effect.
+        let bare = tempdir("rename-bare");
+        assert!(!rename_agent(&bare, "local/a", "local/b", "b").unwrap());
+        assert!(!state_dir(&bare).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     #[test]

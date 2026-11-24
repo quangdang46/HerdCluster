@@ -473,6 +473,43 @@ impl ApiClient {
         req(self, "pane.get", &P { pane_id })
     }
 
+    /// `pane.read` — read a pane's terminal content directly.
+    ///
+    /// Unlike [`agent_read`](Self::agent_read), this takes a `pane_id`
+    /// and works even when no agent is registered on the pane — used for
+    /// spawn timeout diagnostics after the agent CLI may have died.
+    pub fn pane_read(
+        &self,
+        pane_id: &str,
+        source: ReadSource,
+        format: Option<ReadFormat>,
+        lines: Option<u32>,
+        strip_ansi: Option<bool>,
+    ) -> Result<serde_json::Value, ApiError> {
+        #[derive(Serialize)]
+        struct P<'a> {
+            pane_id: &'a str,
+            source: ReadSource,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            format: Option<ReadFormat>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            lines: Option<u32>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            strip_ansi: Option<bool>,
+        }
+        req(
+            self,
+            "pane.read",
+            &P {
+                pane_id,
+                source,
+                format,
+                lines,
+                strip_ansi,
+            },
+        )
+    }
+
     /// `pane.current` — the focused pane.
     pub fn pane_current(&self) -> Result<serde_json::Value, ApiError> {
         req(self, "pane.current", &EmptyParams {})

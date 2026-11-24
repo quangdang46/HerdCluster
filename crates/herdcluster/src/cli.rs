@@ -103,6 +103,8 @@ pub(crate) enum Commands {
         branch: Option<String>,
         #[arg(long)]
         json: bool,
+        /// Extra args forwarded to the agent CLI, placed after `--`
+        /// (e.g. `-- --permission-mode dangerous`)
         #[arg(last = true)]
         agent_args: Vec<String>,
     },

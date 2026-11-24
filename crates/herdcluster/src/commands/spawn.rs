@@ -9,7 +9,12 @@ use cluster_node::project_state::{self, SpawnedAgent};
 
 use super::{load_ctx, report_spawn_error, vlog};
 
-/// `herdcluster spawn <name> --kind <k> --machine <m|auto> [--repo <path>] ...`
+/// `herdcluster spawn <name> --kind <k> --machine <m|auto> [--repo <path>]
+/// [--branch <b>] [-- <agent args>...]`
+///
+/// `agent_args` are extra CLI arguments forwarded to the agent itself,
+/// placed after a literal `--` so clap does not eat agent flags (e.g.
+/// `herdcluster spawn x --kind devin -- --permission-mode dangerous`).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     name: &str,

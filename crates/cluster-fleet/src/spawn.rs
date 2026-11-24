@@ -35,7 +35,15 @@
 //!   discoverable through the API, so `~` there degrades to the same
 //!   default-placement behavior as omitting `--repo`.
 //! - Any other value → find-or-create a workspace for that target-local
-//!   path, exactly as before.
+//!   path, exactly as before — with one guard: when a workspace must be
+//!   *created* for the path, the fresh workspace's pane cwd is verified
+//!   against the request ([`verify_workspace_repo_cwd`]). herdr silently
+//!   substitutes the server user's home when `cwd` does not exist on the
+//!   target, so a missing `--repo` directory would otherwise launch the
+//!   agent in the wrong tree; instead the workspace is closed and
+//!   [`SpawnError::RepoNotFound`] (`repo_not_found`) is returned before
+//!   any agent starts. `--repo` omitted keeps the fallback behavior
+//!   described above.
 //!
 //! ## `--branch` semantics
 //!
@@ -51,7 +59,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use api_client::methods::{
-    AgentStartParams, PaneSplitParams, SplitDirection, WorkspaceCreateParams,
+    AgentStartParams, PaneSplitParams, ReadFormat, ReadSource, SplitDirection,
+    WorkspaceCreateParams,
 };
 use api_client::ApiError;
 use cluster_core::registry::WorkerStatus;
@@ -170,6 +179,19 @@ pub enum SpawnError {
         /// Cause.
         reason: String,
     },
+    /// `--repo` named a path that does not exist on the target machine.
+    ///
+    /// Detected after `workspace.create`: herdr silently substitutes the
+    /// server user's home directory when `cwd` does not exist, so the
+    /// fresh workspace's pane cwd is checked against the request (see
+    /// [`verify_workspace_repo_cwd`]) and the workspace closed before
+    /// any pane split or `agent.start`.
+    RepoNotFound {
+        /// Machine label.
+        machine: String,
+        /// Requested repo path (target-local).
+        repo: String,
+    },
     /// Pane split/list failed or no pane id could be determined.
     PaneFailed {
         /// Machine label.
@@ -192,6 +214,11 @@ pub enum SpawnError {
         agent: String,
         /// Seconds waited.
         waited_secs: u64,
+        /// Last lines of the agent pane's output, captured best-effort
+        /// at timeout so callers can see *why* the agent never became
+        /// ready (bad CLI flag, crashed on launch, stuck on a prompt).
+        /// `None` when the pane read failed or returned no text.
+        output_tail: Option<String>,
     },
     /// Underlying API/config failure not attributable to a step.
     Api {
@@ -210,6 +237,7 @@ impl SpawnError {
             SpawnError::WorkerUnreachable { .. } => "worker_unreachable",
             SpawnError::KindUnsupported { .. } => "kind_unsupported",
             SpawnError::WorkspaceFailed { .. } => "workspace_failed",
+            SpawnError::RepoNotFound { .. } => "repo_not_found",
             SpawnError::PaneFailed { .. } => "pane_failed",
             SpawnError::AgentStartFailed { .. } => "agent_start_failed",
             SpawnError::TimeoutWaitingReady { .. } => "timeout_waiting_ready",
@@ -229,6 +257,12 @@ impl SpawnError {
             }
             SpawnError::KindUnsupported { available, .. } => {
                 error["available"] = serde_json::json!(available);
+            }
+            SpawnError::TimeoutWaitingReady {
+                output_tail: Some(tail),
+                ..
+            } => {
+                error["agent_output_tail"] = serde_json::json!(tail);
             }
             _ => {}
         }
@@ -274,6 +308,11 @@ impl std::fmt::Display for SpawnError {
             SpawnError::WorkspaceFailed { machine, reason } => {
                 write!(f, "workspace step failed on {machine:?}: {reason}")
             }
+            SpawnError::RepoNotFound { machine, repo } => write!(
+                f,
+                "repo {repo:?} does not exist on machine {machine:?} \
+                 (herdr would fall back to the server user's home directory)"
+            ),
             SpawnError::PaneFailed { machine, reason } => {
                 write!(f, "pane step failed on {machine:?}: {reason}")
             }
@@ -284,10 +323,17 @@ impl std::fmt::Display for SpawnError {
                 machine,
                 agent,
                 waited_secs,
-            } => write!(
-                f,
-                "agent {agent:?} on {machine:?} did not become ready within {waited_secs}s"
-            ),
+                output_tail,
+            } => {
+                write!(
+                    f,
+                    "agent {agent:?} on {machine:?} did not become ready within {waited_secs}s"
+                )?;
+                if let Some(tail) = output_tail {
+                    write!(f, "\n--- last agent output ---\n{tail}")?;
+                }
+                Ok(())
+            }
             SpawnError::Api { machine, reason } => match machine {
                 Some(m) => write!(f, "API error on {m:?}: {reason}"),
                 None => write!(f, "API error: {reason}"),
@@ -312,6 +358,12 @@ impl Serialize for SpawnError {
             }
             SpawnError::KindUnsupported { available, .. } => {
                 error["available"] = serde_json::json!(available);
+            }
+            SpawnError::TimeoutWaitingReady {
+                output_tail: Some(tail),
+                ..
+            } => {
+                error["agent_output_tail"] = serde_json::json!(tail);
             }
             _ => {}
         }
@@ -713,13 +765,15 @@ fn find_workspace_for_repo(list: &Value, panes: &Value, repo_path: &str) -> Opti
 
 /// `workspace.create` wrapper shared by both placement modes. `cwd=None`
 /// omits the field so the herdr server picks its default working
-/// directory (its user's home in practice).
+/// directory (its user's home in practice). Returns the workspace id
+/// plus the raw response — the response's `root_pane` carries the cwd
+/// herdr actually used, which [`verify_workspace_repo_cwd`] checks.
 fn create_workspace(
     client: &api_client::ApiClient,
     ep: &MachineEndpoint,
     cwd: Option<&str>,
     label: &str,
-) -> Result<(String, bool), SpawnError> {
+) -> Result<(String, Value), SpawnError> {
     let created = client
         .workspace_create(&WorkspaceCreateParams {
             cwd: cwd.map(str::to_string),
@@ -730,7 +784,7 @@ fn create_workspace(
         })
         .map_err(|e| step_error(ep, "workspace.create", e))?;
     workspace_id_of(&created)
-        .map(|id| (id, true))
+        .map(|id| (id, created))
         .ok_or_else(|| SpawnError::WorkspaceFailed {
             machine: ep.label.clone(),
             reason: "workspace.create returned no workspace id".to_string(),
@@ -761,7 +815,8 @@ fn ensure_workspace(
             if let Some(id) = sole_workspace_id(&list) {
                 return Ok((id, false));
             }
-            create_workspace(client, ep, None, label)
+            let (id, _) = create_workspace(client, ep, None, label)?;
+            Ok((id, true))
         }
         Some(path) => {
             // `pane.list` is best-effort: WorkspaceInfo alone cannot prove
@@ -773,9 +828,94 @@ fn ensure_workspace(
             if let Some(id) = find_workspace_for_repo(&list, &panes, path) {
                 return Ok((id, false));
             }
-            create_workspace(client, ep, Some(path), label)
+            let (id, created) = create_workspace(client, ep, Some(path), label)?;
+            // herdr silently falls back to the server user's home when
+            // `cwd` does not exist on the target — refuse a `--repo`
+            // that landed anywhere else before spawning the agent.
+            verify_workspace_repo_cwd(client, ep, &id, path, &created)?;
+            Ok((id, true))
         }
     }
+}
+
+/// Collect every pane cwd (`cwd` / `foreground_cwd`) visible in a
+/// `workspace.create` response (`root_pane`/`pane` wrappers) and an
+/// optional `pane.list` result.
+fn repo_cwd_candidates(created: &Value, panes: Option<&Value>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut collect = |pane: &Value| {
+        for key in PANE_CWD_KEYS {
+            if let Some(cwd) = pane.get(*key).and_then(Value::as_str) {
+                if !cwd.is_empty() && !out.iter().any(|c| c == cwd) {
+                    out.push(cwd.to_string());
+                }
+            }
+        }
+    };
+    for wrapper in ["root_pane", "pane"] {
+        if let Some(pane) = created.get(wrapper) {
+            collect(pane);
+        }
+    }
+    if let Some(list) = panes {
+        for pane in parse::items_array(list) {
+            collect(pane);
+        }
+    }
+    out
+}
+
+/// After `workspace.create {cwd: repo}`, prove the new workspace's pane
+/// actually landed in `repo`.
+///
+/// **Why this exists:** when the requested `cwd` does not exist on the
+/// target machine, herdr does not error — it silently substitutes the
+/// server user's home directory. An explicit `--repo` typo would
+/// otherwise spawn the agent in the wrong tree while reporting
+/// success. On a cwd mismatch the just-created workspace is closed
+/// (best-effort) and [`SpawnError::RepoNotFound`] is returned — before
+/// any pane split or `agent.start`, so nothing else needs cleanup.
+///
+/// **How the check works:** the herdr API has no stat/exec method, so
+/// existence is verified indirectly through the pane cwd herdr reports
+/// (the `workspace.create` response's `root_pane`, then `pane.list`
+/// scoped to the new workspace). [`path_matches_repo`] is reused so
+/// canonicalization aliases (`/tmp` vs `/private/tmp`) compare
+/// correctly, and it works identically for local and remote machines.
+///
+/// **Best-effort by design:** when no pane cwd is reported at all
+/// (older herdr, shell still spawning) or the repo is not an absolute
+/// path (relative cwds are resolved server-side and cannot be compared
+/// reliably), verification is skipped rather than failing a
+/// possibly-good spawn.
+fn verify_workspace_repo_cwd(
+    client: &api_client::ApiClient,
+    ep: &MachineEndpoint,
+    workspace_id: &str,
+    repo: &str,
+    created: &Value,
+) -> Result<(), SpawnError> {
+    if !repo.starts_with('/') {
+        return Ok(());
+    }
+    // pane.list is best-effort: the create response's root_pane usually
+    // carries the cwd already; a failed list just narrows the evidence.
+    let panes = client.pane_list(Some(workspace_id)).ok();
+    let candidates = repo_cwd_candidates(created, panes.as_ref());
+    if candidates.is_empty() {
+        // No cwd evidence — do not block the spawn on missing data.
+        return Ok(());
+    }
+    if candidates.iter().any(|c| path_matches_repo(c, repo)) {
+        return Ok(());
+    }
+    // The workspace landed somewhere else (home fallback). Close it —
+    // it was created moments ago for this spawn and hosts nothing else.
+    let _ = client.workspace_close(workspace_id, None);
+    Err(SpawnError::RepoNotFound {
+        machine: ep.label.clone(),
+        repo: repo.to_string(),
+    })
 }
 
 /// Collect pane ids for a workspace, preserving response order.
@@ -897,11 +1037,96 @@ fn agent_ready(value: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Lines of agent output captured into `timeout_waiting_ready` errors.
+const READY_TIMEOUT_TAIL_LINES: u32 = 20;
+/// Hard cap on the captured tail so a pathological pane cannot produce
+/// an unbounded error message.
+const READY_TIMEOUT_TAIL_MAX_CHARS: usize = 8000;
+
+/// Best-effort tail of the agent pane's recent output for timeout
+/// diagnostics. `None` when the read fails or yields no text — the
+/// timeout error must still be reported either way.
+///
+/// Reads via `pane.read` (not `agent.read`) so the tail is still
+/// available when the agent CLI died and herdr unregistered it — the
+/// common cause of a readiness timeout (bad flag, crash on launch).
+fn agent_output_tail(client: &api_client::ApiClient, pane_id: &str) -> Option<String> {
+    let value = client
+        .pane_read(
+            pane_id,
+            ReadSource::Recent,
+            Some(ReadFormat::Text),
+            Some(READY_TIMEOUT_TAIL_LINES),
+            Some(true),
+        )
+        .ok()?;
+    read_tail_text(&value)
+}
+
+/// Extract display text from a `pane.read`-style response
+/// (`PaneReadResult.text`, possibly wrapped) and keep only the last
+/// [`READY_TIMEOUT_TAIL_LINES`] lines, capped at
+/// [`READY_TIMEOUT_TAIL_MAX_CHARS`] bytes.
+fn read_tail_text(value: &Value) -> Option<String> {
+    const TEXT_KEYS: &[&str] = &["text", "content", "output", "screen"];
+    let text = find_text_field(value, TEXT_KEYS, 4)?;
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .len()
+        .saturating_sub(READY_TIMEOUT_TAIL_LINES as usize);
+    let mut tail = lines[start..].join("\n");
+    tail = tail.trim().to_string();
+    if tail.is_empty() {
+        return None;
+    }
+    if tail.len() > READY_TIMEOUT_TAIL_MAX_CHARS {
+        let mut cut = tail.len() - READY_TIMEOUT_TAIL_MAX_CHARS;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail = tail[cut..].to_string();
+    }
+    Some(tail)
+}
+
+/// Depth-limited search for the first non-empty string under `keys`
+/// (same shape as the CLI's `display_value` helper, kept local so
+/// cluster-fleet stays free of presentation concerns).
+fn find_text_field(value: &Value, keys: &[&str], depth: usize) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    if let Value::Object(map) = value {
+        for key in keys {
+            if let Some(s) = map.get(*key).and_then(Value::as_str) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        for child in map.values() {
+            if let Some(found) = find_text_field(child, keys, depth - 1) {
+                return Some(found);
+            }
+        }
+    } else if let Value::Array(items) = value {
+        for child in items {
+            if let Some(found) = find_text_field(child, keys, depth - 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// Poll `agent.get` until the agent reports ready or `timeout` elapses.
+/// On timeout, appends the last lines of the agent pane's output to the
+/// error so callers can see why readiness never happened.
 fn wait_until_ready(
     client: &api_client::ApiClient,
     ep: &MachineEndpoint,
     name: &str,
+    pane_id: &str,
     timeout: Duration,
 ) -> Result<(), SpawnError> {
     let deadline = Instant::now() + timeout;
@@ -913,6 +1138,7 @@ fn wait_until_ready(
                 machine: ep.label.clone(),
                 agent: name.to_string(),
                 waited_secs: timeout.as_secs(),
+                output_tail: agent_output_tail(client, pane_id),
             });
         }
         let req_timeout = remaining.min(READY_POLL_REQUEST_TIMEOUT);
@@ -1067,7 +1293,7 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
 
     // Wait for interactive readiness.
     let ready_timeout = req.ready_timeout.unwrap_or(DEFAULT_READY_TIMEOUT);
-    wait_until_ready(&client, &ep, &req.name, ready_timeout)?;
+    wait_until_ready(&client, &ep, &req.name, &pane_id, ready_timeout)?;
 
     Ok(SpawnResult {
         global_id: format_global_id(&ep.label, &req.name),
@@ -1464,10 +1690,31 @@ mod tests {
             SpawnError::TimeoutWaitingReady {
                 machine: "m".into(),
                 agent: "a".into(),
-                waited_secs: 1
+                waited_secs: 1,
+                output_tail: None,
             }
             .code(),
             "timeout_waiting_ready"
+        );
+        assert_eq!(
+            SpawnError::RepoNotFound {
+                machine: "m".into(),
+                repo: "/nope".into(),
+            }
+            .code(),
+            "repo_not_found"
+        );
+        // Timeout tail lands in both the message and the JSON envelope.
+        let e = SpawnError::TimeoutWaitingReady {
+            machine: "m".into(),
+            agent: "a".into(),
+            waited_secs: 35,
+            output_tail: Some("error: unknown flag".into()),
+        };
+        assert!(e.to_string().contains("unknown flag"));
+        assert_eq!(
+            e.to_json()["error"]["agent_output_tail"],
+            "error: unknown flag"
         );
         let e = SpawnError::NoPlacement {
             machine: None,
@@ -1718,5 +1965,60 @@ mod tests {
         assert!(path_matches_repo("/no/such/repo/sub", "/no/such/repo"));
         assert!(!path_matches_repo("/no/such/other", "/no/such/repo"));
         assert!(path_matches_repo("/no/such/repo", "/no/such/repo/"));
+    }
+
+    // ------------------------------------------------------------------
+    // repo_not_found verification helpers.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn repo_cwd_candidates_reads_create_response_and_pane_list() {
+        // workspace.create response: root_pane carries the cwd herdr
+        // actually used (home fallback shows up here).
+        let created = json!({
+            "type": "workspace_created",
+            "workspace": {"workspace_id": "w2E"},
+            "root_pane": {"pane_id": "w2E:p1", "cwd": "/home/u", "foreground_cwd": "/home/u"}
+        });
+        let panes = json!({"panes": [
+            {"pane_id": "w2E:p1", "cwd": "/repo"}
+        ]});
+        let c = repo_cwd_candidates(&created, Some(&panes));
+        assert!(c.contains(&"/home/u".to_string()));
+        assert!(c.contains(&"/repo".to_string()));
+
+        // No pane info anywhere → empty (verification skipped upstream).
+        let bare = json!({"workspace": {"workspace_id": "w1"}});
+        assert!(repo_cwd_candidates(&bare, None).is_empty());
+        // pane wrapper variant also counts.
+        let p = json!({"pane": {"pane_id": "w1:p1", "cwd": "/x"}});
+        assert_eq!(repo_cwd_candidates(&p, None), vec!["/x".to_string()]);
+    }
+
+    #[test]
+    fn read_tail_text_extracts_and_trims() {
+        // Wrapped pane.read shape.
+        let v = json!({"type": "pane_read", "read": {
+            "pane_id": "w1:p1", "text": "line1\nline2\nerror: bad flag\n",
+            "source": "recent", "format": "text", "revision": 3, "truncated": false
+        }});
+        assert_eq!(
+            read_tail_text(&v).as_deref(),
+            Some("line1\nline2\nerror: bad flag")
+        );
+        // Keeps only the last READY_TIMEOUT_TAIL_LINES lines.
+        let many = (0..30)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let v2 = json!({"text": many});
+        let tail = read_tail_text(&v2).unwrap();
+        let tail_lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(tail_lines.len(), READY_TIMEOUT_TAIL_LINES as usize);
+        assert_eq!(tail_lines[0], "l10");
+        assert_eq!(tail_lines[19], "l29");
+        // Empty / missing text → None.
+        assert_eq!(read_tail_text(&json!({"text": "  \n "})), None);
+        assert_eq!(read_tail_text(&json!({"foo": 1})), None);
     }
 }
