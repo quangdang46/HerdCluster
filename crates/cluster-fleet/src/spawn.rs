@@ -1038,18 +1038,34 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
     } else {
         Some(req.extra_agent_args.clone())
     };
-    client
-        .agent_start(&AgentStartParams {
+    // `pane.split` returns before the new pane's shell is an available
+    // target, so `agent.start` can race it with `agent_pane_busy`. Retry
+    // briefly — the shell is ready within a second or two in practice.
+    let pane_busy_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match client.agent_start(&AgentStartParams {
             pane_id: pane_id.clone(),
             kind: req.kind.clone(),
             name: req.name.clone(),
-            args,
+            args: args.clone(),
             timeout_ms: Some(AGENT_START_TIMEOUT_MS),
-        })
-        .map_err(|e| SpawnError::AgentStartFailed {
-            machine: ep.label.clone(),
-            reason: e.to_string(),
-        })?;
+        }) {
+            Ok(_) => break,
+            Err(e) => {
+                let reason = e.to_string();
+                if reason.contains("agent_pane_busy")
+                    && Instant::now() < pane_busy_deadline
+                {
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+                return Err(SpawnError::AgentStartFailed {
+                    machine: ep.label.clone(),
+                    reason,
+                });
+            }
+        }
+    }
 
     // Wait for interactive readiness.
     let ready_timeout = req.ready_timeout.unwrap_or(DEFAULT_READY_TIMEOUT);

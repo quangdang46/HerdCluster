@@ -3,3 +3,4 @@
 /.beads/*.db-*
 .DS_Store
 herdcluster-linux-*
+/.herdcluster/
