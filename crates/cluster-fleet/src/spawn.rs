@@ -450,7 +450,7 @@ fn probe_local(ctx: &FleetContext) -> (bool, u32, Vec<String>) {
 /// Extract supported agent kinds from a `server.agent_manifests` response.
 ///
 /// Defensive: recursively collects string values under `kind`,
-/// `agent_kind`, `id`, or `slug` keys (objects only), plus any string
+/// `agent_kind`, `agent`, `id`, or `slug` keys (objects only), plus any string
 /// array under a `kinds` key. Upstream shape drift is expected to be
 /// covered by the live e2e bead; when nothing parses we return empty and
 /// callers fall back to other signals.
@@ -458,7 +458,7 @@ fn manifest_kinds(value: &Value) -> Vec<String> {
     fn walk(v: &Value, out: &mut BTreeSet<String>) {
         match v {
             Value::Object(map) => {
-                for key in ["kind", "agent_kind", "id", "slug"] {
+                for key in ["kind", "agent_kind", "agent", "id", "slug"] {
                     if let Some(s) = map.get(key).and_then(Value::as_str) {
                         if !s.is_empty() {
                             out.insert(s.to_string());
@@ -586,7 +586,12 @@ fn ensure_workspace(
             source_workspace_id: None,
         })
         .map_err(|e| step_error(ep, "workspace.create", e))?;
-    parse::find_id(&created, parse::ID_KEYS, 3)
+    // `workspace.create` returns `{workspace, tab, root_pane}` — a generic
+    // ID_KEYS search can land on `root_pane.pane_id` ("w2:p1") before the
+    // workspace id, so prefer `workspace_id` explicitly (verified against
+    // herdr 0.9.5 in the loopback e2e).
+    parse::find_id(&created, &["workspace_id"], 3)
+        .or_else(|| parse::find_id(&created, parse::ID_KEYS, 3))
         .map(|id| (id, true))
         .ok_or_else(|| SpawnError::WorkspaceFailed {
             machine: ep.label.clone(),
@@ -893,6 +898,29 @@ mod tests {
 
         // Garbage → empty.
         assert!(manifest_kinds(&json!({"x": 1})).is_empty());
+    }
+
+    #[test]
+    fn manifest_kinds_reads_herdr_095_agent_field() {
+        // Real `server.agent_manifests` shape from herdr 0.9.5: kind names
+        // live under `agent`, not `kind` — regression for the loopback
+        // e2e that found spawn rejecting every kind as unsupported.
+        let v = json!({
+            "type": "agent_manifest_status",
+            "last_result": "checked",
+            "manifests": [
+                {"agent": "claude", "source": "remote:.../claude.toml", "source_kind": "remote", "active_version": "2026.10.11.1"},
+                {"agent": "codex", "source": "remote:.../codex.toml", "source_kind": "remote", "active_version": "2026.10.11.1"},
+                {"agent": "gemini", "source": "remote:.../gemini.toml", "source_kind": "remote", "active_version": "2026.06.10.1"}
+            ]
+        });
+        let kinds = manifest_kinds(&v);
+        assert!(kinds.contains(&"claude".to_string()));
+        assert!(kinds.contains(&"codex".to_string()));
+        assert!(kinds.contains(&"gemini".to_string()));
+        // Non-kind strings must not leak in.
+        assert!(!kinds.contains(&"remote".to_string()));
+        assert!(!kinds.contains(&"checked".to_string()));
     }
 
     #[test]

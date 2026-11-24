@@ -273,7 +273,7 @@ fn supported_kinds() -> Vec<String> {
 ///
 /// Mirrors the defensive walk in `resources::agent_kinds_via` (private
 /// there): recursively collects string values under
-/// `kind`/`agent_kind`/`id`/`slug` keys plus string arrays under `kinds`
+/// `kind`/`agent_kind`/`agent`/`id`/`slug` keys plus string arrays under `kinds`
 /// keys. Duplicated deliberately — upstream schema drift is expected and
 /// both call sites must degrade identically.
 fn manifest_kinds(value: &Value) -> Vec<String> {
@@ -282,7 +282,7 @@ fn manifest_kinds(value: &Value) -> Vec<String> {
     fn walk(v: &Value, out: &mut BTreeSet<String>) {
         match v {
             Value::Object(map) => {
-                for key in ["kind", "agent_kind", "id", "slug"] {
+                for key in ["kind", "agent_kind", "agent", "id", "slug"] {
                     if let Some(s) = map.get(key).and_then(Value::as_str) {
                         if !s.is_empty() {
                             out.insert(s.to_string());
@@ -414,6 +414,20 @@ mod tests {
         let out = install_agent_cli("no-such-kind-xyz", false).unwrap();
         assert!(out.skipped_reason.is_some());
         assert!(!out.created);
+    }
+
+    #[test]
+    fn manifest_kinds_reads_herdr_095_agent_field() {
+        // Real `server.agent_manifests` shape from herdr 0.9.5 uses `agent`.
+        let v = serde_json::json!({
+            "manifests": [
+                {"agent": "claude", "source_kind": "remote"},
+                {"agent": "codex", "source_kind": "remote"}
+            ]
+        });
+        let kinds = manifest_kinds(&v);
+        assert!(kinds.contains(&"claude".to_string()));
+        assert!(kinds.contains(&"codex".to_string()));
     }
 
     #[test]

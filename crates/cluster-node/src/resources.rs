@@ -274,7 +274,7 @@ fn agent_kinds_via(client: &api_client::ApiClient) -> Vec<String> {
 /// Extract supported agent kinds from a `server.agent_manifests` response.
 ///
 /// Mirrors the defensive walk in `cluster_fleet::spawn` (private there):
-/// recursively collects string values under `kind`/`agent_kind`/`id`/`slug`
+/// recursively collects string values under `kind`/`agent_kind`/`agent`/`id`/`slug`
 /// keys plus string arrays under `kinds` keys. Upstream schema drift is
 /// expected; when nothing parses we return empty and callers treat kinds
 /// as unknown.
@@ -284,7 +284,7 @@ fn manifest_kinds(value: &Value) -> Vec<String> {
     fn walk(v: &Value, out: &mut BTreeSet<String>) {
         match v {
             Value::Object(map) => {
-                for key in ["kind", "agent_kind", "id", "slug"] {
+                for key in ["kind", "agent_kind", "agent", "id", "slug"] {
                     if let Some(s) = map.get(key).and_then(Value::as_str) {
                         if !s.is_empty() {
                             out.insert(s.to_string());
@@ -507,6 +507,23 @@ mod tests {
             load_avg: vec![0.1, 0.2, 0.3],
             kinds: kinds.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn manifest_kinds_reads_herdr_095_agent_field() {
+        // Real `server.agent_manifests` shape from herdr 0.9.5 uses `agent`
+        // for the kind name — regression for kinds[] reporting empty.
+        let v = serde_json::json!({
+            "type": "agent_manifest_status",
+            "manifests": [
+                {"agent": "claude", "source_kind": "remote"},
+                {"agent": "codex", "source_kind": "remote"}
+            ]
+        });
+        let kinds = manifest_kinds(&v);
+        assert!(kinds.contains(&"claude".to_string()));
+        assert!(kinds.contains(&"codex".to_string()));
+        assert!(!kinds.contains(&"remote".to_string()));
     }
 
     #[test]
