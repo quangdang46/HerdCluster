@@ -3,18 +3,18 @@
 # herdcluster installer — installs the herdcluster CLI from GitHub releases.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/quangdang46/HerdCluster/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh | bash
 #   ./install.sh --version            # print the installer version
 #
 # Environment:
 #   HERDCLUSTER_VERSION          pin a release tag, e.g. v0.1.0 (default: latest)
 #   HERDCLUSTER_INSTALL_DIR      install directory (default: ~/.local/bin)
-#   HERDCLUSTER_REPO             owner/name override (default: quangdang46/HerdCluster)
+#   HERDCLUSTER_REPO             owner/name override (default: quangdang46/herd_cluster)
 #
 set -euo pipefail
 
 INSTALLER_VERSION="1.0.0"
-REPO="${HERDCLUSTER_REPO:-quangdang46/HerdCluster}"
+REPO="${HERDCLUSTER_REPO:-quangdang46/herd_cluster}"
 INSTALL_DIR="${HERDCLUSTER_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${HERDCLUSTER_VERSION:-latest}"
 
@@ -30,7 +30,7 @@ Usage: install.sh [--version]
 Environment:
   HERDCLUSTER_VERSION       pin a release tag (e.g. v0.1.0); default: latest
   HERDCLUSTER_INSTALL_DIR   install directory (default: ~/.local/bin)
-  HERDCLUSTER_REPO          GitHub repo override (default: quangdang46/HerdCluster)
+  HERDCLUSTER_REPO          GitHub repo override (default: quangdang46/herd_cluster)
 EOF
 }
 

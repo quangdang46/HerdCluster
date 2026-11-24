@@ -6,7 +6,7 @@ GitHub with per-platform tarballs and a `checksums.txt`.
 ## Quick install (macOS / Linux)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/quangdang46/HerdCluster/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh | bash
 ```
 
 The installer detects OS/arch, downloads the matching release asset,
@@ -41,7 +41,7 @@ SSH keys, no Tailscale required.
 1. Install inside WSL2 (Ubuntu), not Windows:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/quangdang46/HerdCluster/main/install.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh | bash
    ```
 
 2. Make sure `~/.local/bin` is on `PATH` inside WSL (the installer prints a
