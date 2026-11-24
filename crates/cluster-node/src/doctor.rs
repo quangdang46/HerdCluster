@@ -18,10 +18,11 @@
 //!   `fix_hint`s (and, for auth-ish failures in interactive mode, the
 //!   re-pair steps are printed).
 //!
-//! `--machine <label>` scopes the per-worker checks to one machine;
-//! cluster-wide checks (config, local herdr, discovery, resources,
-//! skill) always run. `"local"` scopes to the controller's own herdr
-//! only.
+//! `--machine <label>` scopes the worker/endpoint checks to that label
+//! only; cluster-wide checks (config, local herdr, discovery, resources,
+//! skill) always run. `"local"` means the controller itself: remote
+//! workers are excluded from the check list entirely. No `--machine`
+//! checks the whole cluster.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -46,7 +47,9 @@ const MEM_WARN_MB: u64 = 512;
 /// Options for [`run_doctor`].
 #[derive(Debug, Clone, Default)]
 pub struct DoctorOptions {
-    /// Scope per-machine checks to one label; `None` = whole cluster.
+    /// Scope worker/endpoint checks to one machine label; `None` =
+    /// whole cluster. `"local"` = controller only (remote workers are
+    /// excluded); any other label scopes to that single worker.
     pub machine: Option<String>,
     /// Attempt safe remediations after the check pass.
     pub fix: bool,
@@ -538,9 +541,21 @@ fn check_workers_registered(
         return Vec::new();
     }
 
-    // Scope filter.
+    // Scope filter: `--machine <label>` limits worker checks to that
+    // label only. `"local"` is the controller itself — remote workers
+    // are out of scope entirely, so no `machine <label>` endpoint
+    // checks are emitted. `None` keeps the whole cluster.
     let scoped: Vec<WorkerEntry> = match machine {
-        Some(label) if label != LOCAL_LABEL => {
+        Some(LOCAL_LABEL) => {
+            push(
+                checks,
+                "workers registered",
+                CheckStatus::Pass,
+                "scoped to 'local' — remote worker checks skipped",
+            );
+            return Vec::new();
+        }
+        Some(label) => {
             let hits: Vec<WorkerEntry> = file
                 .workers
                 .iter()
@@ -559,7 +574,7 @@ fn check_workers_registered(
             }
             hits
         }
-        _ => file.workers.clone(),
+        None => file.workers.clone(),
     };
 
     if scoped.is_empty() {
@@ -1393,5 +1408,112 @@ mod tests {
         // On unix with df present this returns Some; elsewhere None.
         // Either way it must not panic.
         let _ = disk_free_bytes(Path::new("/"));
+    }
+
+    /// Write a `workers.json` with two never-seen (offline) workers so
+    /// endpoint probes never touch a real socket.
+    fn write_two_workers(state_dir: &Path) {
+        let worker = |id: &str, label: &str| {
+            serde_json::json!({
+                "worker_id": id,
+                "label": label,
+                "pubkey": "aa",
+                "paired_at": "2024-01-01T00:00:00Z",
+                "last_seen": null,
+            })
+        };
+        std::fs::write(
+            state_dir.join(registry::WORKERS_FILE_NAME),
+            serde_json::json!({
+                "version": registry::WORKERS_FILE_VERSION,
+                "workers": [worker("w1", "desktop-a"), worker("w2", "desktop-b")],
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    fn machine_check_names(checks: &[CheckResult]) -> Vec<&str> {
+        checks
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| n.starts_with("machine "))
+            .collect()
+    }
+
+    #[test]
+    fn doctor_machine_local_excludes_remote_workers() {
+        // B4 regression: `--machine local` must scope worker/endpoint
+        // checks to the controller only — remote workers are excluded.
+        let dir = tmpdir("scope-local");
+        write_two_workers(&dir);
+
+        let mut checks = Vec::new();
+        let workers = check_workers_registered(&dir, Some(LOCAL_LABEL), &mut checks);
+        assert!(workers.is_empty(), "local scope must return no workers");
+        let reg = checks
+            .iter()
+            .find(|c| c.name == "workers registered")
+            .unwrap();
+        assert_eq!(reg.status, CheckStatus::Pass, "{}", reg.detail);
+        assert!(reg.detail.contains("local"));
+
+        // Endpoint pass must emit no `machine <label>` checks at all.
+        check_machine_endpoints(&dir, &workers, &mut checks);
+        assert!(
+            machine_check_names(&checks).is_empty(),
+            "unexpected machine checks: {:?}",
+            machine_check_names(&checks)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_machine_label_scopes_to_single_worker() {
+        let dir = tmpdir("scope-label");
+        write_two_workers(&dir);
+
+        let mut checks = Vec::new();
+        let workers = check_workers_registered(&dir, Some("desktop-a"), &mut checks);
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].label, "desktop-a");
+
+        // Both workers are offline → endpoint check is a warn, and only
+        // the in-scope label appears.
+        check_machine_endpoints(&dir, &workers, &mut checks);
+        assert_eq!(machine_check_names(&checks), vec!["machine desktop-a"]);
+
+        // Unknown label still fails loudly.
+        let mut checks = Vec::new();
+        let workers = check_workers_registered(&dir, Some("ghost"), &mut checks);
+        assert!(workers.is_empty());
+        let reg = checks
+            .iter()
+            .find(|c| c.name == "workers registered")
+            .unwrap();
+        assert_eq!(reg.status, CheckStatus::Fail);
+        assert!(reg.detail.contains("ghost"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_no_machine_scope_returns_all_workers() {
+        let dir = tmpdir("scope-all");
+        write_two_workers(&dir);
+
+        let mut checks = Vec::new();
+        let workers = check_workers_registered(&dir, None, &mut checks);
+        assert_eq!(workers.len(), 2);
+        let names = machine_check_names(&checks);
+        assert!(names.is_empty()); // endpoint pass not run yet
+        check_machine_endpoints(&dir, &workers, &mut checks);
+        assert_eq!(
+            machine_check_names(&checks),
+            vec!["machine desktop-a", "machine desktop-b"]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
