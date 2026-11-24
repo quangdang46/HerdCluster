@@ -590,11 +590,11 @@ fn unix_hostname() -> Option<String> {
 
     let mut buf = [0i8; 256];
     // SAFETY: `buf` is a valid writable buffer of `len` bytes.
-    let rc = unsafe { gethostname(buf.as_mut_ptr(), buf.len()) };
+    let rc = unsafe { gethostname(buf.as_mut_ptr() as *mut c_char, buf.len()) };
     if rc != 0 {
         return None;
     }
-    let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+    let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) }
         .to_string_lossy()
         .trim()
         .to_string();
