@@ -624,12 +624,43 @@ fn workspace_path_candidates<'a>(
     out
 }
 
+/// `repo` is a prefix of `candidate` at a path boundary: equal, or
+/// `candidate` lies inside `repo` (`<repo>/…`). Both inputs must already
+/// be trimmed of trailing slashes.
+fn path_within(repo: &str, candidate: &str) -> bool {
+    candidate == repo || candidate.starts_with(&format!("{repo}/"))
+}
+
+/// Filesystem-canonical form of `path` for workspace matching, falling
+/// back to the trimmed input when it cannot be canonicalized.
+///
+/// herdr reports pane cwds in canonical form — on macOS `/tmp` resolves
+/// to `/private/tmp` — while `--repo` arrives verbatim. Comparing
+/// canonical forms on both sides prevents duplicate workspaces for the
+/// same directory. Paths on remote workers typically do not exist on the
+/// machine running herdcluster, so they keep the raw string and the
+/// previous comparison behavior.
+fn canonicalize_for_match(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    let probe = if trimmed.is_empty() { "/" } else { trimmed };
+    match std::fs::canonicalize(probe) {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(_) => trimmed.to_string(),
+    }
+}
+
 /// `candidate` identifies `repo` when it equals the repo path or lies
-/// inside it (`<repo>/…`) — same rule the original path matcher used.
+/// inside it (`<repo>/…`) — same rule the original path matcher used,
+/// checked both verbatim and in filesystem-canonical form (see
+/// [`canonicalize_for_match`]).
 fn path_matches_repo(candidate: &str, repo: &str) -> bool {
-    let repo = repo.trim_end_matches('/');
-    let cand = candidate.trim_end_matches('/');
-    cand == repo || cand.starts_with(&format!("{repo}/"))
+    if path_within(repo.trim_end_matches('/'), candidate.trim_end_matches('/')) {
+        return true;
+    }
+    path_within(
+        canonicalize_for_match(repo).trim_end_matches('/'),
+        canonicalize_for_match(candidate).trim_end_matches('/'),
+    )
 }
 
 /// Pure: workspace id to reuse when `--repo` is omitted — exactly one
@@ -761,39 +792,57 @@ fn pane_ids(client: &api_client::ApiClient, workspace_id: &str) -> Result<Vec<St
         .collect())
 }
 
+/// Pane operations used by [`ensure_pane`], abstracted so tests can fake
+/// the herdr API without a socket. Implemented for
+/// [`api_client::ApiClient`].
+trait PaneOps {
+    /// Pane ids currently in `workspace_id`, in response order.
+    fn list_pane_ids(&self, workspace_id: &str) -> Result<Vec<String>, SpawnError>;
+    /// `pane.split` — returns the raw response for id extraction.
+    fn split_pane(&self, params: &PaneSplitParams) -> Result<Value, SpawnError>;
+}
+
+impl PaneOps for api_client::ApiClient {
+    fn list_pane_ids(&self, workspace_id: &str) -> Result<Vec<String>, SpawnError> {
+        pane_ids(self, workspace_id)
+    }
+
+    fn split_pane(&self, params: &PaneSplitParams) -> Result<Value, SpawnError> {
+        self.pane_split(params).map_err(|e| SpawnError::PaneFailed {
+            machine: "?".to_string(),
+            reason: e.to_string(),
+        })
+    }
+}
+
 /// Ensure a dedicated pane for the agent. Returns the pane id.
 ///
-/// **Strategy (documented choice):**
-/// - If we just created the workspace, its root pane *is* dedicated to this
-///   agent — reuse it (no split needed, cleanest read/wait semantics).
-/// - If the workspace pre-existed, `pane.split` a new pane (`down`
-///   direction, unfocused, cwd = repo) so each agent gets its own pane —
-///   PLAN.md §3.8 prefers one pane per agent.
+/// **Strategy (documented choice):** always `pane.split` a new pane
+/// (`down` direction, unfocused, cwd = repo) — PLAN.md §3.8 prefers one
+/// pane per agent. The root pane of a just-created workspace is
+/// deliberately NOT reused: `workspace.create` returns while that pane's
+/// shell is still spawning, and `pane.list` already sees it, so
+/// `agent.start` raced it and failed with `agent_pane_busy` ("not an
+/// available shell"). A freshly split pane is shell-ready by the time
+/// `pane.split` returns, which the QA retry path proved reliable.
+///
 /// - Fallback: if the split response carries no parseable id, re-list
 ///   panes and pick the first id not present before the split.
 fn ensure_pane(
-    client: &api_client::ApiClient,
+    client: &dyn PaneOps,
     ep: &MachineEndpoint,
     workspace_id: &str,
     repo_path: Option<&str>,
-    created_workspace: bool,
 ) -> Result<String, SpawnError> {
-    let before = pane_ids(client, workspace_id).map_err(|mut e| {
+    let before = client.list_pane_ids(workspace_id).map_err(|mut e| {
         if let SpawnError::PaneFailed { machine, .. } = &mut e {
             *machine = ep.label.clone();
         }
         e
     })?;
 
-    if created_workspace {
-        if let Some(first) = before.first() {
-            return Ok(first.clone());
-        }
-        // Fresh workspace with no visible pane — fall through to split.
-    }
-
     let split = client
-        .pane_split(&PaneSplitParams {
+        .split_pane(&PaneSplitParams {
             direction: SplitDirection::Down,
             target_pane_id: before.first().cloned(),
             cwd: repo_path.map(str::to_string),
@@ -802,9 +851,11 @@ fn ensure_pane(
             ratio: None,
             workspace_id: Some(workspace_id.to_string()),
         })
-        .map_err(|e| SpawnError::PaneFailed {
-            machine: ep.label.clone(),
-            reason: e.to_string(),
+        .map_err(|mut e| {
+            if let SpawnError::PaneFailed { machine, .. } = &mut e {
+                *machine = ep.label.clone();
+            }
+            e
         })?;
 
     if let Some(id) = pane_id_of(&split) {
@@ -812,7 +863,7 @@ fn ensure_pane(
     }
 
     // Fallback: diff the pane list.
-    let after = pane_ids(client, workspace_id).map_err(|mut e| {
+    let after = client.list_pane_ids(workspace_id).map_err(|mut e| {
         if let SpawnError::PaneFailed { machine, .. } = &mut e {
             *machine = ep.label.clone();
         }
@@ -975,10 +1026,11 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
     let repo = effective_repo_path(&req.repo_path, ep.kind == MachineKind::Local);
 
     // Workspace: find by repo path / sole workspace, or create.
-    let (workspace_id, created) = ensure_workspace(&client, &ep, repo.as_deref(), &req.name)?;
+    let (workspace_id, _created) = ensure_workspace(&client, &ep, repo.as_deref(), &req.name)?;
 
-    // Dedicated pane.
-    let pane_id = ensure_pane(&client, &ep, &workspace_id, repo.as_deref(), created)?;
+    // Dedicated pane — always a fresh split (see ensure_pane for why the
+    // root pane of a new workspace is not reused).
+    let pane_id = ensure_pane(&client, &ep, &workspace_id, repo.as_deref())?;
 
     // Launch the agent.
     let args = if req.extra_agent_args.is_empty() {
@@ -1429,5 +1481,227 @@ mod tests {
             }
             other => panic!("expected WorkerUnreachable, got {other:?}"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // B2 regression: ensure_pane must never reuse a fresh workspace's
+    // root pane (agent_pane_busy race).
+    // ------------------------------------------------------------------
+
+    /// Fake [`PaneOps`]: serves queued `pane.list` id sets and records
+    /// `pane.split` calls.
+    struct FakePaneOps {
+        /// Id sets returned by successive `list_pane_ids` calls.
+        list_results: std::cell::RefCell<std::collections::VecDeque<Vec<String>>>,
+        /// Response returned by `split_pane`.
+        split_response: Value,
+        /// Number of `split_pane` invocations.
+        split_calls: std::cell::Cell<usize>,
+        /// Params of the last `split_pane` call.
+        last_params: std::cell::RefCell<Option<PaneSplitParams>>,
+    }
+
+    impl FakePaneOps {
+        fn new(lists: Vec<Vec<String>>, split_response: Value) -> Self {
+            Self {
+                list_results: std::cell::RefCell::new(lists.into()),
+                split_response,
+                split_calls: std::cell::Cell::new(0),
+                last_params: std::cell::RefCell::new(None),
+            }
+        }
+    }
+
+    impl PaneOps for FakePaneOps {
+        fn list_pane_ids(&self, _workspace_id: &str) -> Result<Vec<String>, SpawnError> {
+            Ok(self
+                .list_results
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default())
+        }
+
+        fn split_pane(&self, params: &PaneSplitParams) -> Result<Value, SpawnError> {
+            self.split_calls.set(self.split_calls.get() + 1);
+            *self.last_params.borrow_mut() = Some(params.clone());
+            Ok(self.split_response.clone())
+        }
+    }
+
+    fn test_endpoint() -> MachineEndpoint {
+        MachineEndpoint {
+            label: "local".into(),
+            socket_path: PathBuf::from("/nonexistent.sock"),
+            kind: MachineKind::Local,
+        }
+    }
+
+    #[test]
+    fn ensure_pane_splits_even_when_only_root_pane_exists() {
+        // B2: a brand-new workspace's pane.list already shows the root
+        // pane ("w2:p1") while its shell is still spawning — reusing it
+        // made agent.start fail with agent_pane_busy. ensure_pane must
+        // split a fresh pane instead of returning the root pane id.
+        let fake = FakePaneOps::new(
+            vec![vec!["w2:p1".to_string()]],
+            json!({"type": "pane_info", "pane": {
+                "pane_id": "w2:p2", "workspace_id": "w2", "tab_id": "w2:t1",
+                "terminal_id": "term_2", "focused": false,
+                "agent_status": "unknown", "revision": 0
+            }}),
+        );
+        let pane = ensure_pane(&fake, &test_endpoint(), "w2", Some("/repo"))
+            .expect("ensure_pane should succeed");
+        assert_eq!(pane, "w2:p2");
+        assert_eq!(fake.split_calls.get(), 1);
+        let params = fake.last_params.borrow();
+        let params = params.as_ref().unwrap();
+        // Split targets the existing root pane, in the right workspace,
+        // with the repo as cwd.
+        assert_eq!(params.target_pane_id.as_deref(), Some("w2:p1"));
+        assert_eq!(params.workspace_id.as_deref(), Some("w2"));
+        assert_eq!(params.cwd.as_deref(), Some("/repo"));
+        assert_eq!(params.direction, SplitDirection::Down);
+    }
+
+    #[test]
+    fn ensure_pane_splits_when_workspace_has_no_listed_pane() {
+        // Fresh workspace whose root pane is not yet visible in
+        // pane.list: still split (target None → workspace-scoped split).
+        let fake = FakePaneOps::new(
+            vec![vec![]],
+            json!({"type": "pane_info", "pane": {"pane_id": "w3:p1"}}),
+        );
+        let pane = ensure_pane(&fake, &test_endpoint(), "w3", None).unwrap();
+        assert_eq!(pane, "w3:p1");
+        assert_eq!(fake.split_calls.get(), 1);
+        assert_eq!(
+            fake.last_params.borrow().as_ref().unwrap().target_pane_id,
+            None
+        );
+    }
+
+    #[test]
+    fn ensure_pane_falls_back_to_pane_list_diff() {
+        // Split response carries no parseable id → diff successive
+        // pane.list results for the new pane.
+        let fake = FakePaneOps::new(
+            vec![
+                vec!["w4:p1".to_string()],
+                vec!["w4:p1".to_string(), "w4:p2".to_string()],
+            ],
+            json!({"type": "ok"}),
+        );
+        let pane = ensure_pane(&fake, &test_endpoint(), "w4", None).unwrap();
+        assert_eq!(pane, "w4:p2");
+    }
+
+    #[test]
+    fn ensure_pane_errors_when_no_new_pane_appears() {
+        let fake = FakePaneOps::new(
+            vec![vec!["w5:p1".to_string()], vec!["w5:p1".to_string()]],
+            json!({"type": "ok"}),
+        );
+        let err = ensure_pane(&fake, &test_endpoint(), "w5", None).unwrap_err();
+        assert_eq!(err.code(), "pane_failed");
+    }
+
+    // ------------------------------------------------------------------
+    // B3 regression: macOS /tmp vs /private/tmp canonicalization.
+    // ------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn find_workspace_for_repo_matches_canonicalized_paths() {
+        use std::os::unix::fs::symlink;
+
+        // A symlinked alias stands in for macOS's /tmp → /private/tmp:
+        // herdr reports the pane cwd canonicalized, --repo stays verbatim.
+        let base = std::env::temp_dir();
+        let tag = format!("hc-b3-{}", std::process::id());
+        let real = base.join(format!("{tag}-real"));
+        let alias = base.join(format!("{tag}-alias"));
+        std::fs::create_dir_all(&real).unwrap();
+        let _ = std::fs::remove_file(&alias);
+        symlink(&real, &alias).unwrap();
+        let canon = std::fs::canonicalize(&real).unwrap();
+        let canon_str = canon.to_string_lossy().into_owned();
+        let alias_str = alias.to_string_lossy().into_owned();
+
+        // Sanity: alias and canonical path differ as strings.
+        assert_ne!(
+            alias_str.trim_end_matches('/'),
+            canon_str.trim_end_matches('/')
+        );
+
+        let list = json!({"workspaces": [{"workspace_id": "w2"}]});
+        // Pane cwd reported in canonical form; --repo given via alias.
+        let panes = json!({"panes": [
+            {"pane_id": "w2:p1", "workspace_id": "w2", "cwd": canon_str}
+        ]});
+        assert_eq!(
+            find_workspace_for_repo(&list, &panes, &alias_str),
+            Some("w2".into())
+        );
+        // And the reverse direction: canonical --repo, aliased cwd.
+        let panes_alias = json!({"panes": [
+            {"pane_id": "w2:p1", "workspace_id": "w2", "cwd": alias_str}
+        ]});
+        assert_eq!(
+            find_workspace_for_repo(&list, &panes_alias, &canon_str),
+            Some("w2".into())
+        );
+        // Subdirectory of the repo still matches through canonicalization.
+        let sub = canon.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let panes_sub = json!({"panes": [
+            {"pane_id": "w2:p1", "workspace_id": "w2",
+             "cwd": sub.to_string_lossy()}
+        ]});
+        assert_eq!(
+            find_workspace_for_repo(&list, &panes_sub, &alias_str),
+            Some("w2".into())
+        );
+        // Unrelated path still does not match.
+        assert_eq!(
+            find_workspace_for_repo(&list, &panes, "/definitely/not/the/repo"),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&real);
+        let _ = std::fs::remove_file(&alias);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_workspace_for_repo_matches_macos_tmp_alias() {
+        // Exact B3 repro: --repo /tmp/<dir>, herdr pane cwd
+        // /private/tmp/<dir> — same directory, different strings.
+        // temp_dir on macOS is /var/folders/...; force a /tmp path so the
+        // /tmp → /private/tmp canonicalization is exercised.
+        let tmp_dir = PathBuf::from(format!("/tmp/hc-b3-macos-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let canon = std::fs::canonicalize(&tmp_dir).unwrap();
+        let canon_str = canon.to_string_lossy().into_owned();
+        assert!(canon_str.starts_with("/private/tmp/"));
+
+        let list = json!({"workspaces": [{"workspace_id": "w2"}]});
+        let panes = json!({"panes": [
+            {"pane_id": "w2:p1", "workspace_id": "w2", "cwd": canon_str}
+        ]});
+        assert_eq!(
+            find_workspace_for_repo(&list, &panes, tmp_dir.to_str().unwrap()),
+            Some("w2".into())
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn path_matches_repo_canonical_fallback_for_missing_paths() {
+        // Nonexistent paths (e.g. remote-worker cwds) keep verbatim
+        // comparison — canonicalize fails and falls back to the raw string.
+        assert!(path_matches_repo("/no/such/repo/sub", "/no/such/repo"));
+        assert!(!path_matches_repo("/no/such/other", "/no/such/repo"));
+        assert!(path_matches_repo("/no/such/repo", "/no/such/repo/"));
     }
 }

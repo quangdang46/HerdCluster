@@ -143,7 +143,14 @@ pub fn parse_agent_list(machine: &str, value: &Value) -> Vec<FleetAgent> {
 /// Raw field aliases tried, in order, for the machine-local agent id.
 const AGENT_ID_KEYS: &[&str] = &["name", "terminal_id", "id", "agent_id"];
 /// Raw field aliases for agent kind.
-const KIND_KEYS: &[&str] = &["kind", "agent_kind"];
+///
+/// herdr 0.9.5 `agent.list` rows (`AgentInfo`) carry the kind under
+/// `agent` (e.g. `"devin"`); `kind`/`agent_kind` are kept for older or
+/// alternate shapes. Reading `agent` as the kind is safe because the id
+/// keys above never include it — the machine-local id comes from `name`
+/// (falling back to `terminal_id`/`id`/`agent_id`), and `agent` is
+/// already a consumed key so the raw value never leaks into `extra`.
+const KIND_KEYS: &[&str] = &["kind", "agent_kind", "agent"];
 /// Top-level keys consumed into [`FleetAgent`] fields — removed from `extra`
 /// so flattened output never duplicates a key.
 const CONSUMED_KEYS: &[&str] = &["machine", "id", "agent", "name", "kind", "status"];
@@ -450,6 +457,61 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].agent, "bare-id");
         assert_eq!(rows[1].id, "w/bare-id");
+    }
+
+    #[test]
+    fn parse_agent_list_reads_herdr_095_agent_field_as_kind() {
+        // Real herdr 0.9.5 `agent.list` row (`AgentInfo` from the API
+        // schema): the kind lives under `agent` (e.g. `"devin"`), the
+        // display name under `name`, status under `agent_status`. This is
+        // the shape that made every `kind` serialize as `null`.
+        let v = json!({"type": "agent_list", "agents": [
+            {
+                "terminal_id": "term_1", "agent": "devin", "name": "devin-mac",
+                "agent_status": "idle", "pane_id": "w2:p1", "workspace_id": "w2",
+                "tab_id": "w2:t1", "focused": true, "revision": 0,
+                "interactive_ready": true, "cwd": "/repo", "foreground_cwd": "/repo",
+                "display_agent": "devin", "agent_session": null,
+                "launch_pending": false, "screen_detection_skipped": false,
+                "state_change_seq": 0, "state_labels": {}, "tokens": {},
+                "title": null, "terminal_title": null,
+                "terminal_title_stripped": null, "completion_seq": null
+            }
+        ]});
+        let rows = parse_agent_list("local", &v);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        // Local id still comes from `name`; `agent` is NOT used as id.
+        assert_eq!(r.agent, "devin-mac");
+        assert_eq!(r.id, "local/devin-mac");
+        assert_eq!(r.name.as_deref(), Some("devin-mac"));
+        assert_eq!(r.kind.as_deref(), Some("devin"));
+        assert_eq!(r.status.as_deref(), Some("idle"));
+        // `agent` is consumed into `kind` — never duplicated in `extra`;
+        // unrelated raw fields still pass through flattened.
+        assert!(r.extra.get("agent").is_none());
+        assert_eq!(r.extra.get("pane_id").unwrap(), "w2:p1");
+        assert_eq!(r.extra.get("interactive_ready").unwrap(), true);
+        // --json schema stays stable: `kind` now populates, `agent`
+        // remains the machine-local id.
+        let j = serde_json::to_value(AgentListRow::Agent(r.clone())).unwrap();
+        assert_eq!(j["kind"], "devin");
+        assert_eq!(j["agent"], "devin-mac");
+        assert_eq!(j["id"], "local/devin-mac");
+        assert_eq!(j["status"], "idle");
+    }
+
+    #[test]
+    fn parse_agent_list_kind_alias_priority() {
+        // Explicit `kind` wins over the 0.9.5 `agent` alias.
+        let rows = parse_agent_list(
+            "m",
+            &json!({"agents": [{"name": "a", "kind": "claude", "agent": "devin"}]}),
+        );
+        assert_eq!(rows[0].kind.as_deref(), Some("claude"));
+        // `agent: null` (AgentInfo allows null) → kind stays None.
+        let rows = parse_agent_list("m", &json!({"agents": [{"name": "b", "agent": null}]}));
+        assert_eq!(rows[0].kind, None);
     }
 
     fn ctx_with_workers() -> FleetContext {
