@@ -63,7 +63,10 @@ fn update(version: Option<&str>, yes: bool, verbose: bool) -> Result<Outcome, St
     let asset_name = format!("herdcluster-{target}.tar.gz");
     let current = env!("CARGO_PKG_VERSION");
 
-    let tag = version.map(normalize_tag);
+    let tag = match version {
+        Some(v) => Some(normalize_tag(v)?),
+        None => None,
+    };
     crate::commands::vlog(verbose, format!("querying GitHub releases for {REPO}"));
     let release = fetch_release(tag.as_deref())?;
     let release_tag = release
@@ -77,6 +80,15 @@ fn update(version: Option<&str>, yes: bool, verbose: bool) -> Result<Outcome, St
         return Ok(Outcome::Current {
             version: release_version,
         });
+    }
+    // Never silently downgrade: `--version` (or a latest release older
+    // than this build) must not replace a newer binary without the user
+    // explicitly asking for it via install.sh.
+    if cmp_version(&release_version, current)? == std::cmp::Ordering::Less {
+        return Err(format!(
+            "refusing to downgrade herdcluster {current} → {release_version}; \
+             to install an older release on purpose, use install.sh"
+        ));
     }
 
     let download_url = select_asset_url(&release, &asset_name)
@@ -133,13 +145,57 @@ fn target_triple() -> Result<&'static str, String> {
 }
 
 /// Normalize `--version` input to a GitHub release tag (`vX.Y.Z`).
-/// Accepts `0.1.0` or `v0.1.0`.
-fn normalize_tag(version: &str) -> String {
-    if version.starts_with('v') {
-        version.to_string()
-    } else {
-        format!("v{version}")
+///
+/// Accepts `0.1.0` or `v0.1.0` and rejects everything else — the value is
+/// interpolated into the GitHub API path, so anything containing `/`,
+/// `..`, whitespace, or non-numeric components must never reach
+/// [`fetch_release`].
+fn normalize_tag(version: &str) -> Result<String, String> {
+    let bare = version.trim();
+    let bare = bare.strip_prefix('v').unwrap_or(bare);
+    let mut parts = bare.split('.');
+    let valid = matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(a), Some(b), Some(c), None)
+            if [a, b, c]
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    );
+    if !valid {
+        return Err(format!(
+            "invalid --version {version:?}: expected X.Y.Z or vX.Y.Z \
+             (e.g. --version v0.1.1)"
+        ));
     }
+    Ok(format!("v{bare}"))
+}
+
+/// Parse an `X.Y.Z` version (leading `v` tolerated) into numeric parts.
+fn parse_version(version: &str) -> Result<(u64, u64, u64), String> {
+    let bare = version.strip_prefix('v').unwrap_or(version);
+    let mut parts = bare.split('.');
+    let parse = |p: Option<&str>| -> Result<u64, String> {
+        p.ok_or_else(|| format!("version {version:?} is not X.Y.Z"))
+            .and_then(|s| {
+                s.parse::<u64>()
+                    .map_err(|_| format!("version {version:?} is not X.Y.Z"))
+            })
+    };
+    let (a, b, c) = (
+        parse(parts.next())?,
+        parse(parts.next())?,
+        parse(parts.next())?,
+    );
+    if parts.next().is_some() {
+        return Err(format!("version {version:?} is not X.Y.Z"));
+    }
+    Ok((a, b, c))
+}
+
+/// Semver-ish ordering for `X.Y.Z` versions (no pre-release handling —
+/// release tags are plain `vX.Y.Z`).
+fn cmp_version(a: &str, b: &str) -> Result<std::cmp::Ordering, String> {
+    Ok(parse_version(a)?.cmp(&parse_version(b)?))
 }
 
 /// Strip the leading `v` from a release tag to get the crate version.
@@ -414,10 +470,43 @@ mod tests {
 
     #[test]
     fn version_tag_normalization_and_comparison() {
-        assert_eq!(normalize_tag("0.1.1"), "v0.1.1");
-        assert_eq!(normalize_tag("v0.1.1"), "v0.1.1");
+        assert_eq!(normalize_tag("0.1.1").unwrap(), "v0.1.1");
+        assert_eq!(normalize_tag("v0.1.1").unwrap(), "v0.1.1");
         assert_eq!(version_of_tag("v0.1.1"), "0.1.1");
         assert_eq!(version_of_tag("0.1.1"), "0.1.1");
+    }
+
+    #[test]
+    fn version_tag_rejects_malformed_input() {
+        for bad in [
+            "",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.x",
+            "1.2.3-rc1",
+            "../releases",
+            "1.2.3/../../x",
+            "v",
+            "v1..2",
+            "  ",
+        ] {
+            assert!(normalize_tag(bad).is_err(), "{bad:?} should be rejected");
+        }
+        // Whitespace around a valid version is tolerated.
+        assert_eq!(normalize_tag("  v0.1.1\n").unwrap(), "v0.1.1");
+    }
+
+    #[test]
+    fn version_comparison_orders_semver() {
+        use std::cmp::Ordering::*;
+        assert_eq!(cmp_version("0.1.1", "0.1.2").unwrap(), Less);
+        assert_eq!(cmp_version("0.2.0", "0.10.0").unwrap(), Less);
+        assert_eq!(cmp_version("1.0.0", "0.9.9").unwrap(), Greater);
+        assert_eq!(cmp_version("v0.1.5", "0.1.5").unwrap(), Equal);
+        assert_eq!(cmp_version("0.1.5", "v0.1.5").unwrap(), Equal);
+        assert!(cmp_version("not-a-version", "0.1.0").is_err());
+        assert!(cmp_version("0.1.0", "1.2.3.4").is_err());
     }
 
     #[test]

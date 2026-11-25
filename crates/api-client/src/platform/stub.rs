@@ -10,8 +10,10 @@ use std::time::Duration;
 use crate::ApiError;
 
 /// A bidirectional byte stream returned by [`connect`].
-pub trait IoStream: std::io::Read + std::io::Write + Send {}
-impl<T: std::io::Read + std::io::Write + Send> IoStream for T {}
+pub trait IoStream: std::io::Read + std::io::Write + Send {
+    /// Adjust the per-read timeout on the underlying stream.
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> std::io::Result<()>;
+}
 
 /// Resolve the herdr API endpoint.
 ///

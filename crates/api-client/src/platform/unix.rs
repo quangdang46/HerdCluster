@@ -30,10 +30,19 @@ use crate::ApiError;
 
 /// A bidirectional byte stream returned by [`connect`].
 ///
-/// Blanket-implemented for anything that is `Read + Write + Send`, which
-/// covers `std::os::unix::net::UnixStream`.
-pub trait IoStream: std::io::Read + std::io::Write + Send {}
-impl<T: std::io::Read + std::io::Write + Send> IoStream for T {}
+/// Implemented for [`std::os::unix::net::UnixStream`]; the trait exists so
+/// callers can adjust the per-read timeout while enforcing an overall
+/// request deadline (see [`crate::ApiClient::request_with_timeout`]).
+pub trait IoStream: std::io::Read + std::io::Write + Send {
+    /// Adjust the per-read timeout on the underlying stream.
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl IoStream for std::os::unix::net::UnixStream {
+    fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> {
+        std::os::unix::net::UnixStream::set_read_timeout(self, timeout)
+    }
+}
 
 /// Resolve the herdr API socket path.
 ///

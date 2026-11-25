@@ -24,14 +24,23 @@ pub mod methods;
 pub mod platform;
 
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default per-request timeout. `agent.wait`-style calls need longer —
 /// use [`ApiClient::request_with_timeout`] or the `*_with_timeout` method
 /// wrappers.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum accepted size of a single herdr response line, in bytes.
+///
+/// NDJSON API responses are small — agent/pane metadata plus terminal
+/// reads bounded by the caller's `lines` parameter — so 1 MiB is far
+/// above any legitimate response while still bounding memory against a
+/// hostile or broken endpoint that streams an endless "line" without
+/// ever sending `\n`.
+pub const MAX_RESPONSE_LINE_BYTES: usize = 1024 * 1024;
 
 /// Errors returned by [`ApiClient`].
 #[derive(Debug)]
@@ -204,6 +213,12 @@ impl ApiClient {
 
     /// Send one request with an explicit per-call timeout.
     ///
+    /// `timeout` is an **overall** deadline covering the write and the
+    /// response read — not a per-syscall idle timeout — so `agent.wait`-style
+    /// calls still work by passing a client timeout larger than
+    /// `wait.timeout_ms`. Response lines are capped at
+    /// [`MAX_RESPONSE_LINE_BYTES`].
+    ///
     /// `params` is serialized verbatim as the request `params` field — pass
     /// `&serde_json::json!({})` (or an empty params struct) for methods that
     /// take none.
@@ -224,29 +239,20 @@ impl ApiClient {
 
         // One connection per request — the server closes after one response.
         let mut stream = platform::connect(&self.socket_path, timeout)?;
+        let deadline = Instant::now().checked_add(timeout);
         stream.write_all(&line)?;
         stream.flush()?;
 
-        let mut reader = BufReader::new(stream);
-        let mut response = String::new();
-        match reader.read_line(&mut response) {
-            Ok(0) => {
-                return Err(ApiError::Server {
-                    code: "connection_closed".to_string(),
-                    message: "herdr closed the connection without a response".to_string(),
-                })
-            }
-            Ok(_) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                return Err(ApiError::Timeout)
-            }
-            Err(e) => return Err(ApiError::Io(e)),
-        }
+        let response = read_response_line(&mut *stream, deadline)?;
 
-        let envelope: serde_json::Value = serde_json::from_str(response.trim_end())?;
+        // Trim trailing whitespace (the line's `\n` is excluded already,
+        // but tolerate `\r\n` and stray padding like `read_line` did).
+        let end = response
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let envelope: serde_json::Value = serde_json::from_slice(&response[..end])?;
         // Envelope: {"id": "...", "result": ...} or {"id": "...", "error": {...}}.
         // The echoed id is informational; we do not enforce matching because
         // one-conn-per-request already correlates request/response.
@@ -270,6 +276,85 @@ impl ApiClient {
                 code: "invalid_response".to_string(),
                 message: "herdr response had neither 'result' nor 'error'".to_string(),
             })
+    }
+}
+
+/// Read a single NDJSON response line from `stream`.
+///
+/// `deadline` is an **overall** request budget, not a per-syscall idle
+/// timeout: before every `read()` the stream's read timeout is shrunk to
+/// the remaining time, so a peer that dribbles one byte per interval
+/// cannot keep the request alive past `deadline` (the raw
+/// `set_read_timeout` on the socket only bounds each individual `read()`
+/// syscall — see issue #44). `None` means "no overall deadline" and falls
+/// back to the per-syscall timeout set at connect time.
+///
+/// The line is capped at [`MAX_RESPONSE_LINE_BYTES`]; exceeding it is a
+/// [`ApiError::Server`] `response_too_large` error rather than unbounded
+/// memory growth.
+fn read_response_line(
+    stream: &mut dyn platform::IoStream,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, ApiError> {
+    fn too_large() -> ApiError {
+        ApiError::Server {
+            code: "response_too_large".to_string(),
+            message: format!("herdr response line exceeded {MAX_RESPONSE_LINE_BYTES} bytes"),
+        }
+    }
+
+    let mut response = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ApiError::Timeout);
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(ApiError::Io)?;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => {
+                if response.is_empty() {
+                    return Err(ApiError::Server {
+                        code: "connection_closed".to_string(),
+                        message: "herdr closed the connection without a response".to_string(),
+                    });
+                }
+                // EOF mid-line: parse what arrived (same as `read_line`).
+                return Ok(response);
+            }
+            Ok(n) => {
+                let data = &chunk[..n];
+                match data.iter().position(|&b| b == b'\n') {
+                    // Stop at the first newline; bytes after it belong to
+                    // a next message this one-request-per-connection
+                    // protocol never sends.
+                    Some(pos) => {
+                        if response.len() + pos > MAX_RESPONSE_LINE_BYTES {
+                            return Err(too_large());
+                        }
+                        response.extend_from_slice(&data[..pos]);
+                        return Ok(response);
+                    }
+                    None => {
+                        if response.len() + n > MAX_RESPONSE_LINE_BYTES {
+                            return Err(too_large());
+                        }
+                        response.extend_from_slice(data);
+                    }
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(ApiError::Timeout)
+            }
+            Err(e) => return Err(ApiError::Io(e)),
+        }
     }
 }
 
