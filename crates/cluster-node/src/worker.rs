@@ -180,7 +180,10 @@ pub async fn join_in_state_dir(
     std::fs::create_dir_all(&state_dir)?;
 
     // Already paired → refuse rather than silently rotate the credential.
-    if conn::load_worker_credential(&state_dir).is_ok() {
+    // A credential without a readable worker.json is a half-paired state
+    // (e.g. left by an interrupted join); allow re-joining so the flow
+    // below rewrites both files and heals it.
+    if conn::load_worker_credential(&state_dir).is_ok() && load_worker_info(&state_dir).is_ok() {
         return Err(JoinError::AlreadyPaired(conn::worker_credential_path(
             &state_dir,
         )));
@@ -209,8 +212,12 @@ pub async fn join_in_state_dir(
         }
     };
 
-    conn::save_worker_credential(&state_dir, &credential)
-        .map_err(|e| JoinError::Credential(e.to_string()))?;
+    // Persist worker.json BEFORE the credential: if the second write
+    // fails, the leftover worker.json is harmless — `join` only refuses
+    // when both files exist, and `worker` reports NotPaired until a
+    // successful re-join. The reverse order could leave a valid
+    // credential with no controller address, which neither `worker`
+    // (NoController) nor `join` (AlreadyPaired) could recover from.
     let info = WorkerInfo {
         version: WORKER_INFO_VERSION,
         worker_label: label.clone(),
@@ -219,6 +226,8 @@ pub async fn join_in_state_dir(
         cluster_name: cluster_name.clone(),
     };
     save_worker_info(&state_dir, &info).map_err(JoinError::Io)?;
+    conn::save_worker_credential(&state_dir, &credential)
+        .map_err(|e| JoinError::Credential(e.to_string()))?;
 
     if !cfg.json {
         println!("Paired → worker '{}' online", label);
@@ -604,13 +613,28 @@ fn unix_hostname() -> Option<String> {
     }
 
     let mut buf = [0i8; 256];
+    // Pass `buf.len() - 1`, not `buf.len()`: POSIX `gethostname` does not
+    // guarantee NUL-termination when the name is truncated to `len`, and
+    // keeping one spare byte ensures a terminator stays inside `buf`.
     // SAFETY: `buf` is a valid writable buffer of `len` bytes.
-    let rc = unsafe { gethostname(buf.as_mut_ptr() as *mut c_char, buf.len()) };
+    let rc = unsafe { gethostname(buf.as_mut_ptr() as *mut c_char, buf.len() - 1) };
     if rc != 0 {
         return None;
     }
-    let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) }
-        .to_string_lossy()
+    hostname_from_buf(&buf)
+}
+
+/// Decode a hostname buffer that may lack a NUL terminator (truncated
+/// `gethostname` result): bound the read to the first NUL, or to the end
+/// of the buffer when none is present.
+#[cfg(unix)]
+fn hostname_from_buf(buf: &[i8]) -> Option<String> {
+    let bytes: Vec<u8> = buf.iter().map(|&b| b as u8).collect();
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    if end == 0 {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&bytes[..end])
         .trim()
         .to_string();
     if s.is_empty() {
@@ -993,6 +1017,90 @@ mod tests {
         )
         .unwrap();
         assert!(load_worker_info(&dir).is_err());
+    }
+
+    // ---- join state-dir robustness ----
+
+    fn test_worker_info() -> WorkerInfo {
+        WorkerInfo {
+            version: WORKER_INFO_VERSION,
+            worker_label: "test-host".into(),
+            controller_addr: "127.0.0.1:47820".into(),
+            paired_at_unix: 1_700_000_000,
+            cluster_name: None,
+        }
+    }
+
+    /// A non-interactive join config pointed at a dead loopback port:
+    /// gets past target resolution far enough to prove the
+    /// `AlreadyPaired` gate did (not) fire, then fails on the missing
+    /// pairing code or connect — never on pairing state.
+    fn probe_join_cfg() -> JoinConfig {
+        JoinConfig {
+            controller: Some("127.0.0.1:1".to_string()),
+            yes: true,
+            json: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn join_refuses_only_when_fully_paired() {
+        // credential + worker.json → AlreadyPaired.
+        let paired = tmpdir("join-paired");
+        conn::save_worker_credential(&paired, &test_credential()).unwrap();
+        save_worker_info(&paired, &test_worker_info()).unwrap();
+        let err = join_in_state_dir(probe_join_cfg(), paired)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, JoinError::AlreadyPaired(_)),
+            "fully paired state must refuse re-join, got {err}"
+        );
+
+        // credential only (half-paired: worker.json write failed) → join
+        // must proceed so the flow can rewrite both files and heal.
+        let half = tmpdir("join-half");
+        conn::save_worker_credential(&half, &test_credential()).unwrap();
+        let err = join_in_state_dir(probe_join_cfg(), half).await.unwrap_err();
+        assert!(
+            !matches!(err, JoinError::AlreadyPaired(_)),
+            "half-paired state must not refuse re-join, got {err}"
+        );
+
+        // worker.json only (credential write failed) → join proceeds too.
+        let info_only = tmpdir("join-info-only");
+        save_worker_info(&info_only, &test_worker_info()).unwrap();
+        let err = join_in_state_dir(probe_join_cfg(), info_only)
+            .await
+            .unwrap_err();
+        assert!(
+            !matches!(err, JoinError::AlreadyPaired(_)),
+            "worker.json without credential must not refuse re-join, got {err}"
+        );
+    }
+
+    // ---- hostname decoding ----
+
+    #[cfg(unix)]
+    #[test]
+    fn hostname_from_buf_bounds_read_without_nul() {
+        // Buffer completely full of non-NUL bytes (as a truncated
+        // gethostname result could produce): the read must stay inside
+        // the buffer instead of scanning past it.
+        let full = [b'a' as i8; 256];
+        let s = hostname_from_buf(&full).unwrap();
+        assert_eq!(s.len(), 256);
+        assert!(s.chars().all(|c| c == 'a'));
+
+        // NUL-terminated buffer decodes up to the terminator.
+        let mut buf = [0i8; 16];
+        for (i, b) in b"myhost".iter().enumerate() {
+            buf[i] = *b as i8;
+        }
+        assert_eq!(hostname_from_buf(&buf).as_deref(), Some("myhost"));
+
+        // Empty / all-NUL buffer → None.
+        assert_eq!(hostname_from_buf(&[0i8; 8]), None);
     }
 
     // ---- pairing exchange (loopback fake controller) ----
