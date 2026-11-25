@@ -264,9 +264,11 @@ impl Default for WorkersFile {
     }
 }
 
-/// Generate a random hex identifier (cluster_id, worker_id, …).
+/// Generate a random hex identifier (cluster_id, worker_id, …) of
+/// exactly `hex_chars` characters. Odd lengths round up to whole bytes
+/// and the extra nibble is truncated.
 pub fn random_id(hex_chars: usize) -> String {
-    let bytes = (hex_chars / 2).max(1);
+    let bytes = hex_chars.div_ceil(2).max(1);
     let mut buf = vec![0u8; bytes];
     rand_core::OsRng.fill_bytes(&mut buf);
     let mut s = fsutil::hex_encode(&buf);
@@ -529,6 +531,17 @@ mod tests {
             load_avg: vec![0.1],
             kinds: vec!["claude".into()],
         }
+    }
+
+    #[test]
+    fn random_id_returns_exact_length() {
+        for n in [1usize, 2, 5, 16, 31, 32, 33] {
+            let id = random_id(n);
+            assert_eq!(id.len(), n, "random_id({n}) gave {id:?}");
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // Distinct calls produce distinct ids (sanity, not a guarantee).
+        assert_ne!(random_id(16), random_id(16));
     }
 
     #[test]

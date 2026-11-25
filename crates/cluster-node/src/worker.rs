@@ -515,8 +515,16 @@ pub fn load_worker_info(state_dir: &Path) -> std::io::Result<WorkerInfo> {
     Ok(info)
 }
 
+/// Write `contents` to `path` atomically with `0600` permissions, mirroring
+/// `cluster_core::fsutil::atomic_write` (which is `pub(crate)` and so not
+/// reachable here): PID-unique sibling temp file, fsync, rename, then a
+/// best-effort parent-directory fsync so the rename is durable.
 fn atomic_write_600(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -526,15 +534,22 @@ fn atomic_write_600(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             opts.mode(0o600);
         }
         let mut f = opts.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            // Tighten perms on a pre-existing temp file too.
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         use std::io::Write;
         f.write_all(contents)?;
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    // Best-effort directory fsync so the rename is durable across crashes.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
     }
     Ok(())
 }
