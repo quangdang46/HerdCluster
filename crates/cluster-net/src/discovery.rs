@@ -520,9 +520,12 @@ impl UdpBrowser {
 
     /// Browse a set of UDP ports (tests use custom ports). For each port a
     /// probe is broadcast *and* sent to `127.0.0.1` so same-host instances
-    /// are found even when multicast is unavailable.
+    /// are found even when multicast is unavailable. The socket binds
+    /// `0.0.0.0` — a loopback-bound socket cannot emit or receive LAN
+    /// broadcast traffic, which would limit discovery to same-host
+    /// controllers.
     pub async fn browse_ports(window: Duration, ports: &[u16]) -> Vec<DiscoveredController> {
-        let sock = match UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await {
+        let sock = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -592,7 +595,43 @@ impl UdpBrowser {
                 _ => break,
             }
         }
-        seen.into_values().collect()
+        let out: Vec<DiscoveredController> = seen.into_values().collect();
+        // A controller announces once per path — a broadcast copy plus an
+        // explicit loopback copy — so a same-host browser can see the same
+        // announcer twice: once via its LAN address and once via
+        // 127.0.0.1. Drop the loopback twin when a routable (non-loopback)
+        // candidate from the same announcer exists: 127.0.0.1 only works
+        // for browsers on that host and the duplicate would otherwise
+        // produce a spurious `Ambiguous`.
+        let routable: std::collections::BTreeSet<AnnouncerKey> = out
+            .iter()
+            .filter(|c| !c.addr.ip().is_loopback())
+            .map(AnnouncerKey::of)
+            .collect();
+        out.into_iter()
+            .filter(|c| !c.addr.ip().is_loopback() || !routable.contains(&AnnouncerKey::of(c)))
+            .collect()
+    }
+}
+
+/// Announcer identity used to spot the same controller seen via both a
+/// loopback and a LAN source address.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct AnnouncerKey {
+    hostname: String,
+    cluster_name: Option<String>,
+    protocol_version: Option<u32>,
+    port: u16,
+}
+
+impl AnnouncerKey {
+    fn of(c: &DiscoveredController) -> Self {
+        Self {
+            hostname: c.hostname.clone(),
+            cluster_name: c.cluster_name.clone(),
+            protocol_version: c.protocol_version,
+            port: c.addr.port(),
+        }
     }
 }
 
@@ -629,7 +668,10 @@ mod tests {
         assert_eq!(c.hostname, "test-host");
         assert_eq!(c.source, DiscoverySource::UdpBroadcast);
         assert_eq!(c.addr.port(), CLUSTER_PORT);
-        assert_eq!(c.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        // The address is the announcer's datagram source: 127.0.0.1 when
+        // only the directed copy arrived, the LAN address when the
+        // broadcast copy looped back too (dedup keeps a single one).
+        assert_ne!(c.addr.ip(), IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         assert_eq!(
             c.protocol_version,
             Some(cluster_core::protocol::PROTOCOL_VERSION)
