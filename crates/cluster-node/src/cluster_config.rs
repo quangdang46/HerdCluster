@@ -33,10 +33,14 @@ pub enum ClusterConfigError {
     /// controller (workers have no cluster config of their own).
     #[error("no cluster.json at {0} — run `herdcluster config` on the controller machine")]
     NoCluster(PathBuf),
-    /// Key is not one of the supported forms (`keepawake`,
+    /// Key is not one of the supported `set` forms (`keepawake`,
     /// `machines.<label>.<field>`).
     #[error("unknown config key '{0}' (supported: keepawake, machines.<label>.max_agents, machines.<label>.kinds_override)")]
     UnknownKey(String),
+    /// `unset` key is not the bare `machines.<label>` form — unset
+    /// removes the whole override, not a single field.
+    #[error("unknown config unset key '{0}' (supported: machines.<label> — unset removes the whole override)")]
+    UnsetKey(String),
     /// Value failed to parse for the given key.
     #[error("invalid value for {key}: {reason}")]
     BadValue {
@@ -213,9 +217,9 @@ fn parse_unset_key(key: &str) -> Result<String, ClusterConfigError> {
     let label = key
         .strip_prefix("machines.")
         .filter(|l| !l.is_empty())
-        .ok_or_else(|| ClusterConfigError::UnknownKey(key.to_string()))?;
+        .ok_or_else(|| ClusterConfigError::UnsetKey(key.to_string()))?;
     if label.ends_with(".max_agents") || label.ends_with(".kinds_override") {
-        return Err(ClusterConfigError::UnknownKey(key.to_string()));
+        return Err(ClusterConfigError::UnsetKey(key.to_string()));
     }
     Ok(label.to_string())
 }
@@ -324,6 +328,37 @@ mod tests {
             parse_key("machines..max_agents"),
             Err(ClusterConfigError::UnknownKey(_))
         ));
+    }
+
+    #[test]
+    fn parse_unset_key_only_accepts_bare_label() {
+        assert_eq!(parse_unset_key("machines.wsl").unwrap(), "wsl");
+        // Dotted labels are fine.
+        assert_eq!(parse_unset_key("machines.mac.local").unwrap(), "mac.local");
+        // Field-suffixed and non-machine keys get the unset-specific
+        // error, not the `set` key list (issue #21).
+        for key in [
+            "machines.wsl.max_agents",
+            "machines.wsl.kinds_override",
+            "keepawake",
+            "machines.",
+            "name",
+        ] {
+            match parse_unset_key(key) {
+                Err(ClusterConfigError::UnsetKey(k)) => assert_eq!(k, key),
+                other => panic!("expected UnsetKey for {key}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unset_error_message_describes_unset_syntax() {
+        let err = parse_unset_key("machines.wsl.max_agents").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("machines.<label>"), "{msg}");
+        assert!(msg.contains("whole override"), "{msg}");
+        // Must not leak the `set`-oriented key list.
+        assert!(!msg.contains("max_agents,"), "{msg}");
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ use crate::protocol::Resources;
 use chrono::{DateTime, Duration, Utc};
 use rand_core::RngCore;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -198,6 +198,18 @@ impl ClusterInfo {
             }
         }
         out
+    }
+
+    /// Labels in `machines` that match no known machine — dead config
+    /// the scheduler will never apply. Callers supply the known-label
+    /// set (`local` + `workers.json` labels); this stays a pure value
+    /// check so it is unit-testable without I/O.
+    pub fn unknown_machine_overrides(&self, known_labels: &BTreeSet<String>) -> Vec<String> {
+        self.machines
+            .keys()
+            .filter(|label| !known_labels.contains(*label))
+            .cloned()
+            .collect()
     }
 }
 
@@ -758,6 +770,32 @@ mod tests {
         assert_eq!(problems.len(), 1);
         assert_eq!(problems[0].0, "wsl"); // BTreeMap order: mac first but only wsl has problems
         assert!(problems[0].1.contains("99"));
+    }
+
+    #[test]
+    fn cluster_info_unknown_machine_overrides_flags_dead_labels() {
+        let mut info = ClusterInfo {
+            cluster_id: "x".into(),
+            name: "x".into(),
+            port: 1,
+            protocol_version: 1,
+            created_at: Utc::now(),
+            machines: BTreeMap::new(),
+            keepawake: true,
+        };
+        for label in ["local", "wsl", "ghost"] {
+            info.machines.insert(label.into(), MachineOverride::default());
+        }
+        let known: BTreeSet<String> = ["local".to_string(), "wsl".to_string()].into_iter().collect();
+        assert_eq!(info.unknown_machine_overrides(&known), vec!["ghost"]);
+
+        // Everything known → no dead config. Empty machines → empty.
+        let known: BTreeSet<String> = ["local".into(), "wsl".into(), "ghost".into()]
+            .into_iter()
+            .collect();
+        assert!(info.unknown_machine_overrides(&known).is_empty());
+        info.machines.clear();
+        assert!(info.unknown_machine_overrides(&known).is_empty());
     }
 
     #[test]

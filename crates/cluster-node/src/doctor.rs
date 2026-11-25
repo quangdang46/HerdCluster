@@ -137,7 +137,7 @@ pub async fn run_doctor(opts: DoctorOptions) -> Result<DoctorReport, DoctorError
 
     // ---- phase 1: checks ----
     let cluster = check_cluster_config(&state_dir, &mut checks);
-    check_machine_caps(cluster.as_ref(), &mut checks);
+    check_machine_caps(cluster.as_ref(), &state_dir, &mut checks);
     check_state_layout(&state_dir, &mut checks);
     check_sensitive_perms(&state_dir, &mut checks);
     check_local_herdr(&mut checks);
@@ -283,7 +283,15 @@ fn check_cluster_config(
 /// Validate `machines.<label>` scheduler overrides (beads `m6-caps`):
 /// out-of-range `max_agents` or malformed `kinds_override` would be
 /// silently clamped/ignored by the scheduler, so doctor fails loudly.
-fn check_machine_caps(cluster: Option<&registry::ClusterInfo>, checks: &mut Vec<CheckResult>) {
+///
+/// Overrides whose label is neither `local` nor a `workers.json` entry
+/// are dead config — a separate warning class that does not affect the
+/// value-validation verdict (issue #21).
+fn check_machine_caps(
+    cluster: Option<&registry::ClusterInfo>,
+    state_dir: &Path,
+    checks: &mut Vec<CheckResult>,
+) {
     let Some(info) = cluster else {
         return; // the "cluster config" check already reported why
     };
@@ -297,18 +305,7 @@ fn check_machine_caps(cluster: Option<&registry::ClusterInfo>, checks: &mut Vec<
         return;
     }
     let problems = info.machine_override_problems();
-    if problems.is_empty() {
-        push(
-            checks,
-            "machine caps",
-            CheckStatus::Pass,
-            format!(
-                "{} machine override(s) valid (max_agents ≤ {})",
-                info.machines.len(),
-                cluster_core::scheduler::MAX_AGENTS_CEILING
-            ),
-        );
-    } else {
+    if !problems.is_empty() {
         let detail = problems
             .iter()
             .map(|(label, p)| format!("{label}: {p}"))
@@ -321,7 +318,51 @@ fn check_machine_caps(cluster: Option<&registry::ClusterInfo>, checks: &mut Vec<
             format!("invalid machines.<label> overrides — {detail}"),
             "edit cluster.json: max_agents must be 0..=8, kinds_override a non-empty list of kind names",
         );
+        return;
     }
+    let unknown = info.unknown_machine_overrides(&known_machine_labels(state_dir));
+    if unknown.is_empty() {
+        push(
+            checks,
+            "machine caps",
+            CheckStatus::Pass,
+            format!(
+                "{} machine override(s) valid (max_agents ≤ {})",
+                info.machines.len(),
+                cluster_core::scheduler::MAX_AGENTS_CEILING
+            ),
+        );
+    } else {
+        let labels = unknown
+            .iter()
+            .map(|l| format!("machines.{l}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        push_hint(
+            checks,
+            "machine caps",
+            CheckStatus::Warn,
+            format!(
+                "{labels} override(s) target unknown machine label(s) — the scheduler ignores them"
+            ),
+            "remove dead config: `herdcluster config unset machines.<label>`",
+        );
+    }
+}
+
+/// Labels a `machines.<label>` override may legally target: `local`
+/// plus every `workers.json` entry. Read-only parse — deliberately not
+/// [`registry::load_workers`], which would quarantine a corrupt file
+/// as a side effect before the "workers registered" check reports it.
+fn known_machine_labels(state_dir: &Path) -> std::collections::BTreeSet<String> {
+    let mut known = std::collections::BTreeSet::from([LOCAL_LABEL.to_string()]);
+    let path = state_dir.join(registry::WORKERS_FILE_NAME);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if let Ok(file) = serde_json::from_str::<registry::WorkersFile>(&raw) {
+            known.extend(file.workers.iter().map(|w| w.label.clone()));
+        }
+    }
+    known
 }
 
 // ---- 2. state dir layout ----
@@ -1443,6 +1484,23 @@ mod tests {
         let _g2 = ENV_LOCK.lock().await;
         let dir = tmpdir("caps");
         std::env::set_var(cluster_core::config::ENV_STATE_DIR, &dir);
+        // "wsl" must be a known label (workers.json entry) or the
+        // override counts as dead config and warns instead of passing.
+        std::fs::write(
+            dir.join(registry::WORKERS_FILE_NAME),
+            serde_json::json!({
+                "version": registry::WORKERS_FILE_VERSION,
+                "workers": [{
+                    "worker_id": "w1",
+                    "label": "wsl",
+                    "pubkey": "aa",
+                    "paired_at": "2024-01-01T00:00:00Z",
+                    "last_seen": null,
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         // Valid override first: machine caps must pass.
         std::fs::write(
@@ -1493,6 +1551,98 @@ mod tests {
 
         std::env::remove_var(cluster_core::config::ENV_STATE_DIR);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a [`registry::ClusterInfo`] with the given `machines` map.
+    fn cluster_info_with_machines(
+        machines: std::collections::BTreeMap<String, registry::MachineOverride>,
+    ) -> registry::ClusterInfo {
+        registry::ClusterInfo {
+            cluster_id: "c1".into(),
+            name: "c1".into(),
+            port: 47820,
+            protocol_version: 1,
+            created_at: chrono::Utc::now(),
+            machines,
+            keepawake: true,
+        }
+    }
+
+    /// Write a `workers.json` registering the given labels (offline,
+    /// never-seen workers — no sockets are probed by this check).
+    fn write_worker_labels(state_dir: &Path, labels: &[&str]) {
+        let workers: Vec<serde_json::Value> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, label)| {
+                serde_json::json!({
+                    "worker_id": format!("w{i}"),
+                    "label": label,
+                    "pubkey": "aa",
+                    "paired_at": "2024-01-01T00:00:00Z",
+                    "last_seen": null,
+                })
+            })
+            .collect();
+        std::fs::write(
+            state_dir.join(registry::WORKERS_FILE_NAME),
+            serde_json::json!({
+                "version": registry::WORKERS_FILE_VERSION,
+                "workers": workers,
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn doctor_machine_caps_warns_on_dead_overrides() {
+        let dir = tmpdir("deadcaps");
+        write_worker_labels(&dir, &["wsl"]);
+
+        let mut machines = std::collections::BTreeMap::new();
+        machines.insert("wsl".to_string(), registry::MachineOverride::default());
+        machines.insert("local".to_string(), registry::MachineOverride::default());
+        machines.insert("ghost".to_string(), registry::MachineOverride::default());
+        let info = cluster_info_with_machines(machines);
+
+        let mut checks = Vec::new();
+        check_machine_caps(Some(&info), &dir, &mut checks);
+        assert_eq!(checks.len(), 1);
+        let caps = &checks[0];
+        assert_eq!(caps.status, CheckStatus::Warn, "{}", caps.detail);
+        assert!(caps.detail.contains("machines.ghost"), "{}", caps.detail);
+        assert!(!caps.detail.contains("machines.wsl"), "{}", caps.detail);
+        let hint = caps.fix_hint.as_deref().unwrap_or("");
+        assert!(hint.contains("config unset machines.<label>"), "{hint}");
+
+        // Dead label alone (no workers.json at all) still warns — only
+        // `local` is known then.
+        let dir2 = tmpdir("deadcaps-noworkers");
+        let mut checks = Vec::new();
+        check_machine_caps(Some(&info), &dir2, &mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert!(checks[0].detail.contains("machines.wsl"));
+        assert!(checks[0].detail.contains("machines.ghost"));
+
+        // Invalid values still Fail — the dead-label warning is a
+        // separate class and never masks a value problem.
+        let mut machines = std::collections::BTreeMap::new();
+        machines.insert(
+            "ghost".to_string(),
+            registry::MachineOverride {
+                max_agents: Some(99),
+                kinds_override: None,
+            },
+        );
+        let info = cluster_info_with_machines(machines);
+        let mut checks = Vec::new();
+        check_machine_caps(Some(&info), &dir, &mut checks);
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(checks[0].detail.contains("99"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[tokio::test]
