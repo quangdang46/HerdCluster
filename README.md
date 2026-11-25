@@ -76,7 +76,8 @@ herdcluster spawn builder --kind claude \
 herdcluster agent wait builder --until done --timeout 30m
 ```
 
-**Contract:** stdout carries data (JSON with `--json`, tables otherwise),
+**Contract:** stdout carries data (compact single-line JSON with `--json`,
+tables otherwise — line-oriented so batch loops can parse every line),
 stderr carries diagnostics, exit `0` = success. Error envelopes use stable
 codes (`worker_unreachable`, `agent_pane_busy`, `invalid_pairing_code`, …)
 so scripts and agents can branch on them. An `AGENTS.md` blurb ships in the
