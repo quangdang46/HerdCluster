@@ -336,14 +336,15 @@ pub fn list_all_agents_with_timeout(ctx: &FleetContext, timeout: Duration) -> Ve
     let outcomes: Vec<(String, MachineAgents)> = std::thread::scope(|s| {
         let handles: Vec<_> = live
             .iter()
-            .map(|ep| s.spawn(move || (ep.label.clone(), query_machine(ep, timeout))))
+            .map(|ep| {
+                let label = ep.label.clone();
+                let handle = s.spawn(move || query_machine(ep, timeout));
+                (label, handle)
+            })
             .collect();
         handles
             .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| unreachable!("query thread panicked"))
-            })
+            .map(|(label, h)| join_outcome(label, h.join()))
             .collect()
     });
 
@@ -365,6 +366,37 @@ pub fn list_all_agents_with_timeout(ctx: &FleetContext, timeout: Duration) -> Ve
         }
     }
     merge_agent_rows(inputs)
+}
+
+/// Map one query thread's join result to its `(label, outcome)` pair.
+/// A panicked query thread degrades to `MachineAgents::Unreachable`
+/// like any other per-machine failure — the fan-out never aborts on
+/// one machine's bug (issue #54).
+fn join_outcome(
+    label: String,
+    result: std::thread::Result<MachineAgents>,
+) -> (String, MachineAgents) {
+    match result {
+        Ok(outcome) => (label, outcome),
+        Err(payload) => (
+            label,
+            MachineAgents::Unreachable {
+                reason: panic_reason(payload),
+            },
+        ),
+    }
+}
+
+/// Human-readable reason for a panicked query thread, using the panic
+/// payload when it carries a message.
+fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return format!("internal query panic: {s}");
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return format!("internal query panic: {s}");
+    }
+    "internal query panic".to_string()
 }
 
 fn query_machine(ep: &MachineEndpoint, timeout: Duration) -> MachineAgents {
@@ -692,6 +724,44 @@ mod tests {
         assert_eq!(json["status"], "unreachable");
         assert_eq!(json["reason"], "socket missing");
         assert!(json.get("id").is_none());
+    }
+
+    #[test]
+    fn panicked_query_thread_degrades_to_unreachable() {
+        // Issue #54: a panic inside one machine's query thread must not
+        // abort the whole `agent list --all` fan-out — it becomes the
+        // same Unreachable placeholder any other per-machine failure
+        // produces.
+        let handle = std::thread::spawn(|| -> MachineAgents { panic!("boom") });
+        let (label, outcome) = join_outcome("w".into(), handle.join());
+        assert_eq!(label, "w");
+        match outcome {
+            MachineAgents::Unreachable { reason } => {
+                assert!(reason.contains("boom"), "unexpected reason: {reason}");
+            }
+            MachineAgents::Agents(_) => panic!("expected Unreachable"),
+        }
+        // A non-string payload still maps to a reasoned placeholder.
+        let (label, outcome) = join_outcome(
+            "x".into(),
+            Err(Box::new(42u32) as Box<dyn std::any::Any + Send>),
+        );
+        assert_eq!(label, "x");
+        match outcome {
+            MachineAgents::Unreachable { reason } => {
+                assert_eq!(reason, "internal query panic");
+            }
+            MachineAgents::Agents(_) => panic!("expected Unreachable"),
+        }
+        // Successful joins pass through untouched.
+        let (label, outcome) = join_outcome(
+            "ok".into(),
+            Ok(MachineAgents::Unreachable {
+                reason: "timeout".into(),
+            }),
+        );
+        assert_eq!(label, "ok");
+        assert!(matches!(outcome, MachineAgents::Unreachable { .. }));
     }
 
     #[test]
