@@ -228,7 +228,10 @@ pub struct WorkerEntry {
     #[serde(default)]
     pub last_seen: Option<DateTime<Utc>>,
     /// Derived status (recomputed by [`WorkerRegistry::mark_seen`] and
-    /// [`WorkerRegistry::refresh_statuses`]). Defaults to `offline` when
+    /// [`WorkerRegistry::refresh_statuses`]). This is only a persisted
+    /// cache of `last_seen` age — readers that make placement decisions
+    /// (e.g. `cluster-fleet`'s `FleetContext`) recompute it on load rather
+    /// than trusting the stored value. Defaults to `offline` when
     /// absent so never-seen workers don't look alive.
     #[serde(default = "default_worker_status")]
     pub status: WorkerStatus,

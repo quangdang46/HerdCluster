@@ -12,8 +12,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use api_client::{platform, ApiClient, ApiError};
+use chrono::Utc;
 use cluster_core::config;
-use cluster_core::registry::{ClusterInfo, MachineOverride, WorkerEntry, WorkerStatus};
+use cluster_core::registry::{
+    derive_status, ClusterInfo, MachineOverride, WorkerEntry, WorkerStatus,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::FleetError;
@@ -187,6 +190,10 @@ impl FleetContext {
     /// Side effect: like `cluster-core`'s config loaders, a missing
     /// `cluster.json` is created with a fresh cluster identity — run
     /// `herdcluster init` first for a stable name.
+    ///
+    /// Worker `status` values are recomputed from `last_seen` at load
+    /// time (see [`FleetContext::build`]), so stale persisted statuses
+    /// never leak into scheduling or reachability decisions.
     pub fn load() -> Result<Self, FleetError> {
         let state_dir = config::state_dir().map_err(|e| FleetError::Config {
             message: e.to_string(),
@@ -205,6 +212,13 @@ impl FleetContext {
     /// Build a context from explicit inputs (no disk access beyond what the
     /// caller already did). `workers` may be in any order; endpoints come
     /// out sorted by label with the local machine first.
+    ///
+    /// Each worker's persisted `status` is treated as a cache and
+    /// recomputed from `last_seen` at load time (issue #41) — the same
+    /// derivation `doctor` and `WorkerRegistry::refresh_statuses` apply —
+    /// so a `workers.json` written hours ago cannot report a dead worker
+    /// as online. Pass `last_seen` values that reflect reality; the
+    /// `status` field of the input entries is ignored.
     pub fn build(
         state_dir: PathBuf,
         cluster: ClusterInfo,
@@ -214,13 +228,15 @@ impl FleetContext {
         let mut sorted: Vec<WorkerEntry> = workers;
         sorted.sort_by(|a, b| a.label.cmp(&b.label));
 
+        let now = Utc::now();
         let mut endpoints = vec![local];
         let mut worker_map = BTreeMap::new();
-        for w in sorted {
+        for mut w in sorted {
             if w.label == LOCAL_LABEL {
                 // Reserved label — a worker can never own "local/..." IDs.
                 continue;
             }
+            w.status = derive_status(w.last_seen, now);
             endpoints.push(remote_endpoint(&w.label, &state_dir));
             worker_map.insert(w.label.clone(), w);
         }
@@ -273,14 +289,18 @@ mod tests {
     use super::*;
     use cluster_core::protocol::Resources;
 
-    fn worker(label: &str, status: WorkerStatus) -> WorkerEntry {
+    /// Build a worker fixture. `last_seen` drives the status the context
+    /// derives — the persisted `status` field is overwritten by
+    /// [`FleetContext::build`] (issue #41), so fixtures set `last_seen`
+    /// to express the intended liveness.
+    fn worker(label: &str, last_seen: Option<chrono::DateTime<Utc>>) -> WorkerEntry {
         WorkerEntry {
             worker_id: format!("id-{label}"),
             label: label.into(),
             pubkey: "ab".repeat(32),
             paired_at: chrono::Utc::now(),
-            last_seen: None,
-            status,
+            last_seen,
+            status: WorkerStatus::Offline, // placeholder; build() recomputes
             resources: Some(Resources {
                 cpu_cores: 4,
                 mem_total_mb: 8192,
@@ -331,10 +351,11 @@ mod tests {
     fn build_orders_endpoints_and_skips_local_label_worker() {
         // local_endpoint() needs a real platform socket path — on unix it
         // resolves without checking existence, so this works in tests.
+        let now = chrono::Utc::now();
         let workers = vec![
-            worker("zeta", WorkerStatus::Online),
-            worker(LOCAL_LABEL, WorkerStatus::Online), // must be dropped
-            worker("alpha", WorkerStatus::Offline),
+            worker("zeta", Some(now)),
+            worker(LOCAL_LABEL, Some(now)), // must be dropped
+            worker("alpha", None),
         ];
         let ctx = FleetContext::build(PathBuf::from("/tmp/hc"), cluster(), workers).unwrap();
         let labels: Vec<&str> = ctx.endpoints.iter().map(|e| e.label.as_str()).collect();
@@ -352,5 +373,47 @@ mod tests {
         assert!(!ctx.is_offline("local")); // local has no registry entry
         assert!(ctx.endpoint_for("local").is_some());
         assert!(ctx.endpoint_for("ghost").is_none());
+    }
+
+    #[test]
+    fn build_recomputes_status_from_last_seen() {
+        // Issue #41: `workers.json` persists `status` verbatim, but it is
+        // only a cache of `last_seen` age. A worker the file still marks
+        // `online` whose last heartbeat is hours old must be treated as
+        // offline; a recently-seen worker stays online.
+        let now = chrono::Utc::now();
+        let mut stale_online = worker("stale-online", Some(now - chrono::Duration::hours(1)));
+        stale_online.status = WorkerStatus::Online; // persisted lie
+        let mut never_seen = worker("never-seen", None);
+        never_seen.status = WorkerStatus::Online; // persisted lie
+        let workers = vec![
+            stale_online,
+            never_seen,
+            worker("fresh", Some(now)),
+            worker("degraded", Some(now - chrono::Duration::seconds(20))),
+        ];
+        let ctx = FleetContext::build(PathBuf::from("/tmp/hc"), cluster(), workers).unwrap();
+
+        // Stale last_seen → Offline regardless of the persisted status.
+        assert_eq!(
+            ctx.registry_status("stale-online"),
+            Some(WorkerStatus::Offline)
+        );
+        assert!(ctx.is_offline("stale-online"));
+        assert_eq!(
+            ctx.workers.get("stale-online").unwrap().status,
+            WorkerStatus::Offline
+        );
+        // Never seen → Offline even if the file claimed online.
+        assert!(ctx.is_offline("never-seen"));
+        // Fresh heartbeat → Online.
+        assert_eq!(ctx.registry_status("fresh"), Some(WorkerStatus::Online));
+        assert!(!ctx.is_offline("fresh"));
+        // ~20 s old → Degraded: not offline, so not short-circuited.
+        assert_eq!(
+            ctx.registry_status("degraded"),
+            Some(WorkerStatus::Degraded)
+        );
+        assert!(!ctx.is_offline("degraded"));
     }
 }
