@@ -1171,12 +1171,16 @@ mod tests {
             let alive = alive.clone();
             let slot = slot.clone();
             std::thread::spawn(move || {
+                // Huge restart budget: with ~10-50 ms per failed attempt
+                // the budget cannot be exhausted inside the assertion
+                // window, so `is_finished` below can only mean the
+                // monitor died on its own (the #39 regression).
                 monitor_loop(
                     missing,
                     slot,
                     stop,
                     alive,
-                    fast_timings(3, Duration::from_secs(3600)),
+                    fast_timings(u32::MAX, Duration::from_secs(3600)),
                 )
             })
         };
@@ -1189,8 +1193,6 @@ mod tests {
             !handle.is_finished(),
             "monitor exited after a single failed respawn (issue #39)"
         );
-        // Budget is 3; with >=10 ms backoff per attempt the monitor
-        // cannot have exhausted it before we stop it.
         stop.store(true, Ordering::Relaxed);
         handle.join().expect("monitor thread panicked");
         let _ = std::fs::remove_dir_all(&dir);
