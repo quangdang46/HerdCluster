@@ -25,12 +25,17 @@ pub fn run(controller: Option<String>, yes: bool, json_out: bool, verbose: bool)
             Ok(JoinOutcome::Paired {
                 worker_label,
                 cluster_name,
+                ca_fingerprint,
             }) => {
                 if json_out {
                     print_json(&json!({
                         "paired": true,
                         "worker_label": worker_label,
                         "cluster_name": cluster_name,
+                        // Issue #40: non-interactive joins could not
+                        // verify this against the controller's display —
+                        // automation must compare it out-of-band.
+                        "ca_fingerprint": ca_fingerprint,
                     }));
                 } else {
                     println!("paired as worker '{worker_label}' in cluster '{cluster_name}'");
@@ -57,6 +62,17 @@ pub fn run(controller: Option<String>, yes: bool, json_out: bool, verbose: bool)
                     }));
                 } else {
                     println!("pairing declined");
+                }
+                1
+            }
+            Ok(JoinOutcome::FingerprintDeclined) => {
+                if json_out {
+                    print_json(&json!({
+                        "paired": false,
+                        "reason": "fingerprint_declined",
+                    }));
+                } else {
+                    println!("CA fingerprint not verified — join aborted (nothing was saved)");
                 }
                 1
             }
