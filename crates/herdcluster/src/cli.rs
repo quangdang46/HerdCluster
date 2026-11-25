@@ -192,6 +192,7 @@ pub(crate) enum AgentCommands {
         /// Global agent id `{machine}/{agent}` (e.g. `local/claude-1`)
         id: String,
         /// Comma-separated statuses to wait for
+        /// (idle, working, blocked, done, unknown)
         #[arg(long, default_value = "done,idle")]
         until: String,
         /// Give up after this duration (30s, 5m, 1h); omit to wait forever
