@@ -107,17 +107,27 @@ pub struct MachineInfo {
     /// unreachable). This is *not* the heartbeat `agent_count` snapshot.
     pub agents: Option<u64>,
     /// Last heartbeat-reported running agent count (workers only).
+    /// `null` when the machine is unreachable — the snapshot would be
+    /// stale data, not a live metric (issue #11).
     pub agent_count: Option<u32>,
-    /// Last heartbeat-reported agent cap (workers only).
+    /// Last heartbeat-reported agent cap (workers only); `null` when
+    /// unreachable, same as [`MachineInfo::agent_count`].
     pub max_agents: Option<u32>,
-    /// Last heartbeat-reported available memory in MiB (workers only).
+    /// Last heartbeat-reported available memory in MiB (workers only);
+    /// `null` when unreachable, same as [`MachineInfo::agent_count`].
     pub mem_available_mb: Option<u64>,
     /// Agent kinds the worker advertised (workers only; may be overridden
-    /// by `cluster.json` — see spawn for the effective set).
+    /// by `cluster.json` — see spawn for the effective set). Empty when
+    /// unreachable — the advertisement is part of the stale snapshot.
     pub kinds: Vec<String>,
-    /// Raw last resource snapshot (workers only).
+    /// Raw last resource snapshot (workers only). `null` when unreachable:
+    /// the snapshot (including `load_avg`) is withheld rather than
+    /// serialized as if it were live (issue #11). [`MachineInfo::last_seen`]
+    /// still records when the worker was last heard from.
     pub resources: Option<cluster_core::protocol::Resources>,
-    /// `last_seen` from the registry, RFC 3339 (workers only).
+    /// `last_seen` from the registry, RFC 3339 (workers only). This is a
+    /// timestamp, not a live metric — it is kept even when unreachable so
+    /// consumers can tell *when* the worker was last seen.
     pub last_seen: Option<String>,
 }
 
@@ -336,7 +346,16 @@ fn assemble_machine_info(
             .unwrap_or_else(|| "offline".to_string())
     };
 
-    let resources = worker.and_then(|w| w.resources.clone());
+    // Heartbeat-derived metrics are only meaningful while the machine is
+    // reachable: an unreachable worker's last resource snapshot is stale
+    // data, so withhold it entirely (issue #11) rather than serialize dead
+    // numbers that scripts would read as live. `last_seen` below still
+    // records when the worker was last heard from.
+    let resources = if reachable {
+        worker.and_then(|w| w.resources.clone())
+    } else {
+        None
+    };
     MachineInfo {
         label: endpoint.label.clone(),
         kind: endpoint.kind,
@@ -602,31 +621,51 @@ mod tests {
             kind: MachineKind::Remote,
         };
         // Offline worker: no probe → registry status, unreachable=false.
+        // Heartbeat metrics are withheld — they would be stale (issue #11).
         let mut w = cluster_core::registry::WorkerEntry {
             worker_id: "i".into(),
             label: "w".into(),
             pubkey: "p".into(),
             paired_at: chrono::Utc::now(),
-            last_seen: None,
+            last_seen: Some(chrono::Utc::now()),
             status: cluster_core::registry::WorkerStatus::Offline,
-            resources: None,
+            resources: Some(cluster_core::protocol::Resources {
+                cpu_cores: 8,
+                mem_total_mb: 16384,
+                mem_available_mb: 5120,
+                agent_count: 3,
+                max_agents: 4,
+                load_avg: vec![0.1, 0.2, 0.3],
+                kinds: vec!["claude".into()],
+            }),
         };
         let info = assemble_machine_info(&ep, Some(&w), None);
         assert_eq!(info.status, "offline");
         assert!(!info.reachable);
         assert_eq!(info.agents, None);
+        assert_stale_metrics_withheld(&info);
+        // `last_seen` is a timestamp, not a live metric — kept.
+        assert!(info.last_seen.is_some());
 
-        // Degraded worker, probe ok → status stays degraded, count set.
+        // Degraded worker, probe ok → status stays degraded, count set,
+        // and the heartbeat snapshot is still fresh enough to report.
         w.status = cluster_core::registry::WorkerStatus::Degraded;
         let info = assemble_machine_info(&ep, Some(&w), Some(Ok(3)));
         assert_eq!(info.status, "degraded");
         assert!(info.reachable);
         assert_eq!(info.agents, Some(3));
+        assert_eq!(info.agent_count, Some(3));
+        assert_eq!(info.max_agents, Some(4));
+        assert_eq!(info.mem_available_mb, Some(5120));
+        assert_eq!(info.kinds, vec!["claude".to_string()]);
+        assert!(info.resources.is_some());
 
-        // Probe fails → "unreachable" overrides registry status.
+        // Probe fails → "unreachable" overrides registry status and the
+        // heartbeat snapshot is withheld as stale.
         let info = assemble_machine_info(&ep, Some(&w), Some(Err("boom".into())));
         assert_eq!(info.status, "unreachable");
         assert!(!info.reachable);
+        assert_stale_metrics_withheld(&info);
 
         // Local machine: no registry entry; probe decides.
         let local = MachineEndpoint {
@@ -639,6 +678,62 @@ mod tests {
         assert!(info.reachable);
         let info = assemble_machine_info(&local, None, Some(Err("down".into())));
         assert_eq!(info.status, "unreachable");
+    }
+
+    /// Every heartbeat-derived live metric must be absent on an
+    /// unreachable machine so `--json` consumers cannot read stale data
+    /// as live (issue #11).
+    fn assert_stale_metrics_withheld(info: &MachineInfo) {
+        assert_eq!(info.agent_count, None);
+        assert_eq!(info.max_agents, None);
+        assert_eq!(info.mem_available_mb, None);
+        assert!(info.kinds.is_empty());
+        assert!(info.resources.is_none());
+    }
+
+    #[test]
+    fn machines_json_nulls_stale_metrics_when_unreachable() {
+        // Serialize the exact `machines --json` row shape for an offline
+        // worker that still has a heartbeat snapshot in the registry.
+        let ep = MachineEndpoint {
+            label: "w".into(),
+            socket_path: PathBuf::from("/x.sock"),
+            kind: MachineKind::Remote,
+        };
+        let w = cluster_core::registry::WorkerEntry {
+            worker_id: "i".into(),
+            label: "w".into(),
+            pubkey: "p".into(),
+            paired_at: chrono::Utc::now(),
+            last_seen: Some(chrono::Utc::now()),
+            status: cluster_core::registry::WorkerStatus::Offline,
+            resources: Some(cluster_core::protocol::Resources {
+                cpu_cores: 8,
+                mem_total_mb: 16384,
+                mem_available_mb: 5120,
+                agent_count: 3,
+                max_agents: 4,
+                load_avg: vec![0.1],
+                kinds: vec!["claude".into()],
+            }),
+        };
+        let info = assemble_machine_info(&ep, Some(&w), None);
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["status"], "offline");
+        assert_eq!(v["reachable"], false);
+        for key in [
+            "agents",
+            "agent_count",
+            "max_agents",
+            "mem_available_mb",
+            "resources",
+        ] {
+            assert!(v[key].is_null(), "{key} should be null: {v}");
+        }
+        assert_eq!(v["kinds"], json!([]));
+        // The staleness marker consumers need: when the worker was last
+        // seen, plus reachable=false / status.
+        assert!(v["last_seen"].is_string());
     }
 
     #[test]
