@@ -493,9 +493,36 @@ fn spawn_server(binary: &Path) -> Result<Child, RuntimeError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RuntimeError::Spawn(format!("{} server: {e}", binary.display())))?;
+    // ETXTBSY is transient: the binary was just replaced on disk (e.g.
+    // `herdcluster update`) while a writer still holds it open. Retry a
+    // few times before surfacing the error — the monitor's respawn path
+    // already tolerates spawn failures, this just avoids burning budget
+    // on a condition that clears in milliseconds.
+    let mut child = None;
+    let mut last_err = None;
+    for _ in 0..5 {
+        match cmd.spawn() {
+            Ok(c) => {
+                child = Some(c);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    let mut child = child.ok_or_else(|| {
+        RuntimeError::Spawn(format!(
+            "{} server: {}",
+            binary.display(),
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        ))
+    })?;
 
     // Forward child stdout/stderr to tracing on dedicated threads.
     if let Some(mut stream) = child.stdout.take() {
