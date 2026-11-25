@@ -46,6 +46,11 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(3);
 pub const DEFAULT_STUCK_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Statuses considered "busy" for stuck detection.
 const BUSY_STATUSES: &[&str] = &["working", "blocked"];
+/// Largest duration [`parse_duration`] accepts: 100 years. Anything
+/// bigger is rejected up front — `Instant + Duration` deadline math in
+/// the wait loops overflows far below `u64::MAX` seconds and used to
+/// panic with exit 101 (issue #85).
+const MAX_DURATION_SECS: u64 = 100 * 365 * 24 * 60 * 60;
 /// Statuses that terminate `agent watch` even when they are not in the
 /// caller's until-set. `done` is the agent-finished signal; `idle` is
 /// deliberately excluded (an idle-at-prompt agent has not necessarily
@@ -173,6 +178,9 @@ pub fn parse_duration(input: &str) -> Result<Duration, FleetError> {
     if !seen_unit {
         return Err(invalid("no duration found"));
     }
+    if total_secs > MAX_DURATION_SECS {
+        return Err(invalid("duration exceeds the 100-year maximum"));
+    }
     Ok(Duration::from_secs(total_secs))
 }
 
@@ -239,9 +247,32 @@ pub fn poll_until<F>(
 where
     F: FnMut() -> Result<Value, FleetError>,
 {
+    poll_until_seeded(fetch, until, tuning, emit, None)
+}
+
+/// [`poll_until`] with an optional baseline status the caller already
+/// observed (and already emitted a [`PollEvent::Status`] for). Seeding
+/// `prev_status` suppresses the duplicate `from: null` baseline event
+/// when `agent wait` falls back to polling after its monitor loop ran
+/// (issue #93); transitions away from the seed still emit normally.
+/// `None` behaves exactly like [`poll_until`].
+fn poll_until_seeded<F>(
+    fetch: &mut F,
+    until: &BTreeSet<String>,
+    tuning: &WatchTuning,
+    emit: &mut dyn FnMut(PollEvent),
+    seed_status: Option<String>,
+) -> Result<PollResult, FleetError>
+where
+    F: FnMut() -> Result<Value, FleetError>,
+{
     let start = Instant::now();
-    let deadline = tuning.timeout.map(|t| start + t);
-    let mut prev_status: Option<String> = None;
+    // `checked_add`: a programmatically-built `WatchTuning` can still
+    // carry a duration `parse_duration` would reject — treat an
+    // overflowing deadline as "no deadline" rather than panicking
+    // (issue #85).
+    let deadline = tuning.timeout.and_then(|t| start.checked_add(t));
+    let mut prev_status: Option<String> = seed_status;
     let mut status_since = start;
     let mut stuck_warned = false;
 
@@ -256,9 +287,12 @@ where
 
         let value = match fetch() {
             Ok(v) => v,
-            // `prev_status` is `Some` iff a fetch already succeeded, so
-            // not-found here means the agent vanished mid-wait → Gone.
-            // On the first poll it means the ID never existed → error.
+            // `prev_status` is `Some` once a fetch succeeded — or when
+            // seeded by the wait monitor, which only seeds statuses it
+            // already observed via `agent.get`. Either way not-found
+            // here means the agent vanished mid-wait → Gone. On the
+            // first poll with no seed it means the ID never existed →
+            // error.
             Err(FleetError::AgentNotFound { .. }) if prev_status.is_some() => {
                 return Ok(PollResult::Gone)
             }
@@ -321,6 +355,19 @@ pub fn agent_poll(
     tuning: &WatchTuning,
     emit: &mut dyn FnMut(PollEvent),
 ) -> Result<PollResult, FleetError> {
+    agent_poll_seeded(ctx, global_id, until, tuning, emit, None)
+}
+
+/// [`agent_poll`] seeded with a baseline status the caller already
+/// observed — see [`poll_until_seeded`].
+fn agent_poll_seeded(
+    ctx: &FleetContext,
+    global_id: &str,
+    until: &BTreeSet<String>,
+    tuning: &WatchTuning,
+    emit: &mut dyn FnMut(PollEvent),
+    seed_status: Option<String>,
+) -> Result<PollResult, FleetError> {
     let (resolved, client) = ops::resolve_and_connect(ctx, global_id)?;
     let target = resolved.agent.clone();
     let mut fetch = || -> Result<Value, FleetError> {
@@ -329,7 +376,7 @@ pub fn agent_poll(
             .map(|v| crate::fleet::normalize_agent_get(&v, &target))
             .map_err(|e| ops::op_error(&resolved, e))
     };
-    poll_until(&mut fetch, until, tuning, emit)
+    poll_until_seeded(&mut fetch, until, tuning, emit, seed_status)
 }
 
 // ---------------------------------------------------------------------------
@@ -432,12 +479,26 @@ fn last_agent_status(client: &api_client::ApiClient, target: &str) -> Option<Str
     client.agent_get(target).ok().and_then(|v| agent_status(&v))
 }
 
+/// Outcome of [`agent_wait_server`].
+///
+/// [`WaitAttempt::Unsupported`] carries the last status the monitor loop
+/// observed so the poll fallback can seed its baseline and skip
+/// re-emitting the `Status{from: null}` event already sent (issue #93).
+enum WaitAttempt {
+    /// The wait resolved server-side.
+    Resolved(PollResult),
+    /// The endpoint rejected `agent.wait`; the caller falls back to
+    /// [`agent_poll`]. `last_status` is the monitor's last observation
+    /// (`None` when stuck detection was off and no monitor ran).
+    Unsupported { last_status: Option<String> },
+}
+
 /// Try herdr's server-side `agent.wait` for `global_id`.
 ///
 /// `until` must already be mapped via [`until_agent_statuses`]. Returns
-/// `Ok(Some(PollResult))` when the wait resolved server-side,
-/// `Ok(None)` when the endpoint rejected `agent.wait` (caller falls back
-/// to [`agent_poll`]), `Err` on real failures.
+/// [`WaitAttempt::Resolved`] when the wait resolved server-side,
+/// [`WaitAttempt::Unsupported`] when the endpoint rejected `agent.wait`
+/// (caller falls back to [`agent_poll`]), `Err` on real failures.
 ///
 /// With `tuning.stuck_after` set, the blocking call runs on a helper
 /// thread while this thread polls `agent.get` at `tuning.interval` —
@@ -450,7 +511,7 @@ fn agent_wait_server(
     until: &[AgentStatus],
     tuning: &WatchTuning,
     emit: &mut dyn FnMut(PollEvent),
-) -> Result<Option<PollResult>, FleetError> {
+) -> Result<WaitAttempt, FleetError> {
     let (resolved, client) = ops::resolve_and_connect(ctx, global_id)?;
     let target = resolved.agent.clone();
 
@@ -475,13 +536,13 @@ fn agent_wait_server(
     // indefinitely, so use a far-future bound.
     let client_timeout = tuning
         .timeout
-        .map(|t| t + WAIT_CLIENT_SLACK)
+        .map(|t| t.saturating_add(WAIT_CLIENT_SLACK))
         .unwrap_or(WAIT_CLIENT_MAX);
 
     if tuning.stuck_after.is_none() {
         // Pure server-side wait — no polling at all.
         return match client.agent_wait_with_timeout(&target, Some(wait), client_timeout) {
-            Ok(v) => Ok(Some(PollResult::Matched {
+            Ok(v) => Ok(WaitAttempt::Resolved(PollResult::Matched {
                 status: agent_status(&v).unwrap_or_else(|| "unknown".to_string()),
                 agent: v,
             })),
@@ -491,7 +552,12 @@ fn agent_wait_server(
                 } else {
                     None
                 };
-                classify_wait_error(&resolved, e, last)
+                match classify_wait_error(&resolved, e, last)? {
+                    // No monitor ran, so nothing was emitted — the poll
+                    // fallback emits its own baseline (issue #93).
+                    None => Ok(WaitAttempt::Unsupported { last_status: None }),
+                    Some(result) => Ok(WaitAttempt::Resolved(result)),
+                }
             }
         };
     }
@@ -561,14 +627,20 @@ fn agent_wait_server(
     };
 
     match server_result {
-        Some(Ok(v)) => Ok(Some(PollResult::Matched {
+        Some(Ok(v)) => Ok(WaitAttempt::Resolved(PollResult::Matched {
             status: agent_status(&v).unwrap_or_else(|| "unknown".to_string()),
             agent: v,
         })),
-        Some(Err(e)) => classify_wait_error(&resolved, e, last_status),
+        Some(Err(e)) => match classify_wait_error(&resolved, e, last_status.clone())? {
+            // The monitor already emitted baseline/transition events —
+            // hand the poll fallback the last status so it doesn't
+            // re-emit the `Status{from: null}` baseline (issue #93).
+            None => Ok(WaitAttempt::Unsupported { last_status }),
+            Some(result) => Ok(WaitAttempt::Resolved(result)),
+        },
         // Server never answered within the client bound — report as a
         // wait timeout with the last observed status.
-        None => Ok(Some(PollResult::TimedOut { last_status })),
+        None => Ok(WaitAttempt::Resolved(PollResult::TimedOut { last_status })),
     }
 }
 
@@ -588,8 +660,10 @@ pub fn agent_wait_live(
         return agent_poll(ctx, global_id, until, tuning, emit);
     };
     match agent_wait_server(ctx, global_id, &statuses, tuning, emit)? {
-        Some(result) => Ok(result),
-        None => agent_poll(ctx, global_id, until, tuning, emit),
+        WaitAttempt::Resolved(result) => Ok(result),
+        WaitAttempt::Unsupported { last_status } => {
+            agent_poll_seeded(ctx, global_id, until, tuning, emit, last_status)
+        }
     }
 }
 
@@ -948,6 +1022,73 @@ mod tests {
                 "expected InvalidArgument for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_duration_rejects_absurd_values() {
+        // Issue #85: a huge --timeout used to reach `Instant + Duration`
+        // arithmetic unchecked and panic (exit 101). Anything over the
+        // 100-year cap is now a clean InvalidArgument.
+        for bad in [
+            "18446744073709551615s", // u64::MAX seconds
+            "99999999999999999999h",
+            "3153600001s", // one second past the 100-year cap
+        ] {
+            assert!(
+                matches!(parse_duration(bad), Err(FleetError::InvalidArgument { .. })),
+                "expected InvalidArgument for {bad:?}"
+            );
+        }
+        // The cap itself is still accepted.
+        assert_eq!(
+            parse_duration("3153600000s").unwrap(),
+            Duration::from_secs(MAX_DURATION_SECS)
+        );
+    }
+
+    #[test]
+    fn poll_until_huge_timeout_does_not_panic() {
+        // Issue #85 regression: a programmatically-built timeout larger
+        // than any Instant can represent must not panic on deadline
+        // computation; a matching first poll still resolves.
+        let mut tuning = fast();
+        tuning.timeout = Some(Duration::MAX);
+        let mut responses = std::collections::VecDeque::from(vec![Ok(get("done"))]);
+        let result = poll_until(
+            &mut fake(&mut responses),
+            &until(&["done"]),
+            &tuning,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(matches!(result, PollResult::Matched { .. }));
+    }
+
+    #[test]
+    fn poll_until_seeded_skips_duplicate_baseline() {
+        // Issue #93: when the wait monitor already emitted the baseline
+        // Status{from: None} event, the poll fallback seeded with that
+        // status must not emit it again — but a real transition still
+        // does.
+        let mut responses =
+            std::collections::VecDeque::from(vec![Ok(get("working")), Ok(get("done"))]);
+        let mut events = Vec::new();
+        let result = poll_until_seeded(
+            &mut fake(&mut responses),
+            &until(&["done"]),
+            &fast(),
+            &mut |e| events.push(e),
+            Some("working".into()),
+        )
+        .unwrap();
+        assert!(matches!(result, PollResult::Matched { .. }));
+        assert_eq!(
+            events,
+            vec![PollEvent::Status {
+                from: Some("working".into()),
+                to: "done".into()
+            }]
+        );
     }
 
     #[test]
