@@ -24,7 +24,11 @@
 //! 4. **Spawn + supervise.** `herdr server` (bare = headless server, verified
 //!    on 0.9.5) is spawned with piped stdout/stderr forwarded to `tracing`.
 //!    A monitor thread restarts it with exponential backoff (0.5 s → 30 s,
-//!    capped at [`MAX_RESTARTS`] restarts) on unexpected exit.
+//!    capped at [`MAX_RESTARTS`] restarts) on unexpected exit. Failed
+//!    respawn attempts (transient `fork`/`EMFILE`/`PATH` errors) are
+//!    retried within the same budget rather than killing the monitor,
+//!    and the budget resets after a child stays up for
+//!    [`RESTART_RESET_WINDOW`].
 //!
 //! # Test hooks
 //!
@@ -65,6 +69,13 @@ const RESTART_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Maximum automatic restarts before the supervisor gives up.
 const MAX_RESTARTS: u32 = 5;
+/// Child uptime after which the restart budget resets. A server that
+/// stayed up this long is considered stable, so earlier crashes no
+/// longer count against [`MAX_RESTARTS`]. 5 minutes is far longer than
+/// the worst-case backoff sequence needed to exhaust the budget
+/// (~16 s at the 0.5 s → 30 s ramp) yet short enough that a
+/// crash-looping-then-healthy server recovers its budget quickly.
+const RESTART_RESET_WINDOW: Duration = Duration::from_secs(300);
 
 /// Configuration for [`HerdrRuntime::ensure`].
 #[derive(Debug, Clone)]
@@ -518,22 +529,67 @@ fn spawn_server(binary: &Path) -> Result<Child, RuntimeError> {
     Ok(child)
 }
 
+/// Restart-supervision timings for [`monitor_loop`]. Production uses
+/// the module constants via [`MonitorTimings::PROD`]; tests inject
+/// small values so the loop can be exercised quickly.
+#[derive(Debug, Clone, Copy)]
+struct MonitorTimings {
+    /// Poll interval for child liveness.
+    poll: Duration,
+    /// Initial restart backoff.
+    backoff_min: Duration,
+    /// Restart backoff cap.
+    backoff_max: Duration,
+    /// Max consecutive restarts before giving up.
+    max_restarts: u32,
+    /// Child uptime after which the restart budget resets (see
+    /// [`RESTART_RESET_WINDOW`]).
+    stable_window: Duration,
+}
+
+impl MonitorTimings {
+    const PROD: Self = Self {
+        poll: MONITOR_POLL,
+        backoff_min: RESTART_BACKOFF_MIN,
+        backoff_max: RESTART_BACKOFF_MAX,
+        max_restarts: MAX_RESTARTS,
+        stable_window: RESTART_RESET_WINDOW,
+    };
+}
+
 /// Monitor thread: poll the child, restart with backoff on unexpected
-/// exit (up to [`MAX_RESTARTS`]), then mark the slot empty.
+/// exit (up to `timings.max_restarts` within a stable-run window), then
+/// mark the slot empty.
+///
+/// Two failure modes are handled without killing the monitor:
+///
+/// - **Failed respawn.** If [`spawn_server`] fails (transient `fork`,
+///   `EMFILE`, `PATH` hiccup), the slot stays empty and the next
+///   iteration retries with backoff, still consuming restart budget.
+///   Previously the empty slot hit `None => return` and the monitor
+///   thread died permanently after a single failed respawn.
+/// - **Lifetime crash count.** `restarts` resets whenever a child stays
+///   up for `timings.stable_window`, so a long-stable server that
+///   crashes a few times later still has its full budget.
 fn monitor_loop(
     binary: PathBuf,
     slot: Arc<ChildSlot>,
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicU8>,
+    timings: MonitorTimings,
 ) {
-    let mut backoff = RESTART_BACKOFF_MIN;
+    let mut backoff = timings.backoff_min;
     let mut restarts = 0u32;
+    // When the current child was spawned; `None` while the slot is empty
+    // because the last respawn attempt failed. Initialized to "now"
+    // (the initial spawn happened moments ago in `start_herdr_server`).
+    let mut child_started = Some(Instant::now());
     loop {
-        std::thread::sleep(MONITOR_POLL);
+        std::thread::sleep(timings.poll);
         if stop.load(Ordering::Relaxed) {
             return;
         }
-        let exited = {
+        let down = {
             let mut guard = match slot.child.lock() {
                 Ok(g) => g,
                 Err(_) => return,
@@ -547,14 +603,26 @@ fn monitor_loop(
                     Ok(None) => false,
                     Err(_) => return,
                 },
-                None => return,
+                // Empty slot: the previous respawn failed. Treat like a
+                // down child and retry below instead of returning.
+                None => true,
             }
         };
-        if !exited {
+        if !down {
             continue;
         }
+        // A child that stayed up for the stable window earns a fresh
+        // restart budget. Only applies to a real child exit — an empty
+        // slot (failed respawn) must not reset the counter, or a
+        // permanently failing spawn would retry forever.
+        if let Some(started) = child_started.take() {
+            if started.elapsed() >= timings.stable_window {
+                restarts = 0;
+                backoff = timings.backoff_min;
+            }
+        }
         alive.store(0, Ordering::Relaxed);
-        if restarts >= MAX_RESTARTS {
+        if restarts >= timings.max_restarts {
             tracing::error!("herdr server exceeded restart budget; giving up");
             return;
         }
@@ -565,21 +633,27 @@ fn monitor_loop(
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(
+                Duration::from_millis(100).min(timings.poll.max(Duration::from_millis(1))),
+            );
         }
-        backoff = (backoff * 2).min(RESTART_BACKOFF_MAX);
+        backoff = (backoff * 2).min(timings.backoff_max);
         if stop.load(Ordering::Relaxed) {
             return;
         }
         match spawn_server(&binary) {
             Ok(child) => {
                 tracing::warn!(restarts, "restarting herdr server");
+                child_started = Some(Instant::now());
                 if let Ok(mut guard) = slot.child.lock() {
                     *guard = Some(child);
                 }
                 alive.store(1, Ordering::Relaxed);
             }
             Err(e) => {
+                // Keep the monitor alive: the slot stays empty and the
+                // next loop iteration retries with backoff, still
+                // bounded by `max_restarts`.
                 tracing::error!("herdr server respawn failed: {e}");
             }
         }
@@ -659,7 +733,9 @@ impl HerdrRuntime {
             let slot = slot.clone();
             let stop = stop.clone();
             let alive = alive.clone();
-            std::thread::spawn(move || monitor_loop(binary, slot, stop, alive))
+            std::thread::spawn(move || {
+                monitor_loop(binary, slot, stop, alive, MonitorTimings::PROD)
+            })
         };
 
         Ok(Self {
@@ -965,5 +1041,193 @@ mod tests {
     fn ensure_with_fake_herdr_binary_gated() {
         if std::env::var("HERDCLUSTER_RUNTIME_IT").ok().as_deref() != Some("1") {}
         // Requires a fake herdr implementation; left as a manual hook.
+    }
+
+    // ---- monitor_loop regression tests (issue #39) ----
+    //
+    // These drive `monitor_loop` directly with tiny `MonitorTimings` and
+    // fake `herdr` shell scripts. They spawn real processes, so they are
+    // `#[cfg(unix)]` and kept to a few seconds each.
+
+    /// Write an executable shell script at `dir/name`.
+    #[cfg(unix)]
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Number of lines in `path` (0 when absent).
+    #[cfg(unix)]
+    fn line_count(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// Poll `cond` until true or `timeout` elapses; returns the outcome.
+    #[cfg(unix)]
+    fn wait_for(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        cond()
+    }
+
+    /// Fast timings shared by the monitor tests: millisecond-scale
+    /// poll/backoff, tiny restart budget, huge stable window (unless a
+    /// test overrides it).
+    #[cfg(unix)]
+    fn fast_timings(max_restarts: u32, stable_window: Duration) -> MonitorTimings {
+        MonitorTimings {
+            poll: Duration::from_millis(10),
+            backoff_min: Duration::from_millis(10),
+            backoff_max: Duration::from_millis(50),
+            max_restarts,
+            stable_window,
+        }
+    }
+
+    /// Spawn `binary` into a fresh slot + monitor thread; returns the
+    /// handles the test needs to observe and stop it.
+    #[cfg(unix)]
+    fn spawn_monitor(
+        binary: PathBuf,
+        timings: MonitorTimings,
+    ) -> (Arc<AtomicBool>, Arc<AtomicU8>, std::thread::JoinHandle<()>) {
+        let child = spawn_server(&binary).expect("initial spawn_server");
+        let slot = Arc::new(ChildSlot::new(child));
+        let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicU8::new(1));
+        let handle = {
+            let binary = binary.clone();
+            let slot = slot.clone();
+            let stop = stop.clone();
+            let alive = alive.clone();
+            std::thread::spawn(move || monitor_loop(binary, slot, stop, alive, timings))
+        };
+        (stop, alive, handle)
+    }
+
+    /// A child that exits immediately is respawned until the restart
+    /// budget is exhausted, then the monitor exits cleanly.
+    #[test]
+    #[cfg(unix)]
+    fn monitor_respawns_until_restart_budget() {
+        let dir = std::env::temp_dir().join(format!("hc-mon-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let count = dir.join("count");
+        let script = write_script(
+            &dir,
+            "fake-herdr",
+            &format!("#!/bin/sh\necho x >> {}\nexit 0\n", count.display()),
+        );
+
+        let (stop, _alive, handle) =
+            spawn_monitor(script, fast_timings(3, Duration::from_secs(3600)));
+
+        // Initial spawn + 3 respawns = 4 executions, then the monitor
+        // gives up and the thread exits on its own.
+        assert!(
+            wait_for(|| line_count(&count) >= 4, Duration::from_secs(15)),
+            "monitor did not reach the restart budget"
+        );
+        handle.join().expect("monitor thread panicked");
+        assert_eq!(line_count(&count), 4, "unexpected extra respawns");
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for #39: when `spawn_server` fails (e.g. binary
+    /// vanished, EMFILE), the monitor must stay alive and keep retrying
+    /// within the budget instead of exiting on the first failure.
+    #[test]
+    #[cfg(unix)]
+    fn monitor_survives_failed_respawn() {
+        let dir = std::env::temp_dir().join(format!("hc-mon-spawnfail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Initial child exits instantly so the monitor goes into the
+        // respawn path; the respawn binary does not exist, so every
+        // spawn fails.
+        let fast_exiting = write_script(&dir, "fast-exit", "#!/bin/sh\nexit 0\n");
+        let missing = dir.join("does-not-exist");
+
+        let slot = {
+            let child = spawn_server(&fast_exiting).unwrap();
+            Arc::new(ChildSlot::new(child))
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicU8::new(1));
+        let handle = {
+            let stop = stop.clone();
+            let alive = alive.clone();
+            let slot = slot.clone();
+            std::thread::spawn(move || {
+                monitor_loop(
+                    missing,
+                    slot,
+                    stop,
+                    alive,
+                    fast_timings(3, Duration::from_secs(3600)),
+                )
+            })
+        };
+
+        // First respawn attempt fails after ~poll+backoff (~20 ms). The
+        // old code returned on the *next* poll (~30 ms total); wait well
+        // past that and assert the monitor is still running.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !handle.is_finished(),
+            "monitor exited after a single failed respawn (issue #39)"
+        );
+        // Budget is 3; with >=10 ms backoff per attempt the monitor
+        // cannot have exhausted it before we stop it.
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("monitor thread panicked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A child that stays up past `stable_window` resets the restart
+    /// budget, so long-stable servers are not permanently disabled by
+    /// earlier crashes.
+    #[test]
+    #[cfg(unix)]
+    fn monitor_resets_budget_after_stable_uptime() {
+        let dir = std::env::temp_dir().join(format!("hc-mon-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let count = dir.join("count");
+        // Each run sleeps 1 s — far above the 300 ms stable window — then
+        // exits, so every exit should reset the budget.
+        let script = write_script(
+            &dir,
+            "fake-herdr",
+            &format!(
+                "#!/bin/sh\necho x >> {}\nsleep 1\nexit 0\n",
+                count.display()
+            ),
+        );
+
+        let (stop, _alive, handle) =
+            spawn_monitor(script, fast_timings(2, Duration::from_millis(300)));
+
+        // max_restarts=2 means at most 3 executions without a reset.
+        // Reaching a 4th proves the budget was reset after stable runs.
+        assert!(
+            wait_for(|| line_count(&count) >= 4, Duration::from_secs(15)),
+            "restart budget was not reset after stable uptime"
+        );
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("monitor thread panicked");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
