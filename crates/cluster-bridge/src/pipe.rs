@@ -341,7 +341,7 @@ mod tests {
         let dialer = Mux::new(a, MuxRole::Dialer);
         let acceptor = Mux::new(b, MuxRole::Acceptor);
         let local = dialer.open_stream().unwrap();
-        let mut peer = acceptor.accept_stream().await.unwrap();
+        let peer = acceptor.accept_stream().await.unwrap();
 
         let pipe = tokio::spawn(pipe_unix_stream(sock, local, idle));
 
