@@ -196,6 +196,57 @@ fn agent_row(machine: &str, item: &Value) -> Option<FleetAgent> {
     })
 }
 
+/// Normalize an `agent.get` (`agent_info`) response so `agent`/`kind`
+/// carry the same semantics as `agent list` rows (issue #14).
+///
+/// herdr reports the agent *kind* under `agent` inside the agent record
+/// (`{"agent": {"agent": "claude", "pane_id": "w2:pHF", ...}}`), while
+/// `agent list` rows put the kind under `kind` and the machine-local
+/// target id under `agent`. This rewrites the record in place:
+///
+/// * `kind` ← first string among [`KIND_KEYS`] (explicit `kind` wins,
+///   then `agent_kind`, then the colliding `agent` value);
+/// * `agent` ← the machine-local target id, resolved with the same
+///   [`AGENT_ID_KEYS`] priority as [`parse_agent_list`], falling back to
+///   `fallback_target` (the id the caller asked for) when the record has
+///   none of those fields.
+///
+/// All other herdr fields pass through untouched and the
+/// `{"agent": {...}}` envelope shape is preserved. Idempotent: an
+/// already-normalized record round-trips unchanged.
+pub fn normalize_agent_get(value: &Value, fallback_target: &str) -> Value {
+    // Envelope form: {"type": "agent_info", "agent": {...}}.
+    if value.get("agent").is_some_and(Value::is_object) {
+        let mut out = value.clone();
+        if let Some(inner) = out.get_mut("agent").and_then(Value::as_object_mut) {
+            normalize_agent_record(inner, fallback_target);
+        }
+        return out;
+    }
+    // Flat form: the record itself is the top-level object.
+    match value.as_object() {
+        Some(obj) => {
+            let mut map = obj.clone();
+            normalize_agent_record(&mut map, fallback_target);
+            Value::Object(map)
+        }
+        None => value.clone(),
+    }
+}
+
+/// Rewrite the `agent`/`kind` fields of one agent record object; see
+/// [`normalize_agent_get`].
+fn normalize_agent_record(obj: &mut serde_json::Map<String, Value>, fallback_target: &str) {
+    // Snapshot for the defensive key lookups — same helpers and key
+    // priority `agent list` parsing uses, so both commands agree.
+    let snapshot = Value::Object(obj.clone());
+    if let Some(kind) = parse::str_field(&snapshot, KIND_KEYS) {
+        obj.insert("kind".to_string(), Value::String(kind.to_string()));
+    }
+    let local_id = parse::str_field(&snapshot, AGENT_ID_KEYS).unwrap_or(fallback_target);
+    obj.insert("agent".to_string(), Value::String(local_id.to_string()));
+}
+
 /// Merge per-machine query outcomes into sorted [`AgentListRow`]s.
 ///
 /// Ordering is deterministic: machine label ascending; within a machine,
@@ -639,6 +690,65 @@ mod tests {
         assert!(info.reachable);
         let info = assemble_machine_info(&local, None, Some(Err("down".into())));
         assert_eq!(info.status, "unreachable");
+    }
+
+    #[test]
+    fn normalize_agent_get_matches_list_row_semantics() {
+        // Real herdr 0.9.5 `agent.get` shape: kind lives under `agent`,
+        // pane id under `pane_id`, status under `agent_status` (issue #14).
+        let v = json!({
+            "type": "agent_info",
+            "agent": {
+                "terminal_id": "term_1", "agent": "claude", "pane_id": "w2:pHF",
+                "agent_status": "idle", "workspace_id": "w2", "cwd": "/repo",
+                "interactive_ready": true, "state_change_seq": 3
+            }
+        });
+        let out = normalize_agent_get(&v, "w2:pHF");
+        // Envelope preserved; inner record now matches list-row semantics.
+        assert_eq!(out["type"], "agent_info");
+        let inner = &out["agent"];
+        assert_eq!(inner["kind"], "claude");       // kind under `kind`
+        assert_eq!(inner["agent"], "w2:pHF");      // pane id under `agent`
+        assert_eq!(inner["pane_id"], "w2:pHF");    // raw fields intact
+        assert_eq!(inner["agent_status"], "idle");
+        assert_eq!(inner["state_change_seq"], 3);
+        assert_eq!(inner["interactive_ready"], true);
+    }
+
+    #[test]
+    fn normalize_agent_get_prefers_name_like_list_rows() {
+        // `agent list` resolves the local id as name → pane_id → ...;
+        // `agent get` must agree so scripts see the same `agent` value.
+        let v = json!({"agent": {"agent": "devin", "name": "devin-mac", "pane_id": "w2:p1"}});
+        let out = normalize_agent_get(&v, "fallback");
+        assert_eq!(out["agent"]["agent"], "devin-mac");
+        assert_eq!(out["agent"]["kind"], "devin");
+        assert_eq!(out["agent"]["name"], "devin-mac");
+    }
+
+    #[test]
+    fn normalize_agent_get_explicit_kind_wins_and_fallback_target() {
+        // An explicit `kind` beats the `agent` alias; a record with no id
+        // fields falls back to the resolved target.
+        let v = json!({"agent": {"agent": "claude", "kind": "codex"}});
+        let out = normalize_agent_get(&v, "w9:p9");
+        assert_eq!(out["agent"]["kind"], "codex");
+        assert_eq!(out["agent"]["agent"], "w9:p9");
+    }
+
+    #[test]
+    fn normalize_agent_get_flat_and_idempotent() {
+        // Flat record (no envelope) is normalized in place.
+        let flat = json!({"agent": "claude", "pane_id": "w1:p2", "agent_status": "working"});
+        let out = normalize_agent_get(&flat, "t");
+        assert_eq!(out["kind"], "claude");
+        assert_eq!(out["agent"], "w1:p2");
+        // Normalizing the result again changes nothing.
+        let twice = normalize_agent_get(&out, "t");
+        assert_eq!(twice, out);
+        // Non-object payloads pass through untouched.
+        assert_eq!(normalize_agent_get(&json!("x"), "t"), json!("x"));
     }
 
     #[test]

@@ -53,10 +53,15 @@ pub(crate) fn op_error(resolved: &crate::ids::ResolvedAgent, e: ApiError) -> Fle
 }
 
 /// `agent.get <global-id>` — fetch one agent's details.
+///
+/// The response is normalized via [`crate::fleet::normalize_agent_get`]
+/// so `agent`/`kind` match `agent list` row semantics (issue #14); all
+/// other herdr `agent_info` fields pass through.
 pub fn agent_get(ctx: &FleetContext, global_id: &str) -> Result<Value, FleetError> {
     let (resolved, client) = resolve_and_connect(ctx, global_id)?;
     client
         .agent_get(&resolved.agent)
+        .map(|v| crate::fleet::normalize_agent_get(&v, &resolved.agent))
         .map_err(|e| op_error(&resolved, e))
 }
 
