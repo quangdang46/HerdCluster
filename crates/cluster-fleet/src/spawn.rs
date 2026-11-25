@@ -1759,13 +1759,24 @@ mod tests {
         }
     }
 
+    /// Build a worker fixture. `FleetContext::build` recomputes `status`
+    /// from `last_seen` (issue #41), so the requested status is expressed
+    /// through a matching `last_seen`: `Online` → just seen, `Degraded` →
+    /// ~20 s ago, `Offline` → never seen.
     fn worker(label: &str, status: WorkerStatus, kinds: Vec<String>) -> WorkerEntry {
+        let last_seen = match status {
+            WorkerStatus::Online => Some(chrono::Utc::now()),
+            WorkerStatus::Degraded => {
+                Some(chrono::Utc::now() - chrono::Duration::seconds(20))
+            }
+            WorkerStatus::Offline => None,
+        };
         WorkerEntry {
             worker_id: format!("id-{label}"),
             label: label.into(),
             pubkey: "ab".repeat(32),
             paired_at: chrono::Utc::now(),
-            last_seen: None,
+            last_seen,
             status,
             resources: Some(Resources {
                 cpu_cores: 8,

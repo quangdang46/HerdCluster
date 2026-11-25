@@ -212,9 +212,13 @@ mod tests {
 
     /// Build a `WorkerEntry` via serde — avoids needing `chrono` as a
     /// dev-dependency just for `paired_at`.
+    ///
+    /// `FleetContext::build` recomputes `status` from `last_seen`
+    /// (issue #41), so liveness is expressed through `last_seen`, not a
+    /// persisted status string: `Some(now)` → online, `None` → offline.
     fn worker_entry(
         label: &str,
-        status: &str,
+        last_seen: Option<chrono::DateTime<chrono::Utc>>,
         resources: Option<serde_json::Value>,
     ) -> WorkerEntry {
         serde_json::from_value(serde_json::json!({
@@ -222,8 +226,8 @@ mod tests {
             "label": label,
             "pubkey": "ab".repeat(32),
             "paired_at": "2024-01-01T00:00:00Z",
-            "last_seen": null,
-            "status": status,
+            "last_seen": last_seen.map(|t| t.to_rfc3339()),
+            "status": "online",
             "resources": resources,
         }))
         .unwrap()
@@ -279,15 +283,16 @@ mod tests {
             "local": { "max_agents": 6 },
             "w1": { "max_agents": 2, "kinds_override": ["codex"] },
         }));
+        let now = chrono::Utc::now();
         let workers = vec![
             worker_entry(
                 "w1",
-                "online",
+                Some(now),
                 Some(resources_json(1, 4, 4096, &["claude", "codex"])),
             ),
             worker_entry(
                 "w2",
-                "offline",
+                None,
                 Some(resources_json(3, 4, 2048, &["claude"])),
             ),
         ];
@@ -383,7 +388,7 @@ mod tests {
         let cluster = cluster_with_machines(serde_json::json!({}));
         let workers = vec![worker_entry(
             "wsl",
-            "online",
+            Some(chrono::Utc::now()),
             Some(resources_json(0, 4, 16384, &["claude"])),
         )];
         let ctx = FleetContext::build(PathBuf::from("/tmp/hc-wire2"), cluster, workers).unwrap();
@@ -411,7 +416,7 @@ mod tests {
             "w1": { "kinds_override": ["claude"] }
         }));
         assert!(cluster.machines.contains_key("w1"));
-        let workers = vec![worker_entry("w1", "online", None)];
+        let workers = vec![worker_entry("w1", Some(chrono::Utc::now()), None)];
         let ctx = FleetContext::build(PathBuf::from("/tmp/hc-wire3"), cluster, workers).unwrap();
         let caps = collect_worker_caps(&ctx);
         let w1 = caps.iter().find(|c| c.label == "w1").unwrap();
