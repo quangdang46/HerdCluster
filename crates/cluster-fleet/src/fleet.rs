@@ -37,6 +37,7 @@ use serde_json::Value;
 use crate::endpoint::{FleetContext, MachineEndpoint, MachineKind};
 use crate::ids::format_global_id;
 use crate::parse;
+use crate::spawn::effective_max_agents;
 
 /// Total per-call budget for the `agent list --all` fan-out. All machine
 /// queries run in parallel scoped threads, so wall-clock ≈ this value.
@@ -110,8 +111,15 @@ pub struct MachineInfo {
     /// `null` when the machine is unreachable — the snapshot would be
     /// stale data, not a live metric (issue #11).
     pub agent_count: Option<u32>,
-    /// Last heartbeat-reported agent cap (workers only); `null` when
-    /// unreachable, same as [`MachineInfo::agent_count`].
+    /// Effective agent cap the spawn scheduler enforces for this machine
+    /// (issue #12): the `cluster.json` `machines.<label>.max_agents`
+    /// override wins over the last heartbeat-reported cap, then the
+    /// scheduler default — same precedence as `spawn`/`scheduler_wire`.
+    /// The raw worker-reported value remains under `resources.max_agents`.
+    /// `null` when the machine is unreachable and no `cluster.json`
+    /// override exists — without a live probe or an override the effective
+    /// cap would just be the scheduler default, not a fact about the
+    /// machine (issue #11).
     pub max_agents: Option<u32>,
     /// Last heartbeat-reported available memory in MiB (workers only);
     /// `null` when unreachable, same as [`MachineInfo::agent_count`].
@@ -317,10 +325,16 @@ fn query_machine(ep: &MachineEndpoint, timeout: Duration) -> MachineAgents {
 
 /// Assemble one [`MachineInfo`] from registry data + an optional live probe.
 /// Pure — separated from IO for testing.
+///
+/// `override_max` is the `cluster.json` `machines.<label>.max_agents`
+/// override for this machine (issue #12): it is folded into the reported
+/// `max_agents` field so `machines --json` shows the same effective cap
+/// the scheduler enforces.
 fn assemble_machine_info(
     endpoint: &MachineEndpoint,
     worker: Option<&WorkerEntry>,
     probe: Option<Result<usize, String>>,
+    override_max: Option<u32>,
 ) -> MachineInfo {
     let (reachable, agents, live_status) = match probe {
         Some(Ok(n)) => (true, Some(n as u64), None),
@@ -363,7 +377,19 @@ fn assemble_machine_info(
         reachable,
         agents,
         agent_count: resources.as_ref().map(|r| r.agent_count),
-        max_agents: resources.as_ref().map(|r| r.max_agents),
+        // Effective cap, not the raw reported one: the scheduler
+        // (spawn.rs `build_worker_caps`/`configured_max_agents`,
+        // scheduler_wire.rs `collect_worker_caps`) applies the same
+        // override → reported → default precedence, so `machines --json`
+        // and spawn enforcement can no longer disagree (issue #12).
+        max_agents: if reachable || override_max.is_some() {
+            Some(effective_max_agents(
+                override_max,
+                resources.as_ref().map(|r| r.max_agents),
+            ))
+        } else {
+            None
+        },
         mem_available_mb: resources.as_ref().map(|r| r.mem_available_mb),
         kinds: resources
             .as_ref()
@@ -432,7 +458,11 @@ pub fn machines_with_timeout(ctx: &FleetContext, timeout: Duration) -> Vec<Machi
             } else {
                 probe_map.remove(&ep.label).flatten()
             };
-            assemble_machine_info(ep, worker, probe)
+            let override_max = ctx
+                .machines_overrides
+                .get(&ep.label)
+                .and_then(|o| o.max_agents);
+            assemble_machine_info(ep, worker, probe, override_max)
         })
         .collect();
     out.sort_by(|a, b| a.label.cmp(&b.label));
@@ -639,7 +669,7 @@ mod tests {
                 kinds: vec!["claude".into()],
             }),
         };
-        let info = assemble_machine_info(&ep, Some(&w), None);
+        let info = assemble_machine_info(&ep, Some(&w), None, None);
         assert_eq!(info.status, "offline");
         assert!(!info.reachable);
         assert_eq!(info.agents, None);
@@ -650,7 +680,7 @@ mod tests {
         // Degraded worker, probe ok → status stays degraded, count set,
         // and the heartbeat snapshot is still fresh enough to report.
         w.status = cluster_core::registry::WorkerStatus::Degraded;
-        let info = assemble_machine_info(&ep, Some(&w), Some(Ok(3)));
+        let info = assemble_machine_info(&ep, Some(&w), Some(Ok(3)), None);
         assert_eq!(info.status, "degraded");
         assert!(info.reachable);
         assert_eq!(info.agents, Some(3));
@@ -662,7 +692,7 @@ mod tests {
 
         // Probe fails → "unreachable" overrides registry status and the
         // heartbeat snapshot is withheld as stale.
-        let info = assemble_machine_info(&ep, Some(&w), Some(Err("boom".into())));
+        let info = assemble_machine_info(&ep, Some(&w), Some(Err("boom".into())), None);
         assert_eq!(info.status, "unreachable");
         assert!(!info.reachable);
         assert_stale_metrics_withheld(&info);
@@ -673,10 +703,10 @@ mod tests {
             socket_path: PathBuf::from("/h.sock"),
             kind: MachineKind::Local,
         };
-        let info = assemble_machine_info(&local, None, Some(Ok(2)));
+        let info = assemble_machine_info(&local, None, Some(Ok(2)), None);
         assert_eq!(info.status, "online");
         assert!(info.reachable);
-        let info = assemble_machine_info(&local, None, Some(Err("down".into())));
+        let info = assemble_machine_info(&local, None, Some(Err("down".into())), None);
         assert_eq!(info.status, "unreachable");
     }
 
@@ -717,7 +747,7 @@ mod tests {
                 kinds: vec!["claude".into()],
             }),
         };
-        let info = assemble_machine_info(&ep, Some(&w), None);
+        let info = assemble_machine_info(&ep, Some(&w), None, None);
         let v = serde_json::to_value(&info).unwrap();
         assert_eq!(v["status"], "offline");
         assert_eq!(v["reachable"], false);
@@ -734,6 +764,152 @@ mod tests {
         // The staleness marker consumers need: when the worker was last
         // seen, plus reachable=false / status.
         assert!(v["last_seen"].is_string());
+    }
+
+    #[test]
+    fn assemble_machine_info_max_agents_is_effective_cap() {
+        use cluster_core::protocol::Resources;
+        use cluster_core::registry::WorkerStatus;
+        use cluster_core::scheduler::DEFAULT_MAX_AGENTS;
+
+        let ep = MachineEndpoint {
+            label: "w".into(),
+            socket_path: PathBuf::from("/x.sock"),
+            kind: MachineKind::Remote,
+        };
+        let mut w = cluster_core::registry::WorkerEntry {
+            worker_id: "i".into(),
+            label: "w".into(),
+            pubkey: "p".into(),
+            paired_at: chrono::Utc::now(),
+            last_seen: None,
+            status: WorkerStatus::Online,
+            resources: Some(Resources {
+                cpu_cores: 8,
+                mem_total_mb: 16384,
+                mem_available_mb: 8192,
+                agent_count: 1,
+                max_agents: 4, // worker-reported cap (issue #12 scenario)
+                load_avg: vec![],
+                kinds: vec!["claude".into()],
+            }),
+        };
+
+        // No override → reported cap passes through (reachable probe).
+        let info = assemble_machine_info(&ep, Some(&w), Some(Ok(1)), None);
+        assert_eq!(info.max_agents, Some(4));
+        // Raw reported value stays visible under `resources`.
+        assert_eq!(info.resources.as_ref().unwrap().max_agents, 4);
+
+        // cluster.json override wins — matches the scheduler's
+        // `configured_max_agents`/`build_worker_caps` precedence.
+        let info = assemble_machine_info(&ep, Some(&w), Some(Ok(1)), Some(8));
+        assert_eq!(info.max_agents, Some(8));
+        assert_eq!(info.resources.as_ref().unwrap().max_agents, 4);
+
+        // No reported resources at all → default cap (or override).
+        w.resources = None;
+        let info = assemble_machine_info(&ep, Some(&w), Some(Ok(1)), None);
+        assert_eq!(info.max_agents, Some(DEFAULT_MAX_AGENTS));
+        let info = assemble_machine_info(&ep, Some(&w), Some(Ok(1)), Some(6));
+        assert_eq!(info.max_agents, Some(6));
+
+        // Unreachable with no override → `null` (issue #11: nothing live
+        // to report); unreachable WITH an override still shows the
+        // configured cap, which is not stale data.
+        w.resources = Some(Resources {
+            cpu_cores: 8,
+            mem_total_mb: 16384,
+            mem_available_mb: 8192,
+            agent_count: 1,
+            max_agents: 4,
+            load_avg: vec![],
+            kinds: vec!["claude".into()],
+        });
+        let info = assemble_machine_info(&ep, Some(&w), None, None);
+        assert_eq!(info.max_agents, None);
+        let info = assemble_machine_info(&ep, Some(&w), None, Some(8));
+        assert_eq!(info.max_agents, Some(8));
+
+        // Local machine: no worker entry, so the override/default path
+        // is the only source — same as the scheduler's local caps.
+        let local = MachineEndpoint {
+            label: "local".into(),
+            socket_path: PathBuf::from("/h.sock"),
+            kind: MachineKind::Local,
+        };
+        let info = assemble_machine_info(&local, None, Some(Ok(0)), None);
+        assert_eq!(info.max_agents, Some(DEFAULT_MAX_AGENTS));
+        let info = assemble_machine_info(&local, None, Some(Ok(0)), Some(7));
+        assert_eq!(info.max_agents, Some(7));
+    }
+
+    #[test]
+    fn machines_view_reports_effective_max_agents_from_cluster_json() {
+        // Issue #12 end-to-end at the fleet layer: worker DESKTOP reports
+        // max_agents 4 via heartbeat, cluster.json overrides the label to
+        // 8 — `machines` must show 8, the cap the scheduler enforces.
+        use cluster_core::protocol::Resources;
+        use cluster_core::registry::{MachineOverride, WorkerStatus};
+
+        let mut machines = BTreeMap::new();
+        machines.insert(
+            "desktop".to_string(),
+            MachineOverride {
+                max_agents: Some(8),
+                kinds_override: None,
+            },
+        );
+        machines.insert(
+            "local".to_string(),
+            MachineOverride {
+                max_agents: Some(6),
+                kinds_override: None,
+            },
+        );
+        let ctx = FleetContext::build(
+            PathBuf::from("/tmp/hc"),
+            ClusterInfo {
+                cluster_id: "c".into(),
+                name: "n".into(),
+                port: 1,
+                protocol_version: 1,
+                created_at: chrono::Utc::now(),
+                machines,
+                keepawake: true,
+            },
+            vec![cluster_core::registry::WorkerEntry {
+                worker_id: "id-desktop".into(),
+                label: "desktop".into(),
+                pubkey: "ab".repeat(32),
+                paired_at: chrono::Utc::now(),
+                last_seen: None,
+                status: WorkerStatus::Offline, // skipped probe; caps still apply
+                resources: Some(Resources {
+                    cpu_cores: 8,
+                    mem_total_mb: 16384,
+                    mem_available_mb: 8192,
+                    agent_count: 2,
+                    max_agents: 4,
+                    load_avg: vec![],
+                    kinds: vec!["claude".into()],
+                }),
+            }],
+        )
+        .unwrap();
+
+        let infos = machines_with_timeout(&ctx, Duration::from_millis(10));
+        let desktop = infos.iter().find(|m| m.label == "desktop").unwrap();
+        // The worker is unreachable in this test (no socket), so its
+        // heartbeat snapshot — including the reported cap of 4 — is
+        // withheld as stale (issue #11). The cluster.json override is
+        // config, not telemetry, so the effective cap still shows: 8.
+        assert_eq!(desktop.max_agents, Some(8));
+        assert!(desktop.resources.is_none());
+        // Local machine: the override is config, not telemetry, so it is
+        // the effective cap whether or not the live probe succeeds.
+        let local = infos.iter().find(|m| m.label == "local").unwrap();
+        assert_eq!(local.max_agents, Some(6));
     }
 
     #[test]
