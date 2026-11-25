@@ -177,8 +177,10 @@ pub fn parse_duration(input: &str) -> Result<Duration, FleetError> {
 }
 
 /// Parse a comma-separated `--until` list (`done,idle,blocked`) into a
-/// normalized (lowercased) status set. Rejects empty tokens and anything
-/// that is not a plain lowercase status token.
+/// normalized (lowercased) status set. Rejects empty tokens, malformed
+/// tokens, and any status outside the upstream [`AgentStatus`] enum —
+/// a typo'd status would otherwise burn the whole timeout and surface
+/// as a misleading "timed out" (issue #20).
 pub fn parse_until(input: &str) -> Result<BTreeSet<String>, FleetError> {
     let invalid = |reason: &str| FleetError::InvalidArgument {
         message: format!("invalid --until value {input:?}: {reason}"),
@@ -194,6 +196,16 @@ pub fn parse_until(input: &str) -> Result<BTreeSet<String>, FleetError> {
             .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
         {
             return Err(invalid(&format!("bad status token {token:?}")));
+        }
+        if AgentStatus::parse(&t).is_none() {
+            let valid = AgentStatus::ALL
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(invalid(&format!(
+                "unknown status {t:?} (expected one of: {valid})"
+            )));
         }
         set.insert(t);
     }
@@ -915,6 +927,9 @@ mod tests {
                 "idle".to_string()
             ]
         );
+        // Every upstream AgentStatus value parses, case-insensitively.
+        let all = parse_until("Idle,WORKING,blocked,Done,Unknown").unwrap();
+        assert_eq!(all.len(), 5);
         assert!(parse_until("done").unwrap().contains("done"));
         for bad in ["", ",", "done,,idle", "do ne", "done!"] {
             assert!(
@@ -922,6 +937,27 @@ mod tests {
                 "expected InvalidArgument for {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_until_rejects_unknown_status_with_valid_list() {
+        // A typo'd status must fail fast at parse time, not burn the
+        // whole timeout (issue #20). The error names the valid values.
+        let e = parse_until("bogus_status").unwrap_err();
+        match e {
+            FleetError::InvalidArgument { message } => {
+                assert!(message.contains("bogus_status"), "{message}");
+                for valid in ["idle", "working", "blocked", "done", "unknown"] {
+                    assert!(message.contains(valid), "{message}");
+                }
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        // Unknown tokens are rejected even in a mixed valid list.
+        assert!(matches!(
+            parse_until("done,pause"),
+            Err(FleetError::InvalidArgument { .. })
+        ));
     }
 
     #[test]

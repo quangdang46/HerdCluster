@@ -50,6 +50,16 @@ pub enum AgentStatus {
 }
 
 impl AgentStatus {
+    /// Every status in the upstream enum, for error messages and
+    /// validation that need to enumerate the valid vocabulary.
+    pub const ALL: [AgentStatus; 5] = [
+        AgentStatus::Idle,
+        AgentStatus::Working,
+        AgentStatus::Blocked,
+        AgentStatus::Done,
+        AgentStatus::Unknown,
+    ];
+
     /// Parse a lowercase status string (`"idle"`, `"working"`, ...).
     ///
     /// Returns `None` for anything outside the upstream enum — callers
