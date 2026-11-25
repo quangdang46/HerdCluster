@@ -15,7 +15,12 @@
 //!    the bootstrap secret — it comes from the `HERDCLUSTER_PAIRING_CODE`
 //!    env var or an interactive prompt (see [`ENV_PAIRING_CODE`]).
 //! 4. On approval, decode the [`WorkerCredential`] carried inside
-//!    `PairAccept.credential`, persist it via
+//!    `PairAccept.credential` and run the CA-fingerprint TOFU check
+//!    (issue #40): interactive joins show the fingerprint and require
+//!    the operator to confirm it matches the controller's display;
+//!    `--yes`/`--json` joins warn and expose it for out-of-band
+//!    comparison instead.
+//! 5. Persist the credential via
 //!    [`cluster_net::conn::save_worker_credential`] (0600), and record
 //!    pairing metadata in `<state_dir>/worker.json`.
 //!
@@ -116,9 +121,18 @@ pub enum JoinOutcome {
         /// Controller's advertised cluster name, or `"herdcluster"` when
         /// the candidate didn't advertise one.
         cluster_name: String,
+        /// Pinned cluster CA fingerprint from `PairAccept` (issue #40).
+        /// Interactive joins confirmed it matches the controller's
+        /// display; `--yes`/`--json` joins did not — automation should
+        /// compare this value out-of-band.
+        ca_fingerprint: String,
     },
     /// The user declined at an interactive prompt.
     Declined,
+    /// The user declined the CA-fingerprint verification prompt
+    /// (issue #40): the join aborted BEFORE any credential was
+    /// persisted, so the machine can safely re-join.
+    FingerprintDeclined,
     /// The controller rejected the pairing (`PairReject`).
     Rejected {
         /// Controller-supplied reason.
@@ -212,6 +226,39 @@ pub async fn join_in_state_dir(
         }
     };
 
+    // CA fingerprint TOFU check (issue #40). The pairing exchange runs
+    // over PLAIN TCP with no server authentication, so an on-path
+    // attacker on a hostile LAN could race a forged `PairAccept`
+    // carrying attacker CA material — the worker would then pin the
+    // attacker's CA and every later TLS session would be MITM-able.
+    // Human verification of the fingerprint (the controller prints it
+    // next to the pairing code) is the mitigation.
+    //
+    // RESIDUAL RISK: this only helps if the operator actually compares
+    // the two displayed strings — a reflexive "y" re-opens the hole.
+    // Non-interactive joins (`--yes`/`--json`) skip the prompt entirely
+    // and only warn; `--json` callers must compare `ca_fingerprint` in
+    // the output themselves.
+    match fingerprint_check(&cfg) {
+        FingerprintCheck::Prompt => {
+            println!(
+                "  controller CA fingerprint: {}",
+                fingerprint_display(&credential.ca_fingerprint)
+            );
+            if !confirm_fingerprint()? {
+                eprintln!("CA fingerprint not verified — join aborted; nothing was saved");
+                return Ok(JoinOutcome::FingerprintDeclined);
+            }
+        }
+        FingerprintCheck::WarnUnverified => {
+            eprintln!(
+                "warning: controller CA fingerprint {} was NOT verified \
+                 (non-interactive join); compare it with the controller's display",
+                fingerprint_display(&credential.ca_fingerprint)
+            );
+        }
+    }
+
     // Persist worker.json BEFORE the credential: if the second write
     // fails, the leftover worker.json is harmless — `join` only refuses
     // when both files exist, and `worker` reports NotPaired until a
@@ -236,17 +283,71 @@ pub async fn join_in_state_dir(
             cluster_name.as_deref().unwrap_or("herdcluster")
         );
         println!("  controller: {addr}");
+        println!(
+            "  controller CA fingerprint: {}",
+            fingerprint_display(&credential.ca_fingerprint)
+        );
         println!("Next: run `herdcluster worker` to start the worker daemon.");
     }
 
     Ok(JoinOutcome::Paired {
         worker_label: label,
         cluster_name: cluster_name.unwrap_or_else(|| "herdcluster".to_string()),
+        ca_fingerprint: credential.ca_fingerprint,
     })
 }
 
 fn interactive(cfg: &JoinConfig) -> bool {
     !(cfg.yes || cfg.json)
+}
+
+// ---- CA fingerprint TOFU check (issue #40) ----
+
+/// How the CA fingerprint check runs after `PairAccept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FingerprintCheck {
+    /// Interactive join: display the fingerprint and require the user
+    /// to confirm it matches the controller's output before anything is
+    /// persisted.
+    Prompt,
+    /// Non-interactive (`--yes`/`--json`): no human to compare — warn on
+    /// stderr; `--json` callers get `ca_fingerprint` in the JSON output
+    /// for out-of-band verification.
+    WarnUnverified,
+}
+
+/// Pick the fingerprint-check mode from the join flags.
+fn fingerprint_check(cfg: &JoinConfig) -> FingerprintCheck {
+    if interactive(cfg) {
+        FingerprintCheck::Prompt
+    } else {
+        FingerprintCheck::WarnUnverified
+    }
+}
+
+/// Human-display form of a CA fingerprint: the lowercase-hex value
+/// grouped into 4-char chunks (`0123 4567 89ab cdef`) so the worker's
+/// string and the controller's string are easy to compare visually.
+/// Anything not a multiple of 4 chars keeps its tail ungrouped.
+fn fingerprint_display(fp: &str) -> String {
+    let mut out = String::with_capacity(fp.len() + fp.len() / 4);
+    for (i, ch) in fp.chars().enumerate() {
+        if i > 0 && i % 4 == 0 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Ask the user to confirm the displayed CA fingerprint matches the
+/// controller's. `Ok(false)` on decline/EOF/non-TTY — the caller must
+/// abort the join WITHOUT persisting the credential.
+fn confirm_fingerprint() -> Result<bool, JoinError> {
+    Ok(crate::join_ux::confirm(
+        "Does this match the fingerprint shown on the controller? [y/N]",
+        false,
+    ))
 }
 
 /// Resolve which controller to pair with: manual hint > single discovery
@@ -1230,5 +1331,51 @@ mod tests {
     fn join_config_defaults() {
         let cfg = JoinConfig::default();
         assert!(cfg.controller.is_none() && !cfg.yes && !cfg.json);
+    }
+
+    // ---- CA fingerprint TOFU check (issue #40) ----
+
+    #[test]
+    fn fingerprint_display_groups_hex() {
+        assert_eq!(
+            fingerprint_display("0123456789abcdef"),
+            "0123 4567 89ab cdef"
+        );
+        // Short / odd-length values still render sanely.
+        assert_eq!(fingerprint_display("abc"), "abc");
+        assert_eq!(fingerprint_display("abcde"), "abcd e");
+        assert_eq!(fingerprint_display(""), "");
+    }
+
+    #[test]
+    fn fingerprint_check_mode_follows_interactivity() {
+        // Default (interactive) → prompt.
+        assert_eq!(
+            fingerprint_check(&JoinConfig::default()),
+            FingerprintCheck::Prompt
+        );
+        // --yes and --json are both non-interactive → warn only.
+        assert_eq!(
+            fingerprint_check(&JoinConfig {
+                yes: true,
+                ..Default::default()
+            }),
+            FingerprintCheck::WarnUnverified
+        );
+        assert_eq!(
+            fingerprint_check(&JoinConfig {
+                json: true,
+                ..Default::default()
+            }),
+            FingerprintCheck::WarnUnverified
+        );
+        assert_eq!(
+            fingerprint_check(&JoinConfig {
+                yes: true,
+                json: true,
+                ..Default::default()
+            }),
+            FingerprintCheck::WarnUnverified
+        );
     }
 }

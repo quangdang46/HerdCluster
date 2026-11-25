@@ -52,8 +52,12 @@ herdcluster join --controller <MAC_LAN_IP>:47820
 # enter the pairing code when prompted (or: HERDCLUSTER_PAIRING_CODE=XXXX herdcluster join ...)
 ```
 
-`join` will: pair → store credential → install/reuse herdr → start the
-worker daemon (daemon keeps running; Ctrl-C stops it).
+`join` will: pair → show the controller CA fingerprint and ask you to
+confirm it matches the `controller CA fingerprint:` line printed by
+`herdcluster init` on the Mac (issue #40 TOFU check — compare them
+carefully; with `--yes`/`--json` this prompt is skipped and only a
+stderr warning is printed) → store credential → install/reuse herdr →
+start the worker daemon (daemon keeps running; Ctrl-C stops it).
 
 For persistence across WSL reboots:
 

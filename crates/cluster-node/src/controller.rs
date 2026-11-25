@@ -297,7 +297,7 @@ impl PairingShared {
     fn ensure_live(&self) {
         let mut g = self.inner.lock().unwrap();
         if g.server.phase().is_terminal() {
-            rotate_locked(&mut g, &self.code_slot);
+            rotate_locked(&mut g, &self.code_slot, &self.ca_fingerprint);
         }
     }
 
@@ -305,7 +305,7 @@ impl PairingShared {
     fn with_server<R>(&self, f: impl FnOnce(&mut PairingServer<SystemClock>) -> R) -> R {
         let mut g = self.inner.lock().unwrap();
         if g.server.phase().is_terminal() {
-            rotate_locked(&mut g, &self.code_slot);
+            rotate_locked(&mut g, &self.code_slot, &self.ca_fingerprint);
         }
         f(&mut g.server)
     }
@@ -317,14 +317,19 @@ impl PairingShared {
         if g.server.phase() == PairingPhase::AwaitingJoin
             && g.started.elapsed() > Duration::from_millis(PAIRING_TTL_MS + 5_000)
         {
-            rotate_locked(&mut g, &self.code_slot);
+            rotate_locked(&mut g, &self.code_slot, &self.ca_fingerprint);
         }
     }
 }
 
 /// Replace the FSM inside `g` with a fresh session and publish the new
 /// code to the slot + stdout. Caller holds the mutex.
-fn rotate_locked(g: &mut PairingInner, code_slot: &Arc<Mutex<String>>) {
+///
+/// The cluster CA fingerprint is printed alongside every new code: the
+/// worker side (issue #40) asks the operator to verify it before
+/// persisting the credential, so it must stay visible for the whole
+/// pairing window, not just at startup.
+fn rotate_locked(g: &mut PairingInner, code_slot: &Arc<Mutex<String>>, ca_fingerprint: &str) {
     let mut rng = rand_core::OsRng;
     g.server = PairingServer::start(SystemClock, &mut rng);
     g.started = std::time::Instant::now();
@@ -332,6 +337,7 @@ fn rotate_locked(g: &mut PairingInner, code_slot: &Arc<Mutex<String>>) {
     *code_slot.lock().unwrap() = code.clone();
     println!("new pairing code: {code}");
     println!("pair with: herdcluster join --code {code}");
+    println!("controller CA fingerprint: {ca_fingerprint}");
 }
 
 // ---- ControllerHandle ----
@@ -580,6 +586,11 @@ impl ControllerHandle {
             "to pair a worker now, run `herdcluster join --code {}`",
             code_slot.lock().unwrap().clone()
         );
+        // Issue #40 TOFU check: the worker asks its operator to compare
+        // this fingerprint against the one in PairAccept before saving
+        // the credential. Keep it on its own line, unadorned, so the
+        // two displays diff cleanly by eye.
+        println!("controller CA fingerprint: {}", pairing.ca_fingerprint);
 
         Ok(Self {
             inner: Arc::new(Inner {
