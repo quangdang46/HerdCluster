@@ -639,6 +639,18 @@ fn classify_stream_event(event: &Value, pane_id: &str) -> StreamEvent {
     }
 }
 
+/// True when a mid-stream `next_event` error is transient like a clean
+/// EOF: transport failures ([`ApiError::Io`], e.g. a worker bridge
+/// reconnect resetting the socket) and malformed lines
+/// ([`ApiError::Json`] — the bad line is already consumed, so a fresh
+/// subscribe gets a clean stream). Both resubscribe via the outer loop
+/// instead of killing `agent watch` (issue #62).
+/// [`ApiError::Timeout`] is a read tick, not an error — handled by the
+/// caller before this check.
+fn is_recoverable_stream_error(e: &ApiError) -> bool {
+    matches!(e, ApiError::Io(_) | ApiError::Json(_))
+}
+
 /// `agent watch` via `events.subscribe`: resolve the agent's pane, then
 /// stream `pane.agent_status_changed` (pane-filtered server-side) plus
 /// global `pane.exited`/`pane.closed` (filtered client-side) for
@@ -648,9 +660,12 @@ fn classify_stream_event(event: &Value, pane_id: &str) -> StreamEvent {
 /// `Ok(None)` when the endpoint can't stream (caller falls back to
 /// [`agent_poll`] — nothing has been emitted yet at that point, so the
 /// fallback doesn't duplicate events), `Err` on real mid-stream
-/// failures. A clean EOF (server/bridge closed the stream) triggers
-/// resubscribe with a fresh `agent.get`, which also re-resolves the pane
-/// if the agent moved.
+/// failures. A clean EOF (server/bridge closed the stream) or a
+/// recoverable mid-stream error ([`is_recoverable_stream_error`])
+/// triggers resubscribe with a fresh `agent.get`, which also
+/// re-resolves the pane if the agent moved. Once events have been
+/// emitted, errors never fall back to polling — that would duplicate
+/// events.
 ///
 /// Known limitation: while a stream is live the pane is not re-resolved;
 /// an agent that moves panes mid-watch stops producing events until the
@@ -670,6 +685,12 @@ fn agent_watch_stream(
     let mut emitted_initial = false;
     let mut subscribe_failures = 0u32;
     let mut resolve_failures = 0u32;
+    // Consecutive mid-stream transport/parse errors. Unlike
+    // subscribe/resolve failures this can't share their counters —
+    // both reset on each successful round-trip, so a stream that
+    // keeps dying after a healthy subscribe would retry forever.
+    // Resets once a stream proves healthy by yielding an event.
+    let mut stream_failures = 0u32;
 
     loop {
         // (Re)resolve the agent: fresh pane_id + baseline status. On
@@ -780,14 +801,27 @@ fn agent_watch_stream(
             }));
         }
 
-        // Read events until EOF (resubscribe), a fatal error, or a
-        // terminal status / gone.
+        // Read events until EOF or a fatal error (both resubscribe via
+        // the outer loop when recoverable), a terminal status, or gone.
         loop {
             let event = match stream.next_event() {
-                Ok(Some(v)) => Some(v),
+                Ok(Some(v)) => {
+                    stream_failures = 0;
+                    Some(v)
+                }
                 Ok(None) => break, // EOF → outer loop resubscribes
                 // Read tick: no event within STREAM_TICK.
                 Err(ApiError::Timeout) => None,
+                // Recoverable mid-stream failure (transport drop, bad
+                // line) — resubscribe like EOF, bounded so a persistently
+                // broken endpoint still surfaces a real error.
+                Err(e) if is_recoverable_stream_error(&e) => {
+                    stream_failures += 1;
+                    if stream_failures > MAX_STREAM_RETRIES {
+                        return Err(ops::op_error(&resolved, e));
+                    }
+                    break;
+                }
                 Err(e) => return Err(ops::op_error(&resolved, e)),
             };
             if let Some(v) = event {
@@ -1282,5 +1316,19 @@ mod tests {
             classify_stream_event(&ev, pane),
             StreamEvent::Ignore
         ));
+    }
+
+    #[test]
+    fn recoverable_stream_error_classification() {
+        // Io (bridge/socket drop) and Json (malformed line) resubscribe.
+        assert!(is_recoverable_stream_error(&ApiError::Io(
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset")
+        )));
+        assert!(is_recoverable_stream_error(&ApiError::Json(
+            serde_json::from_str::<Value>("{").unwrap_err()
+        )));
+        // Timeout is a read tick, server errors are real failures.
+        assert!(!is_recoverable_stream_error(&ApiError::Timeout));
+        assert!(!is_recoverable_stream_error(&server_err("internal")));
     }
 }
