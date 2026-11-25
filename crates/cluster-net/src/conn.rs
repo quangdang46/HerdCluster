@@ -43,7 +43,8 @@
 //! `server_auth` → `WorkerHello` (validated: pubkey must match the
 //! authenticated key, `protocol_version` must match) → session
 //! registration → `ControllerEvent::WorkerConnected`. A watcher removes
-//! the session and emits `WorkerDisconnected` when the connection dies.
+//! the session and emits `WorkerDisconnected` (tagged with the dead
+//! [`Session`]) when the connection dies.
 //! Per-session heartbeats keep workers' liveness checks fed; disable with
 //! [`Controller::disable_heartbeats`] (tests only).
 
@@ -718,7 +719,6 @@ impl std::fmt::Debug for WorkerSession {
 }
 
 /// Controller-side events.
-#[derive(Debug)]
 pub enum ControllerEvent {
     /// A worker completed auth + `WorkerHello` and registered.
     WorkerConnected(WorkerSession),
@@ -726,7 +726,50 @@ pub enum ControllerEvent {
     WorkerDisconnected {
         /// The worker's pubkey.
         worker_pubkey: [u8; 32],
+        /// The exact session that ended. After a fast reconnect this can
+        /// be a *stale* session already replaced in the session map —
+        /// consumers must compare it (e.g. `Arc::ptr_eq`) against the
+        /// session a bridge was built from before tearing anything down.
+        session: Arc<Session>,
     },
+}
+
+impl std::fmt::Debug for ControllerEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkerConnected(ws) => {
+                f.debug_tuple("WorkerConnected").field(ws).finish()
+            }
+            Self::WorkerDisconnected {
+                worker_pubkey,
+                session,
+            } => f
+                .debug_struct("WorkerDisconnected")
+                .field("worker_pubkey", worker_pubkey)
+                .field("session_alive", &session.is_alive())
+                .finish(),
+        }
+    }
+}
+
+/// Upper bound on delivering one [`ControllerEvent`]. `send().await`
+/// applies backpressure instead of the old `try_send`, which silently
+/// dropped connect/disconnect events on a full queue (leaving a
+/// registered worker with no bridge); the timeout only guards a wedged
+/// consumer.
+const EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Deliver a controller event with a bounded wait. A closed channel
+/// (controller shutting down) or a consumer stalled past
+/// [`EVENT_SEND_TIMEOUT`] drops the event — logged, never silent.
+async fn send_controller_event(tx: &mpsc::Sender<ControllerEvent>, event: ControllerEvent) {
+    match timeout(EVENT_SEND_TIMEOUT, tx.send(event)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => tracing::debug!("controller event channel closed; event dropped"),
+        Err(_) => tracing::warn!(
+            "controller event queue did not drain within {EVENT_SEND_TIMEOUT:?}; event dropped"
+        ),
+    }
 }
 
 /// The controller endpoint: TLS listener + session registry.
@@ -908,7 +951,7 @@ impl Controller {
                 old.close();
             }
         }
-        let _ = self.event_tx.try_send(ControllerEvent::WorkerConnected(ws));
+        send_controller_event(&self.event_tx, ControllerEvent::WorkerConnected(ws)).await;
 
         // Watcher: on conn death, unregister + emit disconnect.
         let sessions = self.sessions.clone();
@@ -916,20 +959,29 @@ impl Controller {
         let watcher_session = session.clone();
         tokio::spawn(async move {
             watcher_session.wait_closed().await;
-            let mut map = sessions.lock().unwrap();
-            // Only remove if it's still *our* session (a reconnect may have
-            // already replaced it).
-            if map
-                .get(&worker_pub)
-                .map(|s| Arc::ptr_eq(s, &watcher_session))
-                .unwrap_or(false)
             {
-                map.remove(&worker_pub);
+                let mut map = sessions.lock().unwrap();
+                // Only remove if it's still *our* session (a reconnect may
+                // have already replaced it).
+                if map
+                    .get(&worker_pub)
+                    .map(|s| Arc::ptr_eq(s, &watcher_session))
+                    .unwrap_or(false)
+                {
+                    map.remove(&worker_pub);
+                }
             }
-            drop(map);
-            let _ = event_tx.try_send(ControllerEvent::WorkerDisconnected {
-                worker_pubkey: worker_pub,
-            });
+            // Tag the event with *this* session: after a fast reconnect
+            // the map entry may already belong to a newer session, and
+            // consumers must not tear down resources built from it.
+            send_controller_event(
+                &event_tx,
+                ControllerEvent::WorkerDisconnected {
+                    worker_pubkey: worker_pub,
+                    session: watcher_session.clone(),
+                },
+            )
+            .await;
         });
 
         // Block until the session dies; the watcher owns cleanup.
