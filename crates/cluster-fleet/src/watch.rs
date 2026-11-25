@@ -304,6 +304,7 @@ pub fn agent_poll(
     let mut fetch = || -> Result<Value, FleetError> {
         client
             .agent_get(&target)
+            .map(|v| crate::fleet::normalize_agent_get(&v, &target))
             .map_err(|e| ops::op_error(&resolved, e))
     };
     poll_until(&mut fetch, until, tuning, emit)
@@ -642,7 +643,7 @@ fn agent_watch_stream(
         let info = match client.agent_get(&target) {
             Ok(v) => {
                 resolve_failures = 0;
-                v
+                crate::fleet::normalize_agent_get(&v, &target)
             }
             Err(e) => {
                 if let ApiError::Server { code, .. } = &e {
