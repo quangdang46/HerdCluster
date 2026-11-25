@@ -221,9 +221,12 @@ pub fn consume_marker(state_dir: &Path, worker_id: &str) -> std::io::Result<()> 
     }
 }
 
-/// Delete files under `<state_dir>/credentials/` that look like they
-/// belong to `entry` (name contains worker_id, label, or pubkey prefix).
-/// Returns true when at least one file was removed.
+/// Delete files under `<state_dir>/credentials/` that provably belong to
+/// `entry`. Returns true when at least one file was removed.
+///
+/// Matching is exact-or-delimited, never bare substring (issue #42): a
+/// worker labeled `w`/`mac`/`pc` must not claim every file in the
+/// directory. See [`credential_filename_matches`].
 fn remove_worker_credentials(state_dir: &Path, entry: &registry::WorkerEntry) -> bool {
     let dir = state_dir.join("credentials");
     let Ok(read) = std::fs::read_dir(&dir) else {
@@ -232,15 +235,45 @@ fn remove_worker_credentials(state_dir: &Path, entry: &registry::WorkerEntry) ->
     let mut removed = false;
     for item in read.flatten() {
         let name = item.file_name().to_string_lossy().to_string();
-        let matches = name.contains(&entry.worker_id)
-            || name.contains(&entry.label)
-            || (!entry.pubkey.is_empty()
-                && name.contains(&entry.pubkey[..8.min(entry.pubkey.len())]));
-        if matches && std::fs::remove_file(item.path()).is_ok() {
+        if credential_filename_matches(&name, entry) && std::fs::remove_file(item.path()).is_ok() {
             removed = true;
         }
     }
     removed
+}
+
+/// True when credential filename `name` refers to `entry`.
+///
+/// The reserved `credentials/` layout names files after the worker id,
+/// label, or pubkey. We accept:
+///
+/// * the exact stem (`{worker_id}`, `{label}`, `{pubkey}`, each with an
+///   optional `.json` suffix), and
+/// * `{worker_id}-…` / `{worker_id}.…` and `{pubkey}-…` / `{pubkey}.…`
+///   — `worker_id` and `pubkey` are unique generated strings, so a
+///   delimiter-bounded prefix can only belong to this worker.
+///
+/// The user-chosen `label` gets **exact-stem matching only**: labels can
+/// prefix each other (`w` vs `w-x`), so `{label}-…` filenames are
+/// ambiguous and deliberately left behind rather than risking another
+/// worker's credentials (false negatives are harmless — the directory
+/// is currently unused by pairing).
+fn credential_filename_matches(name: &str, entry: &registry::WorkerEntry) -> bool {
+    let stem = name.strip_suffix(".json").unwrap_or(name);
+    stem == entry.worker_id
+        || (!entry.label.is_empty() && stem == entry.label)
+        || (!entry.pubkey.is_empty()
+            && (stem == entry.pubkey || delimited_prefix(stem, &entry.pubkey)))
+        || delimited_prefix(stem, &entry.worker_id)
+}
+
+/// `stem` starts with `id` followed by a `-` or `.` delimiter — e.g.
+/// `w1-issued` for id `w1`, but never `w10-issued` or `w1x`.
+fn delimited_prefix(stem: &str, id: &str) -> bool {
+    !id.is_empty()
+        && stem
+            .strip_prefix(id)
+            .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.'))
 }
 
 fn unix_now() -> u64 {
@@ -345,6 +378,84 @@ mod tests {
         assert!(!creds.join("w1-issued.json").exists());
         assert!(creds.join("other.json").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revoke_short_label_does_not_delete_other_workers_credentials() {
+        // Issue #42: a worker labeled `w` must not substring-match every
+        // file in credentials/ — only files provably belonging to the
+        // revoked worker are removed.
+        let dir = tmpdir("creds-label");
+        seed_registry(
+            &dir,
+            vec![
+                entry("w1", "w", &"ab".repeat(32)),
+                entry("w2", "worker-b", &"cd".repeat(32)),
+            ],
+        );
+        let creds = dir.join("credentials");
+        std::fs::create_dir_all(&creds).unwrap();
+        // Revoked worker's own files (worker_id-derived names).
+        std::fs::write(creds.join("w1-issued.json"), b"{}").unwrap();
+        std::fs::write(creds.join("w1.json"), b"{}").unwrap();
+        // Other workers' files — all must survive.
+        std::fs::write(creds.join("w2-issued.json"), b"{}").unwrap();
+        std::fs::write(creds.join("worker-b.json"), b"{}").unwrap();
+        std::fs::write(creds.join("w10-backup.json"), b"{}").unwrap();
+        std::fs::write(creds.join("cdcdcdcd-worker-b.json"), b"{}").unwrap();
+        std::fs::write(creds.join("w-issued.json"), b"{}").unwrap();
+
+        let outcome = revoke_worker_in_state_dir("w", &dir).unwrap();
+        assert!(outcome.removed_credential);
+        assert!(!creds.join("w1-issued.json").exists());
+        assert!(!creds.join("w1.json").exists());
+        for survivor in [
+            "w2-issued.json",
+            "worker-b.json",
+            "w10-backup.json",
+            "cdcdcdcd-worker-b.json",
+            // Ambiguous label-prefix name: could belong to `w` or `w-x`;
+            // deliberately kept rather than risk deleting another worker's
+            // credentials.
+            "w-issued.json",
+        ] {
+            assert!(creds.join(survivor).exists(), "{survivor} must survive");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_filename_matching_is_exact_or_delimited() {
+        let w = entry("w1", "desktop", &"ab".repeat(32));
+        // Exact stems (with/without .json).
+        assert!(credential_filename_matches("w1", &w));
+        assert!(credential_filename_matches("w1.json", &w));
+        assert!(credential_filename_matches("desktop", &w));
+        assert!(credential_filename_matches("desktop.json", &w));
+        assert!(credential_filename_matches(&"ab".repeat(32), &w));
+        // Delimited worker_id/pubkey prefixes.
+        assert!(credential_filename_matches("w1-issued.json", &w));
+        assert!(credential_filename_matches("w1.backup", &w));
+        assert!(credential_filename_matches(
+            &format!("{}-issued.json", "ab".repeat(32)),
+            &w
+        ));
+        // Substring / prefix-without-delimiter must NOT match.
+        for bad in [
+            "w10-issued.json",     // worker_id prefix collision
+            "w1x.json",            // no delimiter after id
+            "aw1.json",            // id not at start
+            "my-w1-file.json",     // id embedded mid-name
+            "desktop-win.json",    // label prefix is ambiguous
+            "desktop-issued.json", // ditto
+            "abababab-x.json",     // 8-char pubkey prefix is not enough
+            "other.json",
+        ] {
+            assert!(
+                !credential_filename_matches(bad, &w),
+                "{bad} must not match"
+            );
+        }
     }
 
     #[test]

@@ -411,9 +411,9 @@ fn classify_wait_error(
     last_status: Option<String>,
 ) -> Result<Option<PollResult>, FleetError> {
     if let ApiError::Server { code, .. } = &e {
-        // Order matters: unsupported checks run before the not-found
-        // predicate because codes like `unknown_method` contain
-        // "unknown", which the not-found family also matches.
+        // Unsupported checks run before the not-found allowlist so
+        // `unknown_method`/`method_not_found` fall back to polling
+        // instead of surfacing as errors (issue #42).
         if is_unsupported_wait_code(code) {
             return Ok(None);
         }
