@@ -148,21 +148,72 @@ fn bind_bridge_socket(
     Ok((listener, socket_path))
 }
 
+/// First retry delay after a transient `accept()` failure; doubled per
+/// consecutive failure up to [`ACCEPT_RETRY_BACKOFF_MAX`].
+const ACCEPT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Cap for the accept-retry backoff.
+const ACCEPT_RETRY_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Whether an `accept()` error is transient and the loop should retry
+/// rather than exit. `accept(2)` fails spuriously under fd pressure
+/// (EMFILE/ENFILE), kernel buffer exhaustion (ENOBUFS/ENOMEM), or when a
+/// client connects then resets before the accept completes
+/// (ECONNABORTED); none of these mean the listener is dead.
+fn is_retryable_accept_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionAborted | ErrorKind::Interrupted | ErrorKind::WouldBlock => true,
+        // std has no stable ErrorKind for fd/buffer exhaustion, so match
+        // the raw errno (unix-only crate).
+        _ => matches!(
+            e.raw_os_error(),
+            Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
+        ),
+    }
+}
+
 /// Accept loop: one spawned pipe task per local connection. Exits on
-/// shutdown signal or listener failure.
+/// shutdown signal or a *fatal* listener error; transient `accept()`
+/// failures (fd pressure, aborted connects) are retried with backoff so
+/// the bridge does not die silently while its socket file remains.
 async fn accept_loop(
     listener: UnixListener,
     session: Arc<Session>,
     idle_timeout: Duration,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let mut consecutive_errors: u32 = 0;
     loop {
-        let (sock, _addr) = tokio::select! {
+        let accepted = tokio::select! {
             _ = shutdown_rx.changed() => break,
-            res = listener.accept() => match res {
-                Ok(v) => v,
-                Err(_) => break,
-            },
+            res = listener.accept() => res,
+        };
+        let (sock, _addr) = match accepted {
+            Ok(v) => {
+                consecutive_errors = 0;
+                v
+            }
+            Err(e) if is_retryable_accept_error(&e) => {
+                consecutive_errors += 1;
+                // Log the first failure and then every 100th — a persistently
+                // exhausted fd table must not spam the log every 50ms.
+                if consecutive_errors == 1 || consecutive_errors.is_multiple_of(100) {
+                    tracing::warn!(
+                        "bridge accept transient error #{consecutive_errors}: {e}; retrying"
+                    );
+                }
+                // Exponential backoff, capped: 50ms → 1s.
+                let backoff = ACCEPT_RETRY_BACKOFF
+                    .saturating_mul(1u32 << consecutive_errors.min(5))
+                    .min(ACCEPT_RETRY_BACKOFF_MAX);
+                tokio::time::sleep(backoff).await;
+                continue;
+            }
+            Err(e) => {
+                tracing::error!("bridge accept loop exiting on fatal listener error: {e}");
+                break;
+            }
         };
 
         let session = session.clone();
@@ -190,4 +241,41 @@ async fn accept_loop(
         });
     }
     // Listener drops here → socket closed; shutdown() removes the file.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #68: transient accept() failures must be retried, fatal ones fatal.
+    #[test]
+    fn accept_error_classification() {
+        use std::io::ErrorKind;
+
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::Interrupted,
+            ErrorKind::WouldBlock,
+        ] {
+            assert!(
+                is_retryable_accept_error(&std::io::Error::new(kind, "x")),
+                "{kind:?} should be retryable"
+            );
+        }
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+            assert!(
+                is_retryable_accept_error(&std::io::Error::from_raw_os_error(errno)),
+                "errno {errno} should be retryable"
+            );
+        }
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::AddrInUse,
+            ErrorKind::InvalidInput,
+            ErrorKind::ConnectionRefused,
+        ] {
+            let e = std::io::Error::new(kind, "x");
+            assert!(!is_retryable_accept_error(&e), "{kind:?} should be fatal");
+        }
+    }
 }

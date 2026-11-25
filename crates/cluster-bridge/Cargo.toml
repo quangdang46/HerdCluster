@@ -14,6 +14,7 @@ cluster-net.workspace = true
 api-client.workspace = true
 bytes = "1"
 thiserror = "2"
+tracing = "0.1"
 tokio = { version = "1.54", features = [
     "rt-multi-thread",
     "macros",
@@ -22,6 +23,9 @@ tokio = { version = "1.54", features = [
     "sync",
     "io-util",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

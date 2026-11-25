@@ -68,6 +68,42 @@ impl PipeActivity {
     }
 }
 
+/// Wait for an outbound write (`send()` / `write_all()`) under the shared
+/// idle deadline. The write future is polled to completion while:
+///
+/// - activity in *either* pipe direction re-arms the deadline (same rule
+///   as the read side — a legitimately slow drain keeps the pipe alive),
+/// - `idle` elapses with no bytes moving anywhere → `Err(())`, and the
+///   caller takes the same abort path as a stalled reader.
+///
+/// `fut` must be cancel-safe to re-poll: it is the *same* pinned future
+/// across wakeups, so a partially-written `write_all` resumes rather
+/// than restarting, and `StreamHandle::send` only mutates state once it
+/// returns `Ok`.
+async fn await_outbound<F, T>(
+    activity: &PipeActivity,
+    act_rx: &mut watch::Receiver<u64>,
+    idle: Duration,
+    fut: &mut std::pin::Pin<&mut F>,
+) -> Result<T, ()>
+where
+    F: std::future::Future<Output = T>,
+{
+    loop {
+        tokio::select! {
+            r = fut.as_mut() => return Ok(r),
+            r = act_rx.changed() => match r {
+                // Opposite direction moved bytes: re-arm the deadline.
+                Ok(()) => continue,
+                // Sender drop is unreachable while a direction task holds
+                // an `Arc` clone; treat it as idle like the read side.
+                Err(_) => return Err(()),
+            },
+            _ = tokio::time::sleep(activity.remaining(idle)) => return Err(()),
+        }
+    }
+}
+
 /// Pipe bytes both ways between `sock` and `stream` until both directions
 /// finish, an error occurs, or `idle` elapses with no bytes moving in
 /// either direction.
@@ -84,11 +120,12 @@ impl PipeActivity {
 ///   a best-effort socket write shutdown, so the surviving side always sees
 ///   a clean EOF rather than a hang.
 ///
-/// Outbound `send()`/`write_all()` calls are deliberately *not* wrapped in
-/// the idle timeout: a blocked write is legitimate TCP/mux backpressure,
-/// not abandonment. Each direction waits on its inbound read/recv plus the
-/// shared [`PipeActivity`] deadline, so progress in *either* direction
-/// keeps the pipe alive.
+/// Outbound `send()`/`write_all()` calls are bounded by the *same* shared
+/// [`PipeActivity`] deadline as the reads ([`await_outbound`]): a peer
+/// that stops draining can no longer pin the task forever. Activity in
+/// either direction re-arms the timer, so backpressure on a large
+/// transfer is not mistaken for abandonment — only a fully silent pipe
+/// for `idle` trips the abort path.
 pub(crate) async fn pipe_unix_stream(sock: UnixStream, stream: StreamHandle, idle: Duration) {
     let (mut sock_rd, mut sock_wr) = tokio::io::split(sock);
     let send_end = stream.clone();
@@ -138,12 +175,17 @@ pub(crate) async fn pipe_unix_stream(sock: UnixStream, stream: StreamHandle, idl
                     break;
                 }
             };
-            if send_end
-                .send(Bytes::copy_from_slice(&buf[..n]))
-                .await
-                .is_err()
-            {
-                break;
+            // Bounded by the shared idle deadline: a worker that stops
+            // draining the mux stream trips the same abort path as a
+            // stalled reader instead of pinning this task forever.
+            let mut send_fut = std::pin::pin!(send_end.send(Bytes::copy_from_slice(&buf[..n])));
+            match await_outbound(&to_stream_activity, &mut act_rx, idle, &mut send_fut).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => break,
+                Err(()) => {
+                    send_end.abort();
+                    break;
+                }
             }
         }
         // Idempotent: no-op if we already aborted or FIN was sent.
@@ -179,8 +221,19 @@ pub(crate) async fn pipe_unix_stream(sock: UnixStream, stream: StreamHandle, idl
                 }
                 Step::Recv(Ok(Some(chunk))) => {
                     activity.touch();
-                    if sock_wr.write_all(&chunk).await.is_err() {
-                        break;
+                    // Same shared idle deadline as the read side: a local
+                    // peer that stops reading the socket must not pin the
+                    // pipe forever. The pinned future resumes partial
+                    // writes, so re-polling on activity wakeups is safe.
+                    let mut wr_fut = std::pin::pin!(sock_wr.write_all(&chunk));
+                    match await_outbound(&activity, &mut act_rx, idle, &mut wr_fut).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => break,
+                        Err(()) => {
+                            stream.abort();
+                            let _ = sock_wr.shutdown().await;
+                            break;
+                        }
                     }
                 }
                 // Remote FIN: propagate EOF to the local peer's reader.
@@ -267,5 +320,73 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// Regression test for #69: when *both* directions' outbound writes
+    /// stall — the remote peer stops draining the mux stream and the
+    /// local client stops reading the socket — the shared idle deadline
+    /// must still reap the pipe. Previously the unbounded
+    /// `send()`/`write_all()` awaits pinned both tasks forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_outbound_writes_are_reaped_by_idle_timeout() {
+        let idle = Duration::from_millis(200);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = UnixStream::connect(&path).await.unwrap();
+        let (sock, _) = listener.accept().await.unwrap();
+
+        let (a, b) = duplex(1 << 20);
+        let dialer = Mux::new(a, MuxRole::Dialer);
+        let acceptor = Mux::new(b, MuxRole::Acceptor);
+        let local = dialer.open_stream().unwrap();
+        let mut peer = acceptor.accept_stream().await.unwrap();
+
+        let pipe = tokio::spawn(pipe_unix_stream(sock, local, idle));
+
+        // Remote peer floods the stream and never reads our side: once
+        // the pipe's inbound window and the socket buffer fill, the
+        // stream→socket write_all stalls.
+        let flood_peer = peer.clone();
+        let flood = tokio::spawn(async move {
+            let chunk = Bytes::from(vec![0xCDu8; 64 * 1024]);
+            while flood_peer.send(chunk.clone()).await.is_ok() {}
+        });
+
+        // Local client streams data and never reads: once the peer's
+        // inbound window fills, the socket→stream send stalls. Both
+        // directions end up blocked inside outbound writes.
+        let upload = tokio::spawn(async move {
+            let mut client = client;
+            let chunk = vec![0xEFu8; 64 * 1024];
+            while client.write_all(&chunk).await.is_ok() {}
+        });
+
+        // The pipe must die on the shared idle deadline, not hang.
+        timeout(Duration::from_secs(10), pipe)
+            .await
+            .expect("pipe pinned by stalled outbound writes")
+            .unwrap();
+
+        // Remote side observes the abort (RST) after draining buffered
+        // data, not a hang.
+        let outcome = timeout(Duration::from_secs(10), async {
+            loop {
+                match peer.recv().await {
+                    Ok(Some(_)) => continue,
+                    other => break other,
+                }
+            }
+        })
+        .await
+        .expect("peer did not observe stream abort");
+        assert!(
+            matches!(outcome, Ok(None) | Err(_)),
+            "expected FIN/RST after idle abort, got {outcome:?}"
+        );
+
+        flood.abort();
+        upload.abort();
     }
 }
