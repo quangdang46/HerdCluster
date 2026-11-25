@@ -1181,6 +1181,14 @@ trait PaneOps {
         params: &PaneSplitParams,
         timeout: Duration,
     ) -> Result<Value, SpawnError>;
+    /// `pane.close` — best-effort teardown of a pane (terminates any
+    /// agent running in it; the herdr API has no `agent.stop`).
+    fn close_pane(
+        &self,
+        ep: &MachineEndpoint,
+        pane_id: &str,
+        timeout: Duration,
+    ) -> Result<(), SpawnError>;
 }
 
 impl PaneOps for api_client::ApiClient {
@@ -1212,6 +1220,18 @@ impl PaneOps for api_client::ApiClient {
         })?;
         self.request_with_timeout("pane.split", &params, timeout)
             .map_err(|e| pane_step_error(ep, "pane.split", e))
+    }
+
+    fn close_pane(
+        &self,
+        ep: &MachineEndpoint,
+        pane_id: &str,
+        timeout: Duration,
+    ) -> Result<(), SpawnError> {
+        let params = serde_json::json!({ "pane_id": pane_id });
+        self.request_with_timeout("pane.close", &params, timeout)
+            .map(|_| ())
+            .map_err(|e| pane_step_error(ep, "pane.close", e))
     }
 }
 
@@ -1261,13 +1281,48 @@ fn ensure_pane(
     let after_timeout = handshake_left(deadline, ep, "pane.list")?;
     let after = client.list_pane_ids(ep, workspace_id, after_timeout)?;
     let before_set: BTreeSet<&String> = before.iter().collect();
-    after
+    let mut new_panes = after
         .into_iter()
-        .find(|id| !before_set.contains(id))
-        .ok_or_else(|| SpawnError::PaneFailed {
-            machine: ep.label.clone(),
-            reason: "pane.split succeeded but no new pane id could be determined".to_string(),
-        })
+        .filter(|id| !before_set.contains(id));
+    if let Some(id) = new_panes.next() {
+        return Ok(id);
+    }
+
+    // `pane.split` succeeded but no new pane id could be determined — the
+    // split pane may still exist server-side (e.g. pane.list lag). Sweep
+    // once more and close anything that was not there before the split so
+    // a failed spawn does not leak a stray pane (issue #24). Best-effort:
+    // every failure here is ignored.
+    sweep_stray_split_panes(client, ep, workspace_id, &before, deadline);
+    Err(SpawnError::PaneFailed {
+        machine: ep.label.clone(),
+        reason: "pane.split succeeded but no new pane id could be determined".to_string(),
+    })
+}
+
+/// Best-effort cleanup after `pane.split` succeeded but its pane id could
+/// not be determined: re-list the workspace's panes and `pane.close` any
+/// id that was not present before the split. All failures are ignored —
+/// this only runs on an already-failing path.
+fn sweep_stray_split_panes(
+    client: &dyn PaneOps,
+    ep: &MachineEndpoint,
+    workspace_id: &str,
+    before: &[String],
+    deadline: Instant,
+) {
+    let Ok(list_timeout) = handshake_left(deadline, ep, "pane.list") else {
+        return;
+    };
+    let Ok(after) = client.list_pane_ids(ep, workspace_id, list_timeout) else {
+        return;
+    };
+    let before_set: BTreeSet<&String> = before.iter().collect();
+    for id in after.into_iter().filter(|id| !before_set.contains(id)) {
+        let close_timeout =
+            handshake_left(deadline, ep, "pane.close").unwrap_or(Duration::from_secs(1));
+        let _ = client.close_pane(ep, &id, close_timeout);
+    }
 }
 
 /// Status strings that mean "the agent CLI is up and interactive".
@@ -1515,18 +1570,108 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
     let repo = effective_repo_path(&req.repo_path, ep.kind == MachineKind::Local);
 
     // Workspace: find by repo path / sole workspace, or create.
-    let (workspace_id, _created) =
+    let (workspace_id, workspace_created) =
         ensure_workspace(&client, &ep, repo.as_deref(), &req.name, handshake_deadline)?;
 
+    // Everything from here on can leak the workspace, the split pane, and
+    // — on the readiness-timeout path — a live agent process that holds a
+    // `max_agents` slot forever (issue #24). Track what was created and
+    // roll back best-effort on any error.
+    let mut res = SpawnResources {
+        workspace_id,
+        workspace_created,
+        pane_id: None,
+    };
+    match launch_agent(&client, &ep, req, repo.as_deref(), handshake_deadline, &mut res) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            cleanup_failed_spawn(&client, &ep, &res, handshake_deadline);
+            Err(e)
+        }
+    }
+}
+
+/// Resources a [`spawn`] attempt created on the target machine, tracked
+/// so a mid-spawn failure can roll them back (issue #24).
+struct SpawnResources {
+    workspace_id: String,
+    /// True only when `ensure_workspace` created the workspace — a reused
+    /// (pre-existing) workspace belongs to the user and must never be
+    /// closed by a failed spawn.
+    workspace_created: bool,
+    /// The dedicated split pane, once [`ensure_pane`] returns its id.
+    pane_id: Option<String>,
+}
+
+/// Best-effort rollback for a failed spawn (issue #24).
+///
+/// `pane.close` is the agent-teardown path — the herdr API has no
+/// `agent.stop`; closing the hosting pane terminates the agent process
+/// running in it (this frees the `max_agents` slot on the
+/// readiness-timeout path, where `agent.start` succeeded but the agent
+/// never reported ready). `workspace.close` runs only for a workspace
+/// this spawn created, and also sweeps up a stray split pane whose id
+/// could not be determined. Every call ignores its result and is bounded
+/// by whatever handshake budget remains (1s floor) so cleanup can never
+/// mask the original error or block indefinitely — the same pattern as
+/// [`verify_workspace_repo_cwd`].
+fn cleanup_failed_spawn(
+    client: &api_client::ApiClient,
+    ep: &MachineEndpoint,
+    res: &SpawnResources,
+    deadline: Instant,
+) {
+    if let Some(pane_id) = &res.pane_id {
+        let timeout =
+            handshake_left(deadline, ep, "pane.close").unwrap_or(Duration::from_secs(1));
+        let _ = handshake_call(
+            client,
+            ep,
+            "pane.close",
+            "pane.close",
+            &serde_json::json!({"pane_id": pane_id}),
+            timeout,
+        );
+    }
+    if res.workspace_created {
+        let timeout =
+            handshake_left(deadline, ep, "workspace.close").unwrap_or(Duration::from_secs(1));
+        let _ = handshake_call(
+            client,
+            ep,
+            "workspace.close",
+            "workspace.close",
+            &serde_json::json!({"workspace_id": res.workspace_id}),
+            timeout,
+        );
+    }
+}
+
+/// `agent.start` reports `agent_pane_busy` while the fresh split pane's
+/// shell is still spawning — a retryable condition. Matches the
+/// structured server error code first (issue #31), falling back to the
+/// server message text for older herdr builds that may only carry the
+/// reason there. Non-server errors are never pane-busy.
+fn is_agent_pane_busy(e: &ApiError) -> bool {
+    e.code() == Some("agent_pane_busy")
+        || matches!(e, ApiError::Server { message, .. } if message.contains("agent_pane_busy"))
+}
+
+/// Dedicated pane → `agent.start` (with `agent_pane_busy` retry) →
+/// readiness wait. Records the pane id in `res` as soon as it is known so
+/// [`spawn`] can roll back on any subsequent error.
+fn launch_agent(
+    client: &api_client::ApiClient,
+    ep: &MachineEndpoint,
+    req: &SpawnRequest,
+    repo: Option<&str>,
+    deadline: Instant,
+    res: &mut SpawnResources,
+) -> Result<SpawnResult, SpawnError> {
     // Dedicated pane — always a fresh split (see ensure_pane for why the
     // root pane of a new workspace is not reused).
-    let pane_id = ensure_pane(
-        &client,
-        &ep,
-        &workspace_id,
-        repo.as_deref(),
-        handshake_deadline,
-    )?;
+    let pane_id = ensure_pane(client, ep, &res.workspace_id, repo, deadline)?;
+    res.pane_id = Some(pane_id.clone());
 
     // Launch the agent.
     let args = if req.extra_agent_args.is_empty() {
@@ -1552,7 +1697,7 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
     // but never past the shared handshake deadline.
     let pane_busy_deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        let timeout = handshake_left(handshake_deadline, &ep, "agent.start")?;
+        let timeout = handshake_left(deadline, ep, "agent.start")?;
         match client.request_with_timeout("agent.start", &agent_start_params, timeout) {
             Ok(_) => break,
             Err(ApiError::Timeout) => {
@@ -1562,17 +1707,16 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
                 })
             }
             Err(e) => {
-                let reason = e.to_string();
-                if reason.contains("agent_pane_busy")
+                if is_agent_pane_busy(&e)
                     && Instant::now() < pane_busy_deadline
-                    && Instant::now() < handshake_deadline
+                    && Instant::now() < deadline
                 {
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
                 return Err(SpawnError::AgentStartFailed {
                     machine: ep.label.clone(),
-                    reason,
+                    reason: e.to_string(),
                 });
             }
         }
@@ -1580,7 +1724,7 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
 
     // Wait for interactive readiness.
     let ready_timeout = req.ready_timeout.unwrap_or(DEFAULT_READY_TIMEOUT);
-    wait_until_ready(&client, &ep, &req.name, &pane_id, ready_timeout)?;
+    wait_until_ready(client, ep, &req.name, &pane_id, ready_timeout)?;
 
     Ok(SpawnResult {
         global_id: format_global_id(&ep.label, &req.name),
@@ -1588,7 +1732,7 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
         agent: req.name.clone(),
         kind: req.kind.clone(),
         pane_id,
-        workspace_id,
+        workspace_id: res.workspace_id.clone(),
         branch: req.branch.clone(),
     })
 }
@@ -2100,6 +2244,8 @@ mod tests {
         split_calls: std::cell::Cell<usize>,
         /// Params of the last `split_pane` call.
         last_params: std::cell::RefCell<Option<PaneSplitParams>>,
+        /// Pane ids passed to `close_pane`, in call order.
+        closed_panes: std::cell::RefCell<Vec<String>>,
     }
 
     impl FakePaneOps {
@@ -2109,6 +2255,7 @@ mod tests {
                 split_response,
                 split_calls: std::cell::Cell::new(0),
                 last_params: std::cell::RefCell::new(None),
+                closed_panes: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -2136,6 +2283,16 @@ mod tests {
             self.split_calls.set(self.split_calls.get() + 1);
             *self.last_params.borrow_mut() = Some(params.clone());
             Ok(self.split_response.clone())
+        }
+
+        fn close_pane(
+            &self,
+            _ep: &MachineEndpoint,
+            pane_id: &str,
+            _timeout: Duration,
+        ) -> Result<(), SpawnError> {
+            self.closed_panes.borrow_mut().push(pane_id.to_string());
+            Ok(())
         }
     }
 
@@ -2223,6 +2380,55 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         let err = ensure_pane(&fake, &ep, "w5", None, deadline).unwrap_err();
         assert_eq!(err.code(), "pane_failed");
+        // Nothing new appeared in the sweep either → nothing closed.
+        assert!(fake.closed_panes.borrow().is_empty());
+    }
+
+    #[test]
+    fn ensure_pane_sweeps_stray_split_pane_on_id_failure() {
+        // Issue #24: pane.split succeeded but neither the response nor the
+        // first pane.list diff yielded an id; a later list shows the split
+        // pane did land server-side — it must be closed, not leaked.
+        let fake = FakePaneOps::new(
+            vec![
+                vec!["w6:p1".to_string()],
+                vec!["w6:p1".to_string()],
+                vec!["w6:p1".to_string(), "w6:p9".to_string()],
+            ],
+            json!({"type": "ok"}),
+        );
+        let ep = test_endpoint();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = ensure_pane(&fake, &ep, "w6", None, deadline).unwrap_err();
+        assert_eq!(err.code(), "pane_failed");
+        assert_eq!(fake.closed_panes.borrow().as_slice(), ["w6:p9"]);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #31: agent_pane_busy retry matches the structured error code.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn is_agent_pane_busy_prefers_structured_code() {
+        // Server error code is the authority.
+        assert!(is_agent_pane_busy(&ApiError::Server {
+            code: "agent_pane_busy".to_string(),
+            message: "not an available shell".to_string(),
+        }));
+        // Older herdr may carry the reason only in the message.
+        assert!(is_agent_pane_busy(&ApiError::Server {
+            code: "pane_unavailable".to_string(),
+            message: "agent_pane_busy: shell still spawning".to_string(),
+        }));
+        // Unrelated server errors and non-server errors are not retryable.
+        assert!(!is_agent_pane_busy(&ApiError::Server {
+            code: "agent_start_failed".to_string(),
+            message: "bad kind".to_string(),
+        }));
+        assert!(!is_agent_pane_busy(&ApiError::Timeout));
+        assert!(!is_agent_pane_busy(&ApiError::ServerNotRunning {
+            path: "/x.sock".into(),
+        }));
     }
 
     // ------------------------------------------------------------------
