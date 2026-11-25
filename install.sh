@@ -87,6 +87,19 @@ esac
 
 asset="herdcluster-${target}.tar.gz"
 
+if [ "$VERSION" != "latest" ]; then
+    # VERSION is interpolated into the release download URL — restrict it
+    # to X.Y.Z or vX.Y.Z (same shapes `herdcluster update --version`
+    # accepts) and normalize to the v-prefixed tag GitHub uses.
+    bare="${VERSION#v}"
+    case "$bare" in
+        *[!0-9.]*|*..*|.*|*.|*.*.*.*) die "invalid HERDCLUSTER_VERSION '${VERSION}' — expected 'latest' or vX.Y.Z" ;;
+    esac
+    [ "$(awk -F. '{print NF}' <<<"$bare")" = "3" ] || \
+        die "invalid HERDCLUSTER_VERSION '${VERSION}' — expected 'latest' or vX.Y.Z"
+    VERSION="v${bare}"
+fi
+
 if [ "$VERSION" = "latest" ]; then
     base="https://github.com/${REPO}/releases/latest/download"
 else
