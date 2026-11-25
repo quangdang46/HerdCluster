@@ -674,6 +674,12 @@ pub struct EventsSubscribeParams {
 /// wrapper (see the `subscription_event` schema in `herdr api schema`).
 pub struct EventStream {
     reader: BufReader<Box<dyn platform::IoStream>>,
+    /// Bytes of the current line read so far, accumulated across
+    /// `next_event` calls. The stream's per-read timeout can fire
+    /// mid-line; without this buffer the partial bytes would be dropped
+    /// while the line's tail stayed buffered, so the next call would try
+    /// to parse the tail as a fresh JSON envelope (issue #87).
+    line_buf: String,
 }
 
 impl EventStream {
@@ -684,14 +690,32 @@ impl EventStream {
     ///   stream. Callers may resubscribe.
     /// * `Err(ApiError::Timeout)` — no line arrived within the read
     ///   timeout the stream was opened with; treat as a tick and call
-    ///   `next_event` again.
+    ///   `next_event` again. Any partial line already read is retained
+    ///   and completed by a later call.
     /// * `Err(_)` — transport or parse failure; the stream is unusable.
     pub fn next_event(&mut self) -> Result<Option<serde_json::Value>, ApiError> {
         loop {
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
-                Ok(0) => return Ok(None),
+            // `read_line` appends to `line_buf` rather than replacing it,
+            // so bytes consumed before a WouldBlock/TimedOut survive in
+            // the buffer until the rest of the line arrives.
+            match self.reader.read_line(&mut self.line_buf) {
+                Ok(0) => {
+                    if self.line_buf.is_empty() {
+                        // Clean EOF between lines.
+                        return Ok(None);
+                    }
+                    // EOF mid-line: parse whatever arrived — truncated
+                    // JSON surfaces as `ApiError::Json` (recoverable
+                    // upstream) rather than being silently dropped.
+                    let line = std::mem::take(&mut self.line_buf);
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    return Ok(Some(serde_json::from_str(trimmed)?));
+                }
                 Ok(_) => {
+                    let line = std::mem::take(&mut self.line_buf);
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -702,7 +726,8 @@ impl EventStream {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    return Err(ApiError::Timeout)
+                    // Tick: keep `line_buf` — it holds the partial line.
+                    return Err(ApiError::Timeout);
                 }
                 Err(e) => return Err(ApiError::Io(e)),
             }
@@ -784,13 +809,133 @@ impl ApiClient {
                 message: "herdr subscribe response had neither 'result' nor 'error'".to_string(),
             });
         }
-        Ok(EventStream { reader })
+        Ok(EventStream {
+            reader,
+            line_buf: String::new(),
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// A stream that only yields bytes up to `limit`; reads past it
+    /// report `WouldBlock`, simulating the per-read timeout firing
+    /// mid-line. Raising `limit` "opens the gate" for more data.
+    struct DripStream {
+        data: Vec<u8>,
+        pos: usize,
+        limit: Arc<AtomicUsize>,
+    }
+
+    impl Read for DripStream {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0); // EOF
+            }
+            let limit = self.limit.load(Ordering::Relaxed).min(self.data.len());
+            if self.pos >= limit {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "read timed out",
+                ));
+            }
+            let end = limit.min(self.pos + buf.len());
+            let n = end - self.pos;
+            buf[..n].copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+            Ok(n)
+        }
+    }
+
+    impl Write for DripStream {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl platform::IoStream for DripStream {
+        fn set_read_timeout(&mut self, _timeout: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn drip_event_stream(data: &[u8], limit: usize) -> (EventStream, Arc<AtomicUsize>) {
+        let limit = Arc::new(AtomicUsize::new(limit));
+        let stream = DripStream {
+            data: data.to_vec(),
+            pos: 0,
+            limit: limit.clone(),
+        };
+        let boxed: Box<dyn platform::IoStream> = Box::new(stream);
+        (
+            EventStream {
+                reader: BufReader::new(boxed),
+                line_buf: String::new(),
+            },
+            limit,
+        )
+    }
+
+    /// Issue #87: a per-read timeout firing mid-line must not drop the
+    /// partial bytes — the next `next_event` call completes the same
+    /// envelope instead of parsing the tail as fresh JSON.
+    #[test]
+    fn event_stream_survives_mid_line_timeout() {
+        let line1 = concat!(
+            "{\"event\":\"pane.agent_status_changed\",",
+            "\"data\":{\"pane_id\":\"w2:p1\",\"status\":\"done\"}}\n"
+        );
+        let line2 = "{\"event\":\"pane.exited\",\"data\":{\"pane_id\":\"w2:p1\"}}\n";
+        let data = format!("{line1}{line2}");
+        let split = line1.len() / 2;
+        assert!(split > 0 && split < line1.len());
+
+        let (mut events, limit) = drip_event_stream(data.as_bytes(), split);
+
+        // First call reads half the line, then hits WouldBlock → tick.
+        assert!(matches!(events.next_event(), Err(ApiError::Timeout)));
+        // A second tick with no new data still returns Timeout.
+        assert!(matches!(events.next_event(), Err(ApiError::Timeout)));
+
+        // The rest of the line (and the next one) arrives.
+        limit.store(data.len(), Ordering::Relaxed);
+        let v = events
+            .next_event()
+            .expect("completed line should parse")
+            .expect("an event, not EOF");
+        assert_eq!(v["event"], "pane.agent_status_changed");
+        assert_eq!(v["data"]["status"], "done");
+
+        // The following line is unaffected.
+        let v = events
+            .next_event()
+            .expect("second line should parse")
+            .expect("an event, not EOF");
+        assert_eq!(v["event"], "pane.exited");
+
+        // Clean EOF after the last line.
+        assert!(matches!(events.next_event(), Ok(None)));
+    }
+
+    /// Same drip, but the stream closes mid-line: the partial bytes are
+    /// reported as a parse failure (recoverable upstream) rather than
+    /// silently dropped or reported as clean EOF.
+    #[test]
+    fn event_stream_eof_mid_line_is_parse_error() {
+        let data = b"{\"event\":\"pane.exited\",\"data\":{\"pane_id\":";
+        let (mut events, _limit) = drip_event_stream(data, data.len());
+        // limit == len: all bytes readable, then EOF with an unterminated
+        // partial line.
+        assert!(matches!(events.next_event(), Err(ApiError::Json(_))));
+    }
 
     #[test]
     fn agent_status_parse_roundtrip() {
