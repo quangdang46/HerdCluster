@@ -30,17 +30,36 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/herd_cluster/main/inst
 
 ## Why spawn *separate* coding agents?
 
-Subagents inside one agent session share its context, tools, and failure
-modes — they inherit its blind spots and burn the same context window. Real
-parallel work needs **independent agents with their own sessions, worktrees,
-and lifecycles**, coordinated by an orchestrator that can read, prompt, and
-retask each one. That is exactly what HerdCluster provides.
+Harness-native subagents make multi-agent work **worse** — an authority
+gradient forms between orchestrator and subagent, and production runs show
+the same four failure modes every time:
 
-- [anti_subagent](https://github.com/quangdang46/anti_subagent) — the case
-  against delegating to built-in subagents.
+- **Subagents become livestock** — they read and edit to order, contributing
+  nothing a function call couldn't.
+- **Reflexive agreement** — they over-agree, or swing to blanket resistance;
+  neither produces correct work.
+- **Context burned on polling** — the orchestrator wastes its window asking
+  "are you done yet" instead of reasoning.
+- **Identity deception backfires** — a worker that *knows* it is subordinate
+  stops acting like an owner of the outcome.
+
+Documented incident: four workers delegated through a built-in subagent tool
+went fleet-invisible, two died mid-flight on restart, and supervision stayed
+down 73 minutes unnoticed. The fix was never "fewer agents" — it was **real,
+independent agents** coordinated from outside.
+
+That is the SLP (Supervisor → Lead → Peer) architecture: every worker is a
+full agent with its own session, worktree, and lifecycle — spawned plainly,
+free to challenge a premise, and never told it is a subagent. HerdCluster is
+that pattern at cluster scale: one CLI spawns, prompts, watches, and retasks
+peers across every machine you own.
+
+- [anti_subagent](https://github.com/quangdang46/anti_subagent) — the thesis
+  and the production evidence (archived; wrapper approach superseded).
+- [pi-anti-subagent](https://github.com/quangdang46/pi-anti-subagent) — the
+  successor: SLP enforced *inside* the Pi runtime.
 - [SLP: Supervisor–Lead–Peer](https://ultrabuilders.xyz/en/posts/slp-supervisor-lead-peer) —
-  a pattern for orchestrating many independent coding agents instead of
-  nesting them.
+  the orchestration pattern itself.
 
 ---
 
