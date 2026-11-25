@@ -64,6 +64,23 @@ pub enum SkillError {
     /// `project_dir` does not exist or is not a directory.
     #[error("project dir '{}' is not a directory", .0.display())]
     NotADirectory(PathBuf),
+    /// `skill` is not a bundled skill name, or contains characters that
+    /// could escape `<project>/.agents/skills/` via the joined path.
+    #[error("invalid skill name '{0}' (must be a bundled skill name)")]
+    InvalidSkill(String),
+}
+
+/// `true` when `skill` is safe to join under `.agents/skills/`: only
+/// `[A-Za-z0-9_-]` characters **and** a member of [`SKILL_NAMES`]. The
+/// charset check alone would still allow unknown-but-safe names that
+/// produce an empty skill dir; membership keeps installs limited to the
+/// bundled payloads.
+fn valid_skill_name(skill: &str) -> bool {
+    !skill.is_empty()
+        && skill
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && SKILL_NAMES.contains(&skill)
 }
 
 /// One bundled skill: directory name + its file tree.
@@ -167,6 +184,10 @@ fn herdcluster_files() -> Vec<(&'static str, &'static str)> {
 }
 
 /// `.agents` copy path for a project.
+///
+/// `skill` is joined verbatim — callers must pass a bundled skill name
+/// (see [`SKILL_NAMES`]); [`install_skill`] enforces this, the pure path
+/// builders do not.
 pub fn agents_skill_dir(project_dir: &Path, skill: &str) -> PathBuf {
     project_dir.join(".agents").join("skills").join(skill)
 }
@@ -265,6 +286,9 @@ pub fn install_skill(
     skill: &str,
     overwrite_diverged: bool,
 ) -> Result<InstallOutcome, SkillError> {
+    if !valid_skill_name(skill) {
+        return Err(SkillError::InvalidSkill(skill.to_string()));
+    }
     if !project_dir.is_dir() {
         return Err(SkillError::NotADirectory(project_dir.to_path_buf()));
     }
@@ -442,5 +466,45 @@ mod tests {
             install_skill(&missing, SKILL_NAME, false),
             Err(SkillError::NotADirectory(_))
         ));
+    }
+
+    #[test]
+    fn valid_skill_name_charset_and_membership() {
+        for name in SKILL_NAMES {
+            assert!(valid_skill_name(name), "{name} should be valid");
+        }
+        for bad in [
+            "",
+            "../escape",
+            "..",
+            "a/b",
+            "a\\b",
+            "skill name",
+            "skill.name",
+            "no-such-skill",      // safe charset but not bundled
+            "HERDR-ORCHESTRATOR", // case-sensitive
+        ] {
+            assert!(!valid_skill_name(bad), "{bad:?} should be invalid");
+        }
+    }
+
+    #[test]
+    fn install_rejects_unsafe_skill_names() {
+        let dir = tempdir("unsafe");
+        let outside = dir.join("escape-target");
+        for bad in ["../../tmp/x", "../escape", "a/b", "no-such-skill"] {
+            assert!(
+                matches!(
+                    install_skill(&dir, bad, false),
+                    Err(SkillError::InvalidSkill(_))
+                ),
+                "{bad:?} must be rejected"
+            );
+        }
+        // Nothing may be created — neither inside the project nor outside.
+        assert!(!dir.join(".agents").exists());
+        assert!(!outside.exists());
+        assert!(!dir.join("..").join("escape").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
