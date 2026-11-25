@@ -229,6 +229,17 @@ fn load_avg_impl() -> Option<Vec<f64>> {
 // Agent probing (local herdr API — best effort)
 // ---------------------------------------------------------------------------
 
+/// Per-call timeout for `server.agent_manifests` inside the resource
+/// probe path. The typed `server_agent_manifests()` wrapper uses
+/// [`api_client::DEFAULT_TIMEOUT`] (30 s); a wedged herdr socket that
+/// accepts connections but never responds would then stall the
+/// `hc-resources` sampler ~35 s per sample (5 s `agent.list` + 30 s
+/// manifests), delaying [`ResourceMonitor::shutdown`] joins and
+/// accumulating blocked `spawn_blocking` threads on bridge reconnects.
+/// Manifests are cheap metadata — 3 s is generous for a local socket;
+/// on timeout kinds degrade to `[]` exactly like any other API error.
+pub const MANIFESTS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Probe the local herdr API for `(agent_count, supported_kinds)`.
 ///
 /// `agent_count` is the length of `agent.list`; `kinds` is
@@ -260,8 +271,16 @@ pub fn probe_agent_kinds() -> Vec<String> {
 }
 
 /// Manifest kinds filtered to CLIs found on `PATH`.
+///
+/// Uses [`MANIFESTS_PROBE_TIMEOUT`] rather than the client's
+/// [`api_client::DEFAULT_TIMEOUT`] so a hung herdr socket cannot stall
+/// the resource monitor (see the const's docs).
 fn agent_kinds_via(client: &api_client::ApiClient) -> Vec<String> {
-    let manifests = match client.server_agent_manifests() {
+    let manifests = match client.request_with_timeout(
+        "server.agent_manifests",
+        &serde_json::json!({}),
+        MANIFESTS_PROBE_TIMEOUT,
+    ) {
         Ok(v) => v,
         Err(_) => return Vec::new(),
     };
@@ -524,6 +543,44 @@ mod tests {
         assert!(kinds.contains(&"claude".to_string()));
         assert!(kinds.contains(&"codex".to_string()));
         assert!(!kinds.contains(&"remote".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_kinds_via_is_bounded_on_wedged_herdr_socket() {
+        // Regression for issue #30: a herdr socket that accepts
+        // connections but never responds must not stall the resource
+        // probe for the full `DEFAULT_TIMEOUT` (30 s). The manifests
+        // call goes through `request_with_timeout` with
+        // `MANIFESTS_PROBE_TIMEOUT`, so kinds degrade to `[]` quickly.
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!("hc-wedged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("herdr.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Accept every connection and never write a response.
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                std::mem::forget(stream); // hold the fd open, stay silent
+            }
+        });
+
+        let client = api_client::ApiClient::connect(&sock).unwrap();
+        let start = Instant::now();
+        let kinds = agent_kinds_via(&client);
+        let elapsed = start.elapsed();
+
+        assert!(kinds.is_empty(), "wedged socket must yield no kinds");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "manifests probe took {elapsed:?}; expected ~{MANIFESTS_PROBE_TIMEOUT:?} \
+             (DEFAULT_TIMEOUT is {} s)",
+            api_client::DEFAULT_TIMEOUT.as_secs()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
