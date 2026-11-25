@@ -243,9 +243,9 @@ pub(crate) enum ConfigCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Remove a machines.<label> override entirely
+    /// Remove a machines.<label> override, e.g. `machines.wsl.max_agents`
     Unset {
-        /// Config key (machines.<label>)
+        /// Config key (machines.<label>.<field>)
         key: String,
         #[arg(long)]
         json: bool,
