@@ -50,7 +50,12 @@ pub fn run(controller: Option<String>, yes: bool, json_out: bool, verbose: bool)
                 }
             }
             Ok(JoinOutcome::Declined) => {
-                if !json_out {
+                if json_out {
+                    print_json(&json!({
+                        "paired": false,
+                        "reason": "declined",
+                    }));
+                } else {
                     println!("pairing declined");
                 }
                 1
