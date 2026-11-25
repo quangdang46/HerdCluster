@@ -10,14 +10,14 @@ Pick ONE:
 **A. Release install (after first `v*` tag is published)** — inside WSL2:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/quangdang46/herdr_cluster/main/install.sh | bash
 herdcluster --version
 ```
 
 **B. Build from source in WSL2** (needs Rust: `curl https://sh.rustup.rs -sSf | sh`):
 
 ```bash
-git clone https://github.com/quangdang46/herd_cluster && cd HerdCluster
+git clone https://github.com/quangdang46/herdr_cluster && cd HerdCluster
 cargo build --release -p herdcluster
 # binary: target/release/herdcluster — add to PATH or call directly
 ```

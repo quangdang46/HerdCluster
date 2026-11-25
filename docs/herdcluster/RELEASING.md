@@ -40,7 +40,7 @@ herdr release, and vice versa.
 4. Users install with:
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh | bash
+   curl -fsSL https://raw.githubusercontent.com/quangdang46/herdr_cluster/main/install.sh | bash
    ```
 
    or pin a version: `HERDCLUSTER_VERSION=v0.1.0 ./install.sh`.
