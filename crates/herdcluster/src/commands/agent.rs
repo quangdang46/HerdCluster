@@ -125,9 +125,11 @@ fn stuck_warning(id: &str, status: &str, elapsed_secs: u64) {
     );
 }
 
-/// `agent wait` — poll `agent.get` until the status enters `--until`,
-/// the agent disappears, or `--timeout` elapses. Exit 0 on match/gone,
-/// 1 on timeout or fleet error, 2 on bad flags.
+/// `agent wait` — wait until the status enters `--until`, the agent
+/// disappears mid-wait, or `--timeout` elapses. Exit 0 on match/gone,
+/// 1 on timeout, fleet error, or an agent ID that never existed
+/// (`agent_not_found` — a typo must not look like success, issue #10),
+/// 2 on bad flags.
 fn wait_agent(
     id: &str,
     until: &str,
