@@ -165,17 +165,22 @@ pub(crate) fn report_fleet_error(e: &FleetError, json: bool) -> i32 {
     1
 }
 
-/// Print a successful `serde_json::Value` result: pretty JSON in `--json`
+/// Print a successful `serde_json::Value` result: compact JSON in `--json`
 /// mode, best-effort human text otherwise.
 pub(crate) fn emit_result(value: &Value, json: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-        );
+        println!("{}", json_line(value));
     } else {
         println!("{}", display_value(value));
     }
+}
+
+/// Serialize `value` to one compact single-line JSON string for `--json`
+/// stdout — the line-oriented contract shared with `spawn --json`
+/// (issue #63). Serialization cannot realistically fail; the fallback
+/// keeps a static message rather than panicking.
+fn json_line<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
 /// Best-effort human rendering of an API result value: strings pass
@@ -227,14 +232,9 @@ fn find_text_field(value: &Value, keys: &[&str], depth: usize) -> Option<String>
     None
 }
 
-/// Serialize `value` to stdout as pretty JSON. Serialization of a
-/// `Serialize` value into `Value`/string cannot realistically fail; the
-/// fallback keeps a static message rather than panicking.
+/// Serialize `value` to stdout as one compact single-line JSON object.
 pub(crate) fn print_json<T: Serialize>(value: &T) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_string())
-    );
+    println!("{}", json_line(value));
 }
 
 #[cfg(test)]
@@ -261,6 +261,23 @@ mod tests {
         assert_eq!(display_value(&json!(["a", "b"])), "a\nb");
         // Mixed array falls back to JSON.
         assert!(display_value(&json!(["a", 1])).contains('['));
+    }
+
+    #[test]
+    fn json_line_is_compact_single_line() {
+        let v = json!({
+            "status": "ok",
+            "items": [1, 2, {"nested": "value"}],
+            "flag": true
+        });
+        let line = json_line(&v);
+        // Line-oriented contract (issue #63): exactly one line, no
+        // whitespace padding — identical to serde_json::to_string.
+        assert!(!line.contains('\n'));
+        assert_eq!(line, serde_json::to_string(&v).unwrap());
+        // Pretty-printing the same value is multi-line, so a regression
+        // back to to_string_pretty would fail the first assertion.
+        assert!(serde_json::to_string_pretty(&v).unwrap().contains('\n'));
     }
 
     #[test]

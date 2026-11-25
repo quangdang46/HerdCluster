@@ -95,6 +95,8 @@ per machine.
 
 - Never handle agent credentials — if a kind needs login, tell the user to
   run e.g. `claude login` on that machine.
+- `--json` emits one compact single-line JSON object per command on
+  stdout (line-oriented, parseable per line); stderr is diagnostics.
 - Errors are JSON `{"error":{"code","message"}}` under `--json`; codes like
   `worker_unreachable`, `agent_not_found`, `no_placement`,
   `agent_pane_busy`, `invalid_pairing_code` are stable.

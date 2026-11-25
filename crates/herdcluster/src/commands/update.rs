@@ -403,7 +403,7 @@ fn emit_result(outcome: &Outcome, json: bool) {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json!({
+                    serde_json::to_string(&json!({
                         "status": "current",
                         "version": version,
                         "message": "already up to date",
@@ -418,7 +418,7 @@ fn emit_result(outcome: &Outcome, json: bool) {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&json!({
+                    serde_json::to_string(&json!({
                         "status": "updated",
                         "from": from,
                         "to": to,
