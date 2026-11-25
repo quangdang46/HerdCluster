@@ -6,13 +6,17 @@
 //!   The server closes the connection after writing exactly one JSON
 //!   response line, so every request opens a fresh connection.
 //! * Socket path resolution, in priority order:
-//!   1. `HERDR_SOCKET_PATH` env override (explicit, always wins).
-//!   2. `<herdr config dir>/<session>/herdr.sock` when `HERDR_SESSION`
-//!      names a non-default session. Observed layout: the `default`
-//!      session uses `~/.config/herdr/herdr.sock` directly; non-default
-//!      sessions are believed to live under `sessions/<name>/` inside the
-//!      config dir — this is best-effort and falls back to the default
-//!      socket if the session-specific file does not exist.
+//!   1. `HERDR_SOCKET_PATH` env override — explicit, always wins, even
+//!      when the configured path does not exist (a missing socket is
+//!      reported by `connect` as `ServerNotRunning`; it must never fall
+//!      through to a different socket and silently talk to the wrong
+//!      herdr).
+//!   2. `<herdr config dir>/sessions/<name>/herdr.sock` when
+//!      `HERDR_SESSION` names a non-default session — also returned
+//!      unconditionally, for the same reason. Observed layout: the
+//!      `default` session uses `~/.config/herdr/herdr.sock` directly;
+//!      non-default sessions are believed to live under `sessions/<name>/`
+//!      inside the config dir — this is best-effort and unverified.
 //!   3. Default: `$XDG_CONFIG_HOME/herdr/herdr.sock`, falling back to
 //!      `~/.config/herdr/herdr.sock`. Confirmed on macOS 0.9.5:
 //!      `~/.config/herdr/herdr.sock` (NOT `~/Library/Application Support`).
@@ -46,18 +50,33 @@ impl IoStream for std::os::unix::net::UnixStream {
 
 /// Resolve the herdr API socket path.
 ///
-/// Returns the first candidate that exists on disk; if none exist, returns
-/// the default (non-session) path so callers get a stable, meaningful
-/// `ServerNotRunning` error on connect.
+/// An explicit override — `HERDR_SOCKET_PATH`, or a non-default
+/// `HERDR_SESSION` — always wins, even when the configured socket does
+/// not exist: probing for a fallback could silently select a *different*
+/// herdr (e.g. a stale `HERDR_SOCKET_PATH` falling through to the
+/// default-session socket). A missing configured socket is instead
+/// reported by `connect` as `ServerNotRunning` naming that path.
+///
+/// With no explicit env config, the first candidate that exists on disk
+/// is returned; if none exist, the default (non-session) path is
+/// returned so callers get a stable, meaningful `ServerNotRunning`
+/// error on connect.
 pub fn socket_path() -> Result<PathBuf, ApiError> {
     let candidates = socket_path_candidates();
+    // `socket_path_candidates` prepends an explicit env-configured path
+    // (HERDR_SOCKET_PATH, or the session-specific path for a non-default
+    // HERDR_SESSION) ahead of the default; more than one candidate means
+    // such an override is in effect.
+    if candidates.len() > 1 {
+        return Ok(candidates.into_iter().next().unwrap());
+    }
     for path in &candidates {
         if path.exists() {
             return Ok(path.clone());
         }
     }
-    // Nothing exists yet — prefer the session-specific candidate if one was
-    // configured (so the error message names the right socket), else default.
+    // Nothing exists yet — return the default candidate so the error
+    // message names a stable socket path.
     Ok(candidates
         .into_iter()
         .next()
