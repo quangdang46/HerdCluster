@@ -13,8 +13,8 @@ use api_client::methods::ReadSource;
 use cluster_fleet::{
     agent_get, agent_prompt, agent_read, agent_rename, agent_send_keys, agent_wait_live,
     agent_watch_live, format_global_id, list_all_agents, parse_duration, parse_global_id,
-    parse_until, AgentListRow, FleetContext, FleetError, PollEvent, PollResult, WatchTuning,
-    LOCAL_LABEL,
+    parse_until, valid_id_part, AgentListRow, FleetContext, FleetError, PollEvent, PollResult,
+    WatchTuning, LOCAL_LABEL,
 };
 use cluster_node::project_state;
 
@@ -332,7 +332,7 @@ fn rename(id: &str, name: &str, verbose: bool) -> i32 {
 /// [`parse_global_id`] enforces (non-empty; no `/`, whitespace, or
 /// control characters).
 fn valid_agent_name(name: &str) -> bool {
-    parse_global_id(&format_global_id(LOCAL_LABEL, name)).is_ok()
+    valid_id_part(name)
 }
 
 /// Best-effort: after a successful `agent rename`, move the spawn

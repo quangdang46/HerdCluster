@@ -4,7 +4,7 @@
 //! (`auto` → scheduler placement, anything else → explicit label), builds
 //! a [`SpawnRequest`], and renders the [`SpawnResult`].
 
-use cluster_fleet::{spawn, FleetContext, MachineTarget, SpawnRequest};
+use cluster_fleet::{spawn, valid_id_part, FleetContext, MachineTarget, SpawnError, SpawnRequest};
 use cluster_node::project_state::{self, SpawnedAgent};
 
 use super::{load_ctx, vlog};
@@ -26,6 +26,27 @@ pub fn run(
     agent_args: Vec<String>,
     verbose: bool,
 ) -> i32 {
+    // Reject names that can't form a valid global ID *before* touching
+    // the network or state: the name is stamped verbatim into
+    // `{machine}/{name}` and `parse_global_id` rejects '/', whitespace,
+    // and control characters — an unchecked name would produce an id
+    // every later `agent` op refuses (issue #53). Same rule `agent
+    // rename` enforces; exit 2 like other usage errors.
+    if !valid_id_part(name) {
+        let e = SpawnError::InvalidName {
+            name: name.to_string(),
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string(&e.to_json()).unwrap_or_else(|_| "null".to_string())
+            );
+        } else {
+            eprintln!("error: {e}");
+        }
+        return 2;
+    }
+
     let ctx: FleetContext = match load_ctx(verbose, json) {
         Ok(ctx) => ctx,
         Err(code) => return code,
