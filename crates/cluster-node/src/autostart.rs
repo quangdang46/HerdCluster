@@ -167,6 +167,22 @@ fn dirs_home() -> PathBuf {
     PathBuf::from(".")
 }
 
+/// Quote one path for systemd `ExecStart=`. systemd splits the command
+/// line on whitespace unless a word is quoted, and expands `%`
+/// specifiers, so a raw path containing spaces or `%` would corrupt the
+/// unit. Per `systemd.syntax(7)`, inside `"…"` a backslash escapes the
+/// next character, and a literal `%` is written `%%`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn systemd_quote_arg(path: &Path) -> String {
+    let mut s = path.display().to_string();
+    // Specifier escaping first: `%` → `%%` introduces no quotes or
+    // backslashes, so later steps can't corrupt it.
+    s = s.replace('%', "%%");
+    // systemd quoting: `\` escapes the next char inside double quotes.
+    s = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{s}\"")
+}
+
 /// Render the systemd user unit for `exe`.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn systemd_unit_contents(exe: &Path) -> String {
@@ -183,7 +199,7 @@ fn systemd_unit_contents(exe: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exe.display()
+        systemd_quote_arg(exe)
     )
 }
 
@@ -242,11 +258,24 @@ fn launchd_plist_path() -> PathBuf {
     launch_agents_dir().join(format!("{LAUNCHD_LABEL}.plist"))
 }
 
+/// Escape text for a plist `<string>` value. `&`, `<`, and `>` are XML
+/// metacharacters; interpolating a raw path containing them produces a
+/// malformed plist that launchd silently rejects.
+#[cfg(target_os = "macos")]
+fn plist_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Render the launchd plist for `exe`, logging to `log_dir`.
 #[cfg(target_os = "macos")]
 fn launchd_plist_contents(exe: &Path, log_dir: &Path) -> String {
     let out_log = log_dir.join("worker.out.log");
     let err_log = log_dir.join("worker.err.log");
+    let exe = plist_escape(&exe.display().to_string());
+    let out_log = plist_escape(&out_log.display().to_string());
+    let err_log = plist_escape(&err_log.display().to_string());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -270,9 +299,9 @@ fn launchd_plist_contents(exe: &Path, log_dir: &Path) -> String {
          \x20   <string>{err_log}</string>\n\
          </dict>\n\
          </plist>\n",
-        exe = exe.display(),
-        out_log = out_log.display(),
-        err_log = err_log.display(),
+        exe = exe,
+        out_log = out_log,
+        err_log = err_log,
     )
 }
 
@@ -388,9 +417,33 @@ mod tests {
         assert!(unit.contains("[Unit]"));
         assert!(unit.contains("[Service]"));
         assert!(unit.contains("[Install]"));
-        assert!(unit.contains("ExecStart=/usr/local/bin/herdcluster worker"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn systemd_unit_quotes_execstart_path() {
+        // The exe path is always double-quoted so spaces can't split
+        // argv and `%` can't expand as a specifier.
+        let exe = Path::new("/opt/my apps/herd%cluster/bin/herdcluster");
+        let unit = systemd_unit_contents(exe);
+        assert!(unit.contains(
+            "ExecStart=\"/opt/my apps/herd%%cluster/bin/herdcluster\" worker"
+        ));
+        // No unquoted `%` may remain on the ExecStart line.
+        let line = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .unwrap();
+        assert!(!line.replace("%%", "").contains('%'));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn systemd_quote_arg_escapes_quotes_and_backslashes() {
+        let q = systemd_quote_arg(Path::new("/opt/a\"b\\c%d/herdcluster"));
+        assert_eq!(q, "\"/opt/a\\\"b\\\\c%%d/herdcluster\"");
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -416,6 +469,23 @@ mod tests {
         assert!(plist.contains("worker"));
         assert!(plist.contains("/tmp/hc-logs/worker.out.log"));
         assert!(plist.contains("/tmp/hc-logs/worker.err.log"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn launchd_plist_escapes_xml_metacharacters() {
+        // A path containing `&`, `<`, `>` must not produce a malformed
+        // plist — launchd failures are warn-only, so a bad plist would
+        // silently never start the worker.
+        let exe = Path::new("/opt/a&b/<c>/herdcluster");
+        let log_dir = Path::new("/tmp/hc<&>logs");
+        let plist = launchd_plist_contents(exe, log_dir);
+        assert!(plist.contains("/opt/a&amp;b/&lt;c&gt;/herdcluster"));
+        assert!(plist.contains("/tmp/hc&lt;&amp;&gt;logs/worker.out.log"));
+        assert!(plist.contains("/tmp/hc&lt;&amp;&gt;logs/worker.err.log"));
+        // Raw metacharacters must not appear inside <string> values.
+        assert!(!plist.contains("<c>"));
+        assert!(!plist.contains("hc<&>"));
     }
 
     #[cfg(target_os = "macos")]

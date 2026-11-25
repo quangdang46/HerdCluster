@@ -303,6 +303,17 @@ fn watch_agent(id: &str, stuck_after: Option<&str>, json: bool, verbose: bool) -
 /// best-effort: an unrecorded agent or an unwritable state file never
 /// fails the rename itself.
 fn rename(id: &str, name: &str, verbose: bool) -> i32 {
+    // Reject names that can't form a valid global ID *before* touching
+    // the network: `sync_rename_record` writes `{machine}/{name}` into
+    // agents.json, and `parse_global_id` rejects '/', whitespace, and
+    // control characters — an unchecked name would corrupt that file.
+    if !valid_agent_name(name) {
+        eprintln!(
+            "error: invalid agent name {name:?}: must be non-empty and contain \
+             no '/', whitespace, or control characters"
+        );
+        return 2;
+    }
     let ctx = match load_ctx(verbose, false) {
         Ok(ctx) => ctx,
         Err(code) => return code,
@@ -315,6 +326,13 @@ fn rename(id: &str, name: &str, verbose: bool) -> i32 {
         }
         Err(e) => report_fleet_error(&e, false),
     }
+}
+
+/// Whether `name` is a legal agent part of a global ID — the same rules
+/// [`parse_global_id`] enforces (non-empty; no `/`, whitespace, or
+/// control characters).
+fn valid_agent_name(name: &str) -> bool {
+    parse_global_id(&format_global_id(LOCAL_LABEL, name)).is_ok()
 }
 
 /// Best-effort: after a successful `agent rename`, move the spawn
@@ -332,6 +350,11 @@ fn sync_rename_record(old_id: &str, new_name: &str, verbose: bool) {
         return;
     };
     let new_id = format_global_id(&gid.machine, new_name);
+    // `rename` validates `new_name` up front; re-check here so a future
+    // caller can't write a malformed key into agents.json.
+    if parse_global_id(&new_id).is_err() {
+        return;
+    }
     match project_state::rename_agent(&project, old_id, &new_id, new_name) {
         Ok(true) => vlog(
             verbose,
@@ -464,6 +487,15 @@ mod tests {
         assert_eq!(row[1], "wsl");
         assert_eq!(row[3], "unreachable");
         assert_eq!(row[4], "socket missing");
+    }
+
+    #[test]
+    fn valid_agent_name_matches_global_id_rules() {
+        assert!(valid_agent_name("claude-1"));
+        assert!(valid_agent_name("my.agent_v2"));
+        for bad in ["", "a/b", "a b", " a", "a\n", "a\tb"] {
+            assert!(!valid_agent_name(bad), "expected reject for {bad:?}");
+        }
     }
 
     #[test]
