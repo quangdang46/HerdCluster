@@ -14,9 +14,11 @@
 //! automation never blocks.
 
 use std::env;
-use std::io::{IsTerminal, Read, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
@@ -24,6 +26,18 @@ const REPO: &str = "quangdang46/herdr_cluster";
 const API_BASE: &str = "https://api.github.com";
 const USER_AGENT: &str = concat!("herdcluster/", env!("CARGO_PKG_VERSION"));
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Cap on a single HTTP download, in bytes. The release asset is one
+/// compressed Rust binary (~10–20 MiB today), and checksums.txt / the
+/// release JSON are tiny — 128 MiB is generous headroom while still
+/// bounding memory use against a hostile or compromised release asset.
+const MAX_DOWNLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Cap on the decompressed size of the `herdcluster` entry inside the
+/// release tarball. The compressed download is already capped, but a
+/// gzip bomb could still expand far past it during extraction, so each
+/// tar entry read is bounded independently.
+const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 
 /// `herdcluster update [--version vX.Y.Z] [--yes] [--json]`.
 pub fn run(version: Option<String>, yes: bool, json: bool, verbose: bool) -> i32 {
@@ -263,7 +277,7 @@ fn extract_binary(archive: &[u8]) -> Result<Vec<u8>, String> {
     let decoder = GzDecoder::new(Cursor::new(archive));
     let mut tar = tar::Archive::new(decoder);
     for entry in tar.entries().map_err(|e| format!("tar read failed: {e}"))? {
-        let mut entry = entry.map_err(|e| format!("tar entry failed: {e}"))?;
+        let entry = entry.map_err(|e| format!("tar entry failed: {e}"))?;
         let is_regular = entry.header().entry_type() == tar::EntryType::Regular;
         let named_herdcluster = entry
             .path()
@@ -271,10 +285,7 @@ fn extract_binary(archive: &[u8]) -> Result<Vec<u8>, String> {
             .and_then(|p| p.file_name().map(|n| n == "herdcluster"))
             .unwrap_or(false);
         if is_regular && named_herdcluster {
-            let mut buf = Vec::new();
-            entry
-                .read_to_end(&mut buf)
-                .map_err(|e| format!("failed reading herdcluster from archive: {e}"))?;
+            let buf = read_capped(entry, MAX_BINARY_BYTES, "herdcluster entry in archive")?;
             if buf.is_empty() {
                 return Err("herdcluster entry in archive is empty".to_string());
             }
@@ -292,10 +303,38 @@ fn download(url: &str) -> Result<Vec<u8>, String> {
         .timeout(HTTP_TIMEOUT)
         .call()
         .map_err(|e| format!("GET {url} failed: {e}"))?;
+    // Reject early when the server advertises an oversized body; the
+    // take() cap in read_capped still guards chunked/lying responses.
+    if let Some(len) = resp
+        .header("Content-Length")
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "GET {url} failed: content-length {len} exceeds {} byte limit",
+                MAX_DOWNLOAD_BYTES
+            ));
+        }
+    }
+    read_capped(
+        resp.into_reader(),
+        MAX_DOWNLOAD_BYTES,
+        &format!("response from {url}"),
+    )
+}
+
+/// Read `reader` to EOF, failing if it yields more than `limit` bytes.
+/// Reads `limit + 1` internally so an oversized stream is detected
+/// rather than silently truncated.
+fn read_capped<R: Read>(reader: R, limit: u64, what: &str) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    resp.into_reader()
+    reader
+        .take(limit + 1)
         .read_to_end(&mut buf)
-        .map_err(|e| format!("reading response from {url} failed: {e}"))?;
+        .map_err(|e| format!("reading {what} failed: {e}"))?;
+    if buf.len() as u64 > limit {
+        return Err(format!("{what} exceeds {} byte limit", limit));
+    }
     Ok(buf)
 }
 
@@ -343,10 +382,18 @@ fn install_binary(binary: &[u8], version: &str, verbose: bool) -> Result<(), Str
         .parent()
         .ok_or("current executable has no parent directory")?;
 
-    let tmp = dir.join(format!(".herdcluster-update-{}", std::process::id()));
+    let (tmp, mut staged) = create_staging_file(dir)?;
     let write_result = (|| -> Result<(), String> {
-        std::fs::write(&tmp, binary)
+        // `create_new` (O_EXCL) guarantees we own the inode: a
+        // pre-planted symlink or file at the staging path fails the
+        // open instead of being written through.
+        staged
+            .write_all(binary)
             .map_err(|e| format!("failed writing {}: {e}", tmp.display()))?;
+        staged
+            .sync_all()
+            .map_err(|e| format!("fsync {} failed: {e}", tmp.display()))?;
+        drop(staged);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -395,6 +442,30 @@ fn install_binary(binary: &[u8], version: &str, verbose: bool) -> Result<(), Str
         let _ = std::fs::remove_file(&tmp);
     }
     write_result
+}
+
+/// Create a uniquely-named staging file next to the running executable
+/// and return its path plus an open handle. Uses `create_new` so an
+/// existing path — including a pre-planted symlink — can never be
+/// followed or clobbered; on the rare name collision we retry with a
+/// fresh name (timestamp nanos + attempt counter).
+fn create_staging_file(dir: &Path) -> Result<(PathBuf, File), String> {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    for attempt in 0..16u32 {
+        let tmp = dir.join(format!(".herdcluster-update-{pid}-{nanos}-{attempt}"));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!("failed creating {}: {e}", tmp.display()));
+            }
+        }
+    }
+    Err("could not create a unique staging file for update".to_string())
 }
 
 fn emit_result(outcome: &Outcome, json: bool) {
@@ -628,5 +699,44 @@ mod tests {
             checksums_url("v0.1.1"),
             "https://github.com/quangdang46/herdr_cluster/releases/download/v0.1.1/checksums.txt"
         );
+    }
+
+    #[test]
+    fn read_capped_accepts_under_limit_and_rejects_over() {
+        let ok = read_capped(&b"hello"[..], 5, "test stream").unwrap();
+        assert_eq!(ok, b"hello");
+        // One byte over the limit is rejected, not truncated.
+        let ok = read_capped(&b"hello"[..], 4, "test stream").unwrap_err();
+        assert!(ok.contains("exceeds 4 byte limit"), "{ok}");
+        let err = read_capped(&b"hello world"[..], 5, "test stream").unwrap_err();
+        assert!(err.contains("test stream exceeds 5 byte limit"), "{err}");
+    }
+
+    #[test]
+    fn staging_file_is_unique_writable_and_owned() {
+        let dir = std::env::temp_dir().join(format!("hc-update-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path1, mut f1) = create_staging_file(&dir).unwrap();
+        let (path2, _f2) = create_staging_file(&dir).unwrap();
+        assert_ne!(path1, path2);
+        assert!(path1.starts_with(&dir));
+        assert!(path1
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".herdcluster-update-"));
+        use std::io::Write;
+        f1.write_all(b"payload").unwrap();
+        drop(f1);
+        assert_eq!(std::fs::read(&path1).unwrap(), b"payload");
+        // A second open of the same path must fail — create_new owns it.
+        assert!(OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path1)
+            .is_err());
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
