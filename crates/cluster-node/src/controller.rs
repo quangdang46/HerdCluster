@@ -337,7 +337,10 @@ fn rotate_locked(g: &mut PairingInner, code_slot: &Arc<Mutex<String>>, ca_finger
     *code_slot.lock().unwrap() = code.clone();
     println!("new pairing code: {code}");
     println!("pair with: herdcluster join --code {code}");
-    println!("controller CA fingerprint: {ca_fingerprint}");
+    println!(
+        "controller CA fingerprint: {}",
+        crate::worker::fingerprint_display(ca_fingerprint)
+    );
 }
 
 // ---- ControllerHandle ----
@@ -590,7 +593,10 @@ impl ControllerHandle {
         // this fingerprint against the one in PairAccept before saving
         // the credential. Keep it on its own line, unadorned, so the
         // two displays diff cleanly by eye.
-        println!("controller CA fingerprint: {}", pairing.ca_fingerprint);
+        println!(
+            "controller CA fingerprint: {}",
+            crate::worker::fingerprint_display(&pairing.ca_fingerprint)
+        );
 
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1149,11 +1155,27 @@ async fn install_worker_bridge(
                 .is_some_and(|cur| Arc::ptr_eq(&cur, &ws.session))
     };
 
+    // One deadline bounds the WHOLE install: every SocketInUse retry —
+    // including sockets owned outside the `bridges` map, which the
+    // occupied-check below can never see — must give up eventually
+    // rather than spin (issue #94 follow-up).
+    let install_deadline = std::time::Instant::now() + BRIDGE_SOCKET_FREE_TIMEOUT;
+    let give_up = |worker: &str| {
+        tracing::warn!(
+            worker = %worker,
+            "bridge socket still unavailable after {BRIDGE_SOCKET_FREE_TIMEOUT:?}; giving up"
+        );
+    };
+
     loop {
         if !session_current(controller) {
             // Superseded or already dead — a newer connect (or the
             // disconnect path) owns the bridge now.
             tracing::debug!(worker = %label, "worker session superseded before bridge install");
+            return;
+        }
+        if std::time::Instant::now() >= install_deadline {
+            give_up(label);
             return;
         }
         match ControllerBridge::new(state_dir, label, ws.session.clone()).await {
@@ -1180,7 +1202,6 @@ async fn install_worker_bridge(
                 // typically the previous session's listener whose
                 // disconnect hasn't been processed yet. Wait for it to
                 // leave the bridges map, then retry the bind.
-                let deadline = std::time::Instant::now() + BRIDGE_SOCKET_FREE_TIMEOUT;
                 loop {
                     if !session_current(controller) {
                         tracing::debug!(
@@ -1197,15 +1218,17 @@ async fn install_worker_bridge(
                     if !occupied {
                         break; // socket freed — retry the bind
                     }
-                    if std::time::Instant::now() >= deadline {
-                        tracing::warn!(
-                            worker = %label,
-                            "bridge socket still held after {BRIDGE_SOCKET_FREE_TIMEOUT:?}; giving up"
-                        );
+                    if std::time::Instant::now() >= install_deadline {
+                        give_up(label);
                         return;
                     }
                     tokio::time::sleep(BRIDGE_SOCKET_FREE_POLL).await;
                 }
+                // The map shows the path free, but a foreign process may
+                // still own the listener — pace the outer retry so a
+                // persistent SocketInUse can't busy-spin until the
+                // deadline above fires.
+                tokio::time::sleep(BRIDGE_SOCKET_FREE_POLL).await;
             }
             Err(e) => {
                 tracing::warn!(worker = %label, "bridge bind failed: {e}");

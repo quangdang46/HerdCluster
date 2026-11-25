@@ -329,7 +329,7 @@ fn fingerprint_check(cfg: &JoinConfig) -> FingerprintCheck {
 /// grouped into 4-char chunks (`0123 4567 89ab cdef`) so the worker's
 /// string and the controller's string are easy to compare visually.
 /// Anything not a multiple of 4 chars keeps its tail ungrouped.
-fn fingerprint_display(fp: &str) -> String {
+pub(crate) fn fingerprint_display(fp: &str) -> String {
     let mut out = String::with_capacity(fp.len() + fp.len() / 4);
     for (i, ch) in fp.chars().enumerate() {
         if i > 0 && i % 4 == 0 {
