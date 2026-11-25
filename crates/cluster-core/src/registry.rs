@@ -417,7 +417,16 @@ impl WorkerRegistry {
     /// Insert or update a worker. Matches first by `worker_id`, then by
     /// `pubkey` (the cryptographic identity); a pubkey match under a
     /// different id updates that row in place.
-    pub fn upsert(&mut self, entry: WorkerEntry) {
+    ///
+    /// A pubkey match is a *re-pair* of the same worker: the stable
+    /// `worker_id` and all liveness state (`paired_at`, `last_seen`,
+    /// `status`, `resources`) are preserved — only `label` (and any other
+    /// caller-supplied identity fields) are refreshed. Rotating
+    /// `worker_id` here would orphan the controller's per-worker bridge
+    /// map (keyed by `worker_id`): the stale disconnect would resolve the
+    /// *new* id, never remove the old bridge, and the replacement bind
+    /// would hit `SocketInUse` — permanently bridgeless (issue #98).
+    pub fn upsert(&mut self, mut entry: WorkerEntry) {
         if let Some(pos) = self
             .data
             .workers
@@ -433,7 +442,13 @@ impl WorkerRegistry {
             .iter()
             .position(|w| w.pubkey == entry.pubkey)
         {
-            self.data.workers[pos] = entry;
+            let existing = &mut self.data.workers[pos];
+            entry.worker_id = existing.worker_id.clone();
+            entry.paired_at = existing.paired_at;
+            entry.last_seen = existing.last_seen;
+            entry.status = existing.status;
+            entry.resources = existing.resources.clone();
+            *existing = entry;
             return;
         }
         self.data.workers.push(entry);
@@ -582,22 +597,68 @@ mod tests {
         assert!(reg2.get("w1").is_some());
         assert!(reg2.get("nope").is_none());
 
-        // Upsert by pubkey with a different id updates in place.
+        // Upsert by pubkey with a different id updates in place and
+        // preserves the stable worker_id (issue #98).
         let mut e = entry("w3", "renamed");
         e.pubkey = pubkey_for("w1"); // same pubkey as w1
         reg2.upsert(e);
         reg2.save().unwrap();
         let reg3 = WorkerRegistry::open(&path).unwrap();
         assert_eq!(reg3.list().len(), 2);
-        assert_eq!(reg3.list()[0].worker_id, "w3");
+        assert_eq!(reg3.list()[0].worker_id, "w1");
+        assert_eq!(reg3.list()[0].label, "renamed");
 
         // Removal.
         let mut reg4 = WorkerRegistry::open(&path).unwrap();
-        assert!(reg4.remove("w3"));
-        assert!(!reg4.remove("w3"));
+        assert!(reg4.remove("w1"));
+        assert!(!reg4.remove("w1"));
         reg4.save().unwrap();
         let reg5 = WorkerRegistry::open(&path).unwrap();
         assert_eq!(reg5.list().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_same_pubkey_preserves_worker_id_and_state() {
+        // Issue #98: re-pairing the same pubkey must keep worker_id and
+        // liveness state — the controller's bridge map is keyed by
+        // worker_id, so rotating it orphans the old bridge entry.
+        let dir = tmpdir("upsert-preserve");
+        let path = dir.join(WORKERS_FILE_NAME);
+        let mut reg = WorkerRegistry::open(&path).unwrap();
+        let mut w = entry("w1", "old-label");
+        w.last_seen = Some(Utc::now());
+        w.status = WorkerStatus::Online;
+        w.resources = Some(resources(3));
+        let paired_at = w.paired_at;
+        reg.upsert(w);
+
+        // Re-pair: same pubkey, fresh random id + label, reset state.
+        let mut e = entry("w9-newid", "new-label");
+        e.pubkey = pubkey_for("w1");
+        e.last_seen = None;
+        e.status = WorkerStatus::Offline;
+        e.resources = None;
+        reg.upsert(e);
+
+        assert_eq!(reg.list().len(), 1);
+        assert!(reg.get("w9-newid").is_none());
+        let w = reg.get("w1").expect("worker_id preserved");
+        assert_eq!(w.label, "new-label");
+        assert_eq!(w.paired_at, paired_at);
+        assert!(w.last_seen.is_some());
+        assert_eq!(w.status, WorkerStatus::Online);
+        assert_eq!(w.resources.as_ref().unwrap().agent_count, 3);
+
+        // worker_id match still replaces wholesale (explicit id update).
+        let mut by_id = entry("w1", "id-update");
+        by_id.pubkey = "ff".repeat(32);
+        by_id.last_seen = None;
+        reg.upsert(by_id);
+        let w = reg.get("w1").unwrap();
+        assert_eq!(w.label, "id-update");
+        assert_eq!(w.pubkey, "ff".repeat(32));
+        assert!(w.last_seen.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
