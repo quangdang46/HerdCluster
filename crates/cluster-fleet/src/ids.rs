@@ -124,17 +124,14 @@ pub fn resolve_existing_agent(
     let client = resolved.endpoint.client()?;
     match client.agent_get(&resolved.agent) {
         Ok(_) => Ok(resolved),
-        Err(api_client::ApiError::Server { code, .. })
-            if code.contains("not_found")
-                || code.contains("unknown")
-                || code.contains("no_such") =>
-        {
-            Err(FleetError::AgentNotFound {
-                machine: resolved.machine,
-                agent: resolved.agent,
-            })
+        Err(e) => {
+            if let api_client::ApiError::Server { code, .. } = &e {
+                if let Some(err) = agent_not_found(&resolved.machine, &resolved.agent, code) {
+                    return Err(err);
+                }
+            }
+            Err(map_api_error(&resolved.endpoint.label, e))
         }
-        Err(e) => Err(map_api_error(&resolved.endpoint.label, e)),
     }
 }
 
@@ -156,11 +153,30 @@ pub(crate) fn map_api_error(machine: &str, e: api_client::ApiError) -> FleetErro
     }
 }
 
+/// herdr 0.9.5 server error codes meaning "the agent target does not
+/// exist" — emitted by `agent.*`/`pane.*` handlers when the target name,
+/// agent, or backing pane is gone (verified against the installed
+/// `herdr` 0.9.5 binary's `api/agents.rs` error table).
+///
+/// This is an **explicit allowlist**, not a substring match: codes like
+/// `unknown_method`, `workspace_not_found`, or `internal_unknown_state`
+/// merely *contain* `unknown`/`not_found` and must surface as real API
+/// errors, not `agent_not_found` (issue #42).
+const AGENT_NOT_FOUND_CODES: &[&str] = &[
+    "agent_not_found",
+    "agent_name_not_found",
+    "agent_pane_not_found",
+    "pane_not_found",
+    "target_pane_not_found",
+    "source_pane_not_found",
+    "not_found",
+];
+
 /// Map an `api-client` *server* error code to [`FleetError::AgentNotFound`]
-/// when the code indicates the agent target does not exist; `None` means
-/// "not an agent-not-found".
+/// when the code is a known herdr agent-target-missing code; `None`
+/// means "not an agent-not-found".
 pub(crate) fn agent_not_found(machine: &str, agent: &str, code: &str) -> Option<FleetError> {
-    if code.contains("not_found") || code.contains("unknown") || code.contains("no_such") {
+    if AGENT_NOT_FOUND_CODES.contains(&code) {
         Some(FleetError::AgentNotFound {
             machine: machine.to_string(),
             agent: agent.to_string(),
@@ -214,6 +230,50 @@ mod tests {
             assert!(
                 matches!(parse_global_id(bad), Err(FleetError::MalformedId { .. })),
                 "expected MalformedId for {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_not_found_uses_explicit_code_allowlist() {
+        // Known herdr agent-target-missing codes → AgentNotFound.
+        for code in [
+            "agent_not_found",
+            "agent_name_not_found",
+            "agent_pane_not_found",
+            "pane_not_found",
+            "target_pane_not_found",
+            "source_pane_not_found",
+            "not_found",
+        ] {
+            let err = agent_not_found("m", "a", code).expect("should be agent-not-found");
+            assert!(matches!(err, FleetError::AgentNotFound { .. }), "{code}");
+        }
+        // Codes that merely *contain* not_found/unknown/no_such must NOT
+        // be misreported as agent_not_found (issue #42).
+        for code in [
+            "unknown_method",
+            "method_not_found",
+            "workspace_not_found",
+            "internal_unknown_state",
+            "tab_not_found",
+            "worktree_not_found",
+            "plugin_not_found",
+            "plugin_action_not_found",
+            "plugin_pane_not_found",
+            "command_not_found",
+            "layout_not_found",
+            "split_not_found",
+            "repo_not_found",
+            "agent_target_ambiguous",
+            "agent_not_ready",
+            "invalid_target",
+            "timeout",
+            "internal_error",
+        ] {
+            assert!(
+                agent_not_found("m", "a", code).is_none(),
+                "{code} must not map to AgentNotFound"
             );
         }
     }
