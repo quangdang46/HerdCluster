@@ -28,6 +28,22 @@ curl -fsSL "https://raw.githubusercontent.com/quangdang46/herd_cluster/main/inst
 
 ---
 
+## Why spawn *separate* coding agents?
+
+Subagents inside one agent session share its context, tools, and failure
+modes — they inherit its blind spots and burn the same context window. Real
+parallel work needs **independent agents with their own sessions, worktrees,
+and lifecycles**, coordinated by an orchestrator that can read, prompt, and
+retask each one. That is exactly what HerdCluster provides.
+
+- [anti_subagent](https://github.com/quangdang46/anti_subagent) — the case
+  against delegating to built-in subagents.
+- [SLP: Supervisor–Lead–Peer](https://ultrabuilders.xyz/en/posts/slp-supervisor-lead-peer) —
+  a pattern for orchestrating many independent coding agents instead of
+  nesting them.
+
+---
+
 ## Agent Quickstart
 
 HerdCluster is built to be driven by agents, not just humans. Every read
@@ -89,22 +105,6 @@ published NDJSON socket API. Upstream herdr updates flow through untouched.
 | Resource-aware `--machine auto` | ✅ CPU/RAM/slots | ❌ | ❌ | ⚠️ opaque |
 | No modification to agent runtimes | ✅ pure API wrapper | ✅ | ✅ | n/a |
 | Cost | free, your hardware | free | free | per-seat pricing |
-
----
-
-## Why spawn *separate* coding agents?
-
-Subagents inside one agent session share its context, tools, and failure
-modes — they inherit its blind spots and burn the same context window. Real
-parallel work needs **independent agents with their own sessions, worktrees,
-and lifecycles**, coordinated by an orchestrator that can read, prompt, and
-retask each one. That is exactly what HerdCluster provides.
-
-- [anti_subagent](https://github.com/quangdang46/anti_subagent) — the case
-  against delegating to built-in subagents.
-- [SLP: Supervisor–Lead–Peer](https://ultrabuilders.xyz/en/posts/slp-supervisor-lead-peer) —
-  a pattern for orchestrating many independent coding agents instead of
-  nesting them.
 
 ---
 
