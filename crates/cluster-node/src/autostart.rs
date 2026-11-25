@@ -208,7 +208,7 @@ fn install_systemd(exe: &Path) -> Result<PathBuf, AutostartError> {
     let dir = systemd_unit_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(SYSTEMD_UNIT_NAME);
-    std::fs::write(&path, systemd_unit_contents(exe))?;
+    atomic_write(&path, systemd_unit_contents(exe).as_bytes())?;
     tracing::info!(unit = %path.display(), "wrote systemd user unit");
 
     // Best-effort activation. WSL2 without systemd, containers, and
@@ -318,7 +318,7 @@ fn install_launchd(exe: &Path) -> Result<PathBuf, AutostartError> {
     std::fs::create_dir_all(&log_dir)?;
 
     let path = dir.join(format!("{LAUNCHD_LABEL}.plist"));
-    std::fs::write(&path, launchd_plist_contents(exe, &log_dir))?;
+    atomic_write(&path, launchd_plist_contents(exe, &log_dir).as_bytes())?;
     tracing::info!(plist = %path.display(), "wrote launchd agent plist");
 
     // Best-effort activation: modern `launchctl bootstrap`, legacy
@@ -376,6 +376,39 @@ fn launchd_uid() -> Option<String> {
 // shared
 // ---------------------------------------------------------------------------
 
+/// Write `contents` to `path` atomically: PID-unique sibling temp file,
+/// fsync, rename, then a best-effort parent-directory fsync so the rename
+/// is durable. Mirrors `worker::atomic_write_600` and
+/// `cluster_core::fsutil::atomic_write` (both private to their crates),
+/// but without pinning `0600` — unit files and plists keep the default
+/// umask permissions `std::fs::write` used to produce.
+#[cfg(unix)]
+fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        use std::io::Write;
+        f.write_all(contents)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // Best-effort directory fsync so the rename is durable across crashes.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Run a service-manager command best-effort: `true` on exit status 0.
 /// Missing binaries and non-zero exits only produce a `tracing::warn`.
 #[cfg(unix)]
@@ -407,6 +440,27 @@ mod tests {
             AutostartStatus::NotInstalled => {}
             AutostartStatus::Unsupported { reason } => assert!(!reason.is_empty()),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_roundtrip_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("hc-autostart-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("unit.service");
+        atomic_write(&path, b"v1").unwrap();
+        atomic_write(&path, b"v2-longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"v2-longer");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
