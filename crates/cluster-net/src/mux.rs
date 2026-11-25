@@ -311,6 +311,13 @@ impl StreamHandle {
             st.recv_done.store(true, Ordering::Release);
             return Err(dead_err(st));
         }
+        // Re-check under the lock: a concurrent recv() may have consumed
+        // the Fin while we waited for the mutex. Without this, the loser
+        // blocks on `rx.recv()` forever — the channel stays open but no
+        // further InMsg will ever arrive.
+        if st.recv_done.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         match rx.recv().await {
             Some(InMsg::Data(b)) => {
                 st.in_bytes.fetch_sub(b.len(), Ordering::AcqRel);
@@ -657,10 +664,10 @@ async fn dispatch_frame(shared: &Arc<Shared>, stream_id: u32, flags: u8, payload
     let rst = flags & FLAG_RST != 0;
 
     // Resolve or create the stream state.
-    let st = {
+    let (st, created) = {
         let mut map = shared.streams.lock().unwrap();
         match map.get(&stream_id) {
-            Some(s) => s.clone(),
+            Some(s) => (s.clone(), false),
             None => {
                 if !is_open {
                     // Frame for an unknown stream — drop it (peer may have
@@ -683,12 +690,29 @@ async fn dispatch_frame(shared: &Arc<Shared>, stream_id: u32, flags: u8, payload
                 }
                 let state = new_stream_state(stream_id, shared.write_notify.clone());
                 map.insert(stream_id, state.clone());
-                state
+                (state, true)
             }
         }
     };
 
     if is_open {
+        if !created {
+            // OPEN for a stream we already track is a protocol violation
+            // (duplicate OPEN or wrong ID space). Handing out a second
+            // StreamHandle would split inbound bytes between two pipe
+            // tasks, so reject the stream with RST instead.
+            st.flags.fetch_or(SF_RESET | SF_DEAD, Ordering::AcqRel);
+            queue_out(
+                &st,
+                OutItem {
+                    flags: FLAG_RST,
+                    payload: Bytes::new(),
+                },
+            );
+            let _ = st.in_tx.try_send(InMsg::Reset);
+            gc_stream(shared, &st);
+            return true;
+        }
         // First frame for a peer-opened stream: hand the handle to accept().
         let handle = StreamHandle { shared: st.clone() };
         // accept_tx is bounded; if full, reset the stream.
@@ -1074,5 +1098,99 @@ mod tests {
         d.close();
         let res = timeout(Duration::from_secs(5), &mut pending).await.unwrap();
         assert!(res.is_err());
+    }
+
+    /// Serialize one mux frame for raw injection into the wire.
+    fn wire_frame(id: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = Vec::with_capacity(HEADER_LEN + payload.len());
+        v.extend_from_slice(&id.to_be_bytes());
+        v.push(flags);
+        v.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    /// Regression for duplicate OPEN: a second OPEN for an already-known
+    /// stream id must not hand out a second StreamHandle (which would
+    /// split inbound bytes between two pipe tasks). The peer gets RST.
+    #[tokio::test]
+    async fn duplicate_open_is_rejected_with_rst() {
+        let (mut client, server) = duplex(1 << 16);
+        let acceptor = Mux::new(server, MuxRole::Acceptor);
+
+        // Two OPENs for the same peer-space (dialer) stream id: 7.
+        client
+            .write_all(&wire_frame(7, FLAG_OPEN, b""))
+            .await
+            .unwrap();
+        client
+            .write_all(&wire_frame(7, FLAG_OPEN, b""))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        // Exactly one handle is accepted.
+        let h = timeout(Duration::from_secs(5), acceptor.accept_stream())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.id(), 7);
+
+        // No second handle is ever handed out.
+        assert!(timeout(Duration::from_millis(300), acceptor.accept_stream())
+            .await
+            .is_err());
+
+        // The duplicate OPEN is answered with RST on the wire.
+        let mut hdr = [0u8; HEADER_LEN];
+        timeout(Duration::from_secs(5), client.read_exact(&mut hdr))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(u32::from_be_bytes(hdr[0..4].try_into().unwrap()), 7);
+        assert_ne!(hdr[4] & FLAG_RST, 0);
+
+        // And the accepted handle observes the reset.
+        let res = timeout(Duration::from_secs(5), h.recv()).await.unwrap();
+        assert!(matches!(res, Err(MuxError::Reset)));
+    }
+
+    /// Regression for the recv() race: once FIN is consumed, every
+    /// concurrent/subsequent recv() must return Ok(None) — none may block
+    /// forever on the still-open inbound channel.
+    #[tokio::test]
+    async fn concurrent_recv_after_fin_all_complete() {
+        let (d, a) = mux_pair();
+        let (s, p) = open_pair(&d, &a).await;
+        s.send_bytes(b"data").await.unwrap();
+        s.close().unwrap();
+
+        // Race many recv() callers on clones of the same handle.
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let p = p.clone();
+            tasks.push(tokio::spawn(async move { p.recv().await }));
+        }
+        let mut saw_data = false;
+        let mut saw_eof = 0usize;
+        for t in tasks {
+            match timeout(Duration::from_secs(5), t)
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Ok(Some(_)) => saw_data = true,
+                Ok(None) => saw_eof += 1,
+                Err(e) => panic!("unexpected recv error: {e}"),
+            }
+        }
+        assert!(saw_data);
+        assert_eq!(saw_eof, 7);
+        // recv() stays EOF forever after.
+        assert!(timeout(Duration::from_secs(5), p.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
     }
 }
