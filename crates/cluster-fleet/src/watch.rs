@@ -103,8 +103,11 @@ pub enum PollResult {
     /// The status entered the until-set. `agent` is the last `agent.get`
     /// response (contains the full agent record).
     Matched { status: String, agent: Value },
-    /// The agent disappeared mid-poll (`agent.get` → not-found). For
-    /// `watch` this is a clean end state: the agent exited.
+    /// The agent disappeared *after* being observed at least once
+    /// (`agent.get` → not-found mid-poll). For `watch` this is a clean
+    /// end state: the agent exited. A not-found on the very first poll
+    /// is [`FleetError::AgentNotFound`] instead — the ID never existed
+    /// (e.g. a typo), which must not look like success (issue #10).
     Gone,
     /// The timeout elapsed before the status entered the until-set.
     TimedOut { last_status: Option<String> },
@@ -206,7 +209,9 @@ pub fn parse_until(input: &str) -> Result<BTreeSet<String>, FleetError> {
 /// Each iteration:
 /// 1. Returns [`PollResult::TimedOut`] if the deadline passed.
 /// 2. Calls `fetch`. [`FleetError::AgentNotFound`] maps to
-///    [`PollResult::Gone`]; every other error aborts the loop.
+///    [`PollResult::Gone`] once the agent has been observed; on the
+///    first poll it propagates as an error (never-existed ID, issue
+///    #10). Every other error aborts the loop.
 /// 3. Emits a [`PollEvent::Status`] on every status change (including the
 ///    first observation) and a [`PollEvent::Stuck`] once per busy streak
 ///    that exceeds `tuning.stuck_after`.
@@ -239,7 +244,12 @@ where
 
         let value = match fetch() {
             Ok(v) => v,
-            Err(FleetError::AgentNotFound { .. }) => return Ok(PollResult::Gone),
+            // `prev_status` is `Some` iff a fetch already succeeded, so
+            // not-found here means the agent vanished mid-wait → Gone.
+            // On the first poll it means the ID never existed → error.
+            Err(FleetError::AgentNotFound { .. }) if prev_status.is_some() => {
+                return Ok(PollResult::Gone)
+            }
             Err(e) => return Err(e),
         };
         let status = agent_status(&value).unwrap_or_else(|| "unknown".to_string());
@@ -374,7 +384,10 @@ fn is_server_timeout(e: &ApiError) -> bool {
 /// Map an `agent.wait` API error to a wait outcome:
 ///
 /// * `Ok(None)` — endpoint can't do server-side waits; caller polls.
-/// * `Ok(Some(PollResult::Gone))` — agent target does not exist.
+/// * `Ok(Some(PollResult::Gone))` — agent target vanished after the
+///   upfront existence check in [`agent_wait_server`] passed (it
+///   disappeared mid-wait). A not-found *before* any successful lookup
+///   never reaches here — the pre-check returns `agent_not_found`.
 /// * `Ok(Some(PollResult::TimedOut))` — server-side `timeout_ms` elapsed.
 /// * `Err` — real failure (unreachable, protocol, ...).
 ///
@@ -428,6 +441,15 @@ fn agent_wait_server(
 ) -> Result<Option<PollResult>, FleetError> {
     let (resolved, client) = ops::resolve_and_connect(ctx, global_id)?;
     let target = resolved.agent.clone();
+
+    // First lookup: confirm the agent exists before blocking on
+    // `agent.wait`. Without this, a typo'd ID surfaces as
+    // `PollResult::Gone` ("agent_gone", exit 0) — indistinguishable
+    // from a mid-wait disappearance (issue #10). A not-found from
+    // `agent.wait` itself, after this check passed, still maps to Gone.
+    client
+        .agent_get(&target)
+        .map_err(|e| ops::op_error(&resolved, e))?;
 
     let timeout_ms = tuning
         .timeout
@@ -646,12 +668,15 @@ fn agent_watch_stream(
                 crate::fleet::normalize_agent_get(&v, &target)
             }
             Err(e) => {
-                if let ApiError::Server { code, .. } = &e {
+                let gone = matches!(&e, ApiError::Server { code, .. }
                     if crate::ids::agent_not_found(&resolved.machine, &resolved.agent, code)
-                        .is_some()
-                    {
-                        return Ok(Some(PollResult::Gone));
-                    }
+                        .is_some());
+                // Mid-watch disappearance is a clean end state. On the
+                // first lookup not-found means the ID never existed —
+                // fall through so the poll loop surfaces the typed
+                // `agent_not_found` error (issue #10).
+                if gone && emitted_initial {
+                    return Ok(Some(PollResult::Gone));
                 }
                 if !emitted_initial {
                     // Nothing emitted yet — let the poll loop produce
@@ -977,6 +1002,7 @@ mod tests {
 
     #[test]
     fn poll_agent_not_found_is_gone_not_error() {
+        // Observed once, then disappears → mid-wait gone, still success.
         let mut responses =
             std::collections::VecDeque::from(vec![Ok(get("working")), Err(not_found())]);
         let result = poll_until(
@@ -987,6 +1013,23 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(result, PollResult::Gone));
+    }
+
+    #[test]
+    fn poll_agent_not_found_on_first_poll_is_error() {
+        // Never existed (typo'd id) → typed agent_not_found error, not a
+        // success-looking Gone (issue #10).
+        let mut responses =
+            std::collections::VecDeque::from(vec![Err(not_found())]);
+        let e = poll_until(
+            &mut fake(&mut responses),
+            &until(&["done"]),
+            &fast(),
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), "agent_not_found");
+        assert_eq!(e.to_json()["error"]["code"], "agent_not_found");
     }
 
     #[test]
