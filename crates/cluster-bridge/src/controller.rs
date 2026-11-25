@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use cluster_net::conn::Session;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::paths;
 use crate::pipe::pipe_unix_stream;
@@ -64,7 +65,7 @@ impl ControllerBridge {
         session: Arc<Session>,
         idle_timeout: Duration,
     ) -> Result<Self, BridgeError> {
-        let (listener, socket_path) = bind_bridge_socket(state_dir, worker_label)?;
+        let (listener, socket_path) = bind_bridge_socket(state_dir, worker_label).await?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let accept_task = tokio::spawn(accept_loop(listener, session, idle_timeout, shutdown_rx));
         Ok(Self {
@@ -111,9 +112,22 @@ impl Drop for ControllerBridge {
     }
 }
 
+/// Bound on the stale-socket connect probe. A connect to a healthy unix
+/// listener completes (or is refused) essentially instantly; hitting this
+/// timeout means the listener's accept backlog is saturated — which only
+/// happens when a *live* bridge owns the path — so a probe timeout maps to
+/// [`BridgeError::SocketInUse`], never "stale".
+const SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Create `<state_dir>/bridge/` (0700), sweep a stale socket at `path`,
 /// bind the listener, and chmod the socket file to 0600.
-fn bind_bridge_socket(
+///
+/// The connect probe is async + timeout-bounded: a blocking `connect(2)`
+/// on a live-but-backlogged unix listener could otherwise stall a tokio
+/// worker thread indefinitely (#102). The remaining fs ops (`create_dir_all`,
+/// `bind`, `chmod`, `remove_file`) are O(µs) local syscalls and stay
+/// synchronous.
+async fn bind_bridge_socket(
     state_dir: &Path,
     worker_label: &str,
 ) -> Result<(UnixListener, PathBuf), BridgeError> {
@@ -130,9 +144,13 @@ fn bind_bridge_socket(
     // Stale-socket sweep: a connect probe distinguishes "live listener"
     // (refuse to steal) from "dead file" (unlink and rebind).
     if socket_path.exists() || socket_path.symlink_metadata().is_ok() {
-        match std::os::unix::net::UnixStream::connect(&socket_path) {
-            Ok(_) => return Err(BridgeError::SocketInUse(socket_path)),
-            Err(_) => {
+        match timeout(SOCKET_PROBE_TIMEOUT, UnixStream::connect(&socket_path)).await {
+            // Connected — or the connect stalled past the timeout because
+            // the owner's accept backlog is full: either way a live bridge
+            // owns this path, refuse to steal it.
+            Ok(Ok(_)) | Err(_) => return Err(BridgeError::SocketInUse(socket_path)),
+            // Refused (or other connect error): stale file, unlink and rebind.
+            Ok(Err(_)) => {
                 std::fs::remove_file(&socket_path)?;
             }
         }
