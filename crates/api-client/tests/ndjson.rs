@@ -478,6 +478,80 @@ fn socket_path_candidates_session_env_adds_candidate() {
         .any(|p| p.to_string_lossy().contains("my-session")));
 }
 
+#[test]
+fn socket_path_explicit_env_wins_even_when_missing() {
+    // Regression test for issue #67: a stale HERDR_SOCKET_PATH must not
+    // fall through to the default-session socket.
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", dir.path());
+    // The default socket exists on disk — the old probe would pick it.
+    let default_sock = dir.path().join("herdr").join("herdr.sock");
+    std::fs::create_dir_all(default_sock.parent().unwrap()).unwrap();
+    std::fs::write(&default_sock, b"").unwrap();
+
+    let stale = Path::new("/nonexistent-dir-67/stale-herdr.sock");
+    assert!(!stale.exists());
+    std::env::set_var("HERDR_SOCKET_PATH", stale);
+    std::env::remove_var("HERDR_SESSION");
+    let resolved = api_client::platform::socket_path().unwrap();
+    std::env::remove_var("HERDR_SOCKET_PATH");
+    std::env::remove_var("XDG_CONFIG_HOME");
+    assert_eq!(resolved, stale);
+
+    // connect() surfaces the typed error naming the explicit path.
+    match ApiClient::connect(&resolved) {
+        Err(ApiError::ServerNotRunning { path }) => assert_eq!(path, stale),
+        other => panic!("expected ServerNotRunning, got {other:?}"),
+    }
+}
+
+#[test]
+fn socket_path_session_env_wins_over_default_even_when_missing() {
+    // A non-default HERDR_SESSION must never be silently substituted by
+    // the default-session socket.
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", dir.path());
+    let default_sock = dir.path().join("herdr").join("herdr.sock");
+    std::fs::create_dir_all(default_sock.parent().unwrap()).unwrap();
+    std::fs::write(&default_sock, b"").unwrap();
+
+    std::env::set_var("HERDR_SESSION", "other");
+    std::env::remove_var("HERDR_SOCKET_PATH");
+    let resolved = api_client::platform::socket_path().unwrap();
+    std::env::remove_var("HERDR_SESSION");
+    std::env::remove_var("XDG_CONFIG_HOME");
+    assert_ne!(resolved, default_sock);
+    assert!(
+        resolved
+            .to_string_lossy()
+            .contains("sessions/other/herdr.sock"),
+        "resolved: {resolved:?}"
+    );
+}
+
+#[test]
+fn socket_path_default_probe_unchanged_without_env() {
+    // With no explicit env config, discovery still probes the default
+    // candidate and returns it whether or not it exists yet.
+    let _lock = env_lock();
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("XDG_CONFIG_HOME", dir.path());
+    std::env::remove_var("HERDR_SOCKET_PATH");
+    std::env::remove_var("HERDR_SESSION");
+    let default_sock = dir.path().join("herdr").join("herdr.sock");
+
+    let resolved = api_client::platform::socket_path().unwrap();
+    assert_eq!(resolved, default_sock);
+
+    std::fs::create_dir_all(default_sock.parent().unwrap()).unwrap();
+    std::fs::write(&default_sock, b"").unwrap();
+    let resolved = api_client::platform::socket_path().unwrap();
+    std::env::remove_var("XDG_CONFIG_HOME");
+    assert_eq!(resolved, default_sock);
+}
+
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
