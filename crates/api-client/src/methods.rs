@@ -22,7 +22,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::platform;
-use crate::{ApiClient, ApiError, DEFAULT_TIMEOUT};
+use crate::{ApiClient, ApiError, DEFAULT_TIMEOUT, MAX_RESPONSE_LINE_BYTES};
 
 // ---------------------------------------------------------------------------
 // Shared param building blocks
@@ -715,6 +715,21 @@ impl EventStream {
                     return Ok(Some(serde_json::from_str(trimmed)?));
                 }
                 Ok(_) => {
+                    // Cap on content bytes, excluding a trailing newline
+                    // `read_line` may have consumed.
+                    let content_len = self
+                        .line_buf
+                        .strip_suffix('\n')
+                        .unwrap_or(&self.line_buf)
+                        .len();
+                    if content_len > MAX_RESPONSE_LINE_BYTES {
+                        return Err(ApiError::Server {
+                            code: "response_too_large".to_string(),
+                            message: format!(
+                                "herdr event line exceeded {MAX_RESPONSE_LINE_BYTES} bytes"
+                            ),
+                        });
+                    }
                     let line = std::mem::take(&mut self.line_buf);
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -935,6 +950,19 @@ mod tests {
         // limit == len: all bytes readable, then EOF with an unterminated
         // partial line.
         assert!(matches!(events.next_event(), Err(ApiError::Json(_))));
+    }
+
+    /// Issue #108: an unterminated line growing past
+    /// `MAX_RESPONSE_LINE_BYTES` is a `response_too_large` server error,
+    /// matching the request-path cap — not unbounded buffer growth.
+    #[test]
+    fn event_stream_oversized_line_is_rejected() {
+        let data = vec![b'x'; MAX_RESPONSE_LINE_BYTES + 1];
+        let (mut events, _limit) = drip_event_stream(&data, data.len());
+        assert!(matches!(
+            events.next_event(),
+            Err(ApiError::Server { ref code, .. }) if code == "response_too_large"
+        ));
     }
 
     #[test]
