@@ -634,9 +634,7 @@ fn hostname_from_buf(buf: &[i8]) -> Option<String> {
     if end == 0 {
         return None;
     }
-    let s = String::from_utf8_lossy(&bytes[..end])
-        .trim()
-        .to_string();
+    let s = String::from_utf8_lossy(&bytes[..end]).trim().to_string();
     if s.is_empty() {
         None
     } else {
