@@ -20,8 +20,10 @@
 //! them down later. The `.herdcluster` directory itself is never
 //! deleted by `clean` — only the agent entries inside `agents.json`.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -32,6 +34,15 @@ pub const PROJECT_DIR_NAME: &str = ".herdcluster";
 pub const CONFIG_FILE_NAME: &str = "config.json";
 /// Spawned-agents registry file (`agents.json`).
 pub const AGENTS_FILE_NAME: &str = "agents.json";
+/// Lock file serializing `agents.json` read-modify-write cycles.
+const AGENTS_LOCK_FILE_NAME: &str = "agents.json.lock";
+/// How long a mutation waits for the `agents.json` lock before failing.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Poll interval while spinning on the lock.
+const LOCK_POLL: Duration = Duration::from_millis(10);
+/// A lock file older than this is assumed abandoned (crashed writer)
+/// and stolen — mutations are sub-millisecond, so this is generous.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(60);
 
 /// `config.json` contents: project-scoped configuration.
 ///
@@ -163,11 +174,83 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ProjectStateEr
         path: path.to_path_buf(),
     })?;
     // Write via sibling temp + rename so a crash never leaves a
-    // truncated registry file.
-    let tmp = path.with_extension("hctmp");
+    // truncated registry file. The temp name carries the PID (same
+    // pattern as `worker::atomic_write_600`) so concurrent writers in
+    // the same project never collide on it.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, format!("{text}\n"))?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Held `agents.json` lock: the file's existence is the mutex; dropping
+/// the guard removes it. See [`acquire_agents_lock`].
+struct AgentsLock {
+    path: PathBuf,
+}
+
+impl Drop for AgentsLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// `<project>/.herdcluster/agents.json.lock`.
+fn agents_lock_path(project_dir: &Path) -> PathBuf {
+    state_dir(project_dir).join(AGENTS_LOCK_FILE_NAME)
+}
+
+/// Take the `agents.json` mutation lock, spinning on `create_new` until
+/// `timeout` elapses. A lock file older than [`LOCK_STALE_AFTER`] is
+/// treated as abandoned (its writer crashed) and removed so a stale
+/// lock can never wedge the registry permanently.
+fn acquire_agents_lock(
+    project_dir: &Path,
+    timeout: Duration,
+) -> Result<AgentsLock, ProjectStateError> {
+    std::fs::create_dir_all(state_dir(project_dir))?;
+    let path = agents_lock_path(project_dir);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(AgentsLock { path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > LOCK_STALE_AFTER);
+                if stale {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    return Err(ProjectStateError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out waiting for {} (another herdcluster process holds it)",
+                            path.display()
+                        ),
+                    )));
+                }
+                std::thread::sleep(LOCK_POLL);
+            }
+            Err(e) => return Err(ProjectStateError::Io(e)),
+        }
+    }
+}
+
+/// Take the `agents.json` mutation lock with the default timeout.
+fn lock_agents(project_dir: &Path) -> Result<AgentsLock, ProjectStateError> {
+    acquire_agents_lock(project_dir, LOCK_TIMEOUT)
 }
 
 /// Load `config.json`; a missing file yields the default (empty map).
@@ -218,6 +301,11 @@ pub fn record_spawn(
     global_id: &str,
     agent: SpawnedAgent,
 ) -> Result<(), ProjectStateError> {
+    // Take the lock before ensure_files: it also writes state files,
+    // and the whole load→modify→save must be serialized so concurrent
+    // spawns can't drop each other's entries (or collide on the temp
+    // file — same-process threads share a PID).
+    let _lock = lock_agents(project_dir)?;
     ensure_files(project_dir)?;
     let mut file = load_agents(project_dir)?;
     file.agents.insert(global_id.to_string(), agent);
@@ -238,6 +326,12 @@ pub fn rename_agent(
     new_global_id: &str,
     new_name: &str,
 ) -> Result<bool, ProjectStateError> {
+    // No registry file → nothing recorded. Checked before locking so a
+    // bare directory doesn't gain a `.herdcluster/` dir as a side effect.
+    if !agents_path(project_dir).exists() {
+        return Ok(false);
+    }
+    let _lock = lock_agents(project_dir)?;
     let mut file = load_agents(project_dir)?;
     let Some(mut agent) = file.agents.remove(old_global_id) else {
         return Ok(false);
@@ -251,6 +345,12 @@ pub fn rename_agent(
 /// Remove one entry from `agents.json` (used by `clean` after a
 /// successful teardown). Returns `true` when an entry was removed.
 pub fn remove_agent(project_dir: &Path, global_id: &str) -> Result<bool, ProjectStateError> {
+    // Same fast path as `rename_agent`: no registry → nothing to do,
+    // and don't create `.herdcluster/` as a side effect.
+    if !agents_path(project_dir).exists() {
+        return Ok(false);
+    }
+    let _lock = lock_agents(project_dir)?;
     let mut file = load_agents(project_dir)?;
     let removed = file.agents.remove(global_id).is_some();
     if removed {
@@ -284,17 +384,34 @@ pub fn repo_override_for(cwd: &Path, machine: &str) -> Option<String> {
     repo_for_machine(&project, machine)
 }
 
+/// The machine an `agents.json` entry should be addressed on.
+///
+/// Prefers the machine half of the entry's global-id key
+/// (`{machine}/{name}`) — the key is the routing identity `clean` and
+/// `agent rename` actually use — and falls back to the record's stored
+/// `machine` field only when the key doesn't parse (hand-edited or
+/// legacy entries). The two can diverge after a rename recorded under
+/// a stale key, so callers routing teardown must use this, not
+/// [`SpawnedAgent::machine`] directly.
+pub fn effective_machine<'a>(global_id: &str, agent: &'a SpawnedAgent) -> Cow<'a, str> {
+    match cluster_fleet::parse_global_id(global_id) {
+        Ok(gid) => Cow::Owned(gid.machine),
+        Err(_) => Cow::Borrowed(agent.machine.as_str()),
+    }
+}
+
 /// Agents selected for cleanup: every recorded agent, or only those on
-/// `machine` when a label filter is given. Pure — the caller decides
-/// what to do with the selection (dry-run lists it, `clean` tears it
-/// down).
+/// `machine` when a label filter is given. Matching uses
+/// [`effective_machine`] so the key's machine half wins over the
+/// record's stored field. Pure — the caller decides what to do with the
+/// selection (dry-run lists it, `clean` tears it down).
 pub fn select_agents<'a>(
     file: &'a AgentsFile,
     machine: Option<&str>,
 ) -> Vec<(&'a String, &'a SpawnedAgent)> {
     file.agents
         .iter()
-        .filter(|(_, a)| machine.is_none_or(|m| a.machine == m))
+        .filter(|(id, a)| machine.is_none_or(|m| &*effective_machine(id, a) == m))
         .collect()
 }
 
@@ -482,5 +599,78 @@ mod tests {
             Err(ProjectStateError::Corrupt { .. })
         ));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_agent(machine: &str, name: &str) -> SpawnedAgent {
+        SpawnedAgent {
+            machine: machine.into(),
+            name: name.into(),
+            kind: "claude".into(),
+            workspace_id: "w".into(),
+            pane_id: "p".into(),
+            spawned_at: "t".into(),
+        }
+    }
+
+    #[test]
+    fn agents_lock_excludes_second_writer() {
+        let dir = tempdir("lock");
+        let first = lock_agents(&dir).unwrap();
+        assert!(agents_lock_path(&dir).exists());
+        // A second writer with a short timeout fails while held.
+        assert!(matches!(
+            acquire_agents_lock(&dir, Duration::from_millis(50)),
+            Err(ProjectStateError::Io(ref e))
+                if e.kind() == std::io::ErrorKind::TimedOut
+        ));
+        // Releasing the guard frees the lock for the next writer.
+        drop(first);
+        assert!(!agents_lock_path(&dir).exists());
+        let second = acquire_agents_lock(&dir, Duration::from_secs(1)).unwrap();
+        drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_record_spawn_loses_no_entries() {
+        let dir = tempdir("spawn-race");
+        const WRITERS: usize = 8;
+        std::thread::scope(|s| {
+            for i in 0..WRITERS {
+                let dir = dir.clone();
+                s.spawn(move || {
+                    record_spawn(
+                        &dir,
+                        &format!("local/a{i}"),
+                        test_agent("local", &format!("a{i}")),
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        let file = load_agents(&dir).unwrap();
+        assert_eq!(file.agents.len(), WRITERS);
+        for i in 0..WRITERS {
+            assert!(file.agents.contains_key(&format!("local/a{i}")));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_machine_prefers_key_then_record() {
+        let rec = test_agent("local", "probe");
+        // Key parses → its machine half wins over the stored field.
+        assert_eq!(&*effective_machine("w9/probe", &rec), "w9");
+        // Key doesn't parse → stored `machine` field is the fallback.
+        assert_eq!(&*effective_machine("not a global id", &rec), "local");
+
+        // `select_agents --machine` matches on the effective machine.
+        let mut file = AgentsFile::default();
+        file.agents.insert("w9/probe".into(), rec.clone());
+        assert_eq!(select_agents(&file, Some("w9")).len(), 1);
+        assert_eq!(select_agents(&file, Some("local")).len(), 0);
+        // A malformed key falls back to the stored machine for filtering.
+        file.agents.insert("bogus key".into(), rec);
+        assert_eq!(select_agents(&file, Some("local")).len(), 1);
     }
 }

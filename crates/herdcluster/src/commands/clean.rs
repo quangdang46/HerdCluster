@@ -66,9 +66,12 @@ pub fn run(
             agents_path.display()
         );
         for (id, agent) in &selected {
+            // Route by the global-id key's machine half (falling back to
+            // the record's stored field) — `agent.machine` can be stale.
+            let machine = project_state::effective_machine(id, agent);
             println!(
                 "  {id}  machine={} pane={} workspace={}",
-                agent.machine, agent.pane_id, agent.workspace_id
+                machine, agent.pane_id, agent.workspace_id
             );
         }
         if close_workspaces {
@@ -109,15 +112,18 @@ pub fn run(
     let mut closed_pane_workspaces: Vec<(String, String)> = Vec::new();
 
     for (id, agent) in &selected {
-        match machine_pane_close(&ctx, &agent.machine, &agent.pane_id) {
+        // Route teardown by the key's machine half — the stored
+        // `agent.machine` field can diverge from the `agents.json` key
+        // and would send pane.close to the wrong machine.
+        let machine = project_state::effective_machine(id, agent);
+        match machine_pane_close(&ctx, &machine, &agent.pane_id) {
             Ok(_) => {
                 if let Err(e) = project_state::remove_agent(&project_dir, id) {
                     eprintln!("warning: {id} torn down but agents.json update failed: {e}");
                 }
                 cleaned += 1;
                 if close_workspaces {
-                    closed_pane_workspaces
-                        .push((agent.machine.clone(), agent.workspace_id.clone()));
+                    closed_pane_workspaces.push((machine.into_owned(), agent.workspace_id.clone()));
                 }
                 println!("cleaned {id} (pane {})", agent.pane_id);
             }
@@ -162,7 +168,12 @@ fn workspace_close_plan(selected: &[(&String, &SpawnedAgent)]) -> Vec<(String, S
     dedup_workspaces(
         &selected
             .iter()
-            .map(|(_, a)| (a.machine.clone(), a.workspace_id.clone()))
+            .map(|(id, a)| {
+                (
+                    project_state::effective_machine(id, a).into_owned(),
+                    a.workspace_id.clone(),
+                )
+            })
             .collect::<Vec<_>>(),
     )
 }
@@ -205,6 +216,29 @@ mod tests {
         // Workspace plan dedupes shared workspaces.
         let plan = workspace_close_plan(&selected);
         assert_eq!(plan, vec![("w1".to_string(), "w2".to_string())]);
+    }
+
+    #[test]
+    fn routing_prefers_key_machine_over_stored_field() {
+        // Record whose stored `machine` diverges from its key: teardown
+        // must route by the key (`w9`), not the stale stored `local`.
+        let mut file = AgentsFile::default();
+        file.agents.insert("w9/stale".into(), agent("local", "w1"));
+
+        let selected = project_state::select_agents(&file, Some("w9"));
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0.as_str(), "w9/stale");
+        assert_eq!(
+            &*project_state::effective_machine(selected[0].0, selected[0].1),
+            "w9"
+        );
+        // The workspace-close plan routes to the key's machine too.
+        assert_eq!(
+            workspace_close_plan(&selected),
+            vec![("w9".to_string(), "w1".to_string())]
+        );
+        // `--machine local` must NOT pick it up via the stale field.
+        assert!(project_state::select_agents(&file, Some("local")).is_empty());
     }
 
     #[test]
