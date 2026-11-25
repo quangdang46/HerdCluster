@@ -40,7 +40,9 @@
 
 use cluster_core::identity::Keypair;
 use rand_core::RngCore;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose, PublicKeyData,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -288,10 +290,23 @@ fn load_or_create_ca(
         let key_pem = std::fs::read_to_string(&key_path)?;
         let key = KeyPair::from_pem(&key_pem)?;
         let der = pem_to_der(&cert_pem)?;
-        // Params only need the fields `Issuer` reads: DN + key usages +
-        // key-identifier method. Reconstruct deterministically.
-        let params = ca_params();
-        return Ok((params, key, cert_pem, der));
+        if ca_key_matches_cert(&key, &der) {
+            // Params only need the fields `Issuer` reads: DN + key usages +
+            // key-identifier method. Reconstruct deterministically.
+            let params = ca_params();
+            return Ok((params, key, cert_pem, der));
+        }
+        // Mismatched ca.crt/ca.key pair — the signature of a crash between
+        // the two atomic renames in `rotate_ca`. Both files exist so this
+        // would otherwise load silently and break every TLS handshake.
+        // Regenerate the pair below; the server cert is signed by the CA
+        // key, so it must be re-issued too (its mtime looks fresh).
+        tracing::warn!(
+            "cluster CA cert/key mismatch under {}; regenerating",
+            dir.display()
+        );
+        let _ = std::fs::remove_file(server_cert_path(dir));
+        let _ = std::fs::remove_file(server_key_path(dir));
     }
     let (params, key, cert) = generate_ca()?;
     let cert_pem = cert.pem();
@@ -299,6 +314,18 @@ fn load_or_create_ca(
     write_private(&key_path, &key.serialize_pem())?;
     let der = pem_to_der(&cert_pem)?;
     Ok((params, key, cert_pem, der))
+}
+
+/// True when `key` is the private half of the CA certificate whose DER is
+/// `cert_der` — i.e. the certificate's SubjectPublicKeyInfo equals the
+/// key's. Guards [`load_or_create_ca`] against a mismatched pair left by
+/// a crash between the `ca.crt`/`ca.key` atomic renames in [`rotate_ca`].
+fn ca_key_matches_cert(key: &KeyPair, cert_der: &[u8]) -> bool {
+    let cert = der_to_cert_der(cert_der);
+    let Ok(parsed) = rustls::server::ParsedCertificate::try_from(&cert) else {
+        return false;
+    };
+    parsed.subject_public_key_info().as_ref() == key.subject_public_key_info().as_slice()
 }
 
 /// Whether the persisted server cert should be regenerated. Uses file mtime
@@ -593,6 +620,35 @@ mod tests {
         let m1 = ensure_tls_material(dir.path(), "h").unwrap();
         let m2 = rotate_ca(dir.path(), "h").unwrap();
         assert_ne!(m1.ca_fingerprint(), m2.ca_fingerprint());
+    }
+
+    /// Regression: a crash between the `ca.crt` and `ca.key` atomic
+    /// renames in `rotate_ca` leaves a mismatched pair that used to load
+    /// silently and break every TLS handshake. Load must detect the
+    /// mismatch and regenerate a consistent pair (and a server cert
+    /// signed by it).
+    #[test]
+    fn mismatched_ca_pair_regenerates() {
+        let dir = tempdir();
+        let m1 = ensure_tls_material(dir.path(), "h").unwrap();
+
+        // Simulate the torn write: swap in a *different* CA's cert while
+        // keeping the original ca.key.
+        let other = tempdir();
+        let m_other = ensure_tls_material(other.path(), "h").unwrap();
+        std::fs::write(tls_dir(dir.path()).join("ca.crt"), &m_other.ca_cert_pem).unwrap();
+
+        let m2 = ensure_tls_material(dir.path(), "h").unwrap();
+        // A fresh CA was generated — neither the old nor the foreign one.
+        assert_ne!(m2.ca_fingerprint(), m1.ca_fingerprint());
+        assert_ne!(m2.ca_fingerprint(), m_other.ca_fingerprint());
+        // The regenerated pair is self-consistent and stable on reload.
+        let m3 = ensure_tls_material(dir.path(), "h").unwrap();
+        assert_eq!(m2.ca_fingerprint(), m3.ca_fingerprint());
+        // Material still builds working rustls configs (server cert was
+        // re-signed by the new CA).
+        server_config(&m2).unwrap();
+        client_config(&m2.ca_cert_pem, &m2.ca_fingerprint()).unwrap();
     }
 
     #[tokio::test]

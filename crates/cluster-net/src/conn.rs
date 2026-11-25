@@ -550,6 +550,30 @@ impl WorkerClient {
     }
 }
 
+/// Jittered backoff delay in [0.5x, 1.5x), capped at `cap`.
+fn jittered_delay(backoff: Duration, cap: Duration) -> Duration {
+    let mut b = [0u8; 8];
+    rand_core::OsRng.fill_bytes(&mut b);
+    let jitter = (u64::from_le_bytes(b) % 1000) as f64 / 1000.0;
+    Duration::from_secs_f64(backoff.as_secs_f64() * (0.5 + jitter)).min(cap)
+}
+
+/// Sleep for the current jittered backoff, then double it (capped).
+/// Returns the next backoff, or `None` when shutdown was requested
+/// mid-sleep (caller must return).
+async fn backoff_sleep(
+    backoff: Duration,
+    tuning: &WorkerTuning,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> Option<Duration> {
+    let delay = jittered_delay(backoff, tuning.backoff_max);
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => {}
+        _ = shutdown_rx.changed() => return None,
+    }
+    Some((backoff * 2).min(tuning.backoff_max))
+}
+
 async fn run_worker_loop(
     client: Arc<WorkerClient>,
     addr: SocketAddr,
@@ -570,6 +594,7 @@ async fn run_worker_loop(
 
         match client.connect_once(addr).await {
             Ok(session) => {
+                let session_started = Instant::now();
                 let session = Arc::new(session);
                 let _ = status_tx.send(LinkStatus::Online);
                 let _ = sess_tx.send(Some(session.clone()));
@@ -582,23 +607,27 @@ async fn run_worker_loop(
                 session.close();
                 let _ = sess_tx.send(None);
                 let _ = status_tx.send(LinkStatus::Offline);
-                backoff = tuning.backoff_min;
+
+                // Only a session that lived long enough to be "real"
+                // (> 2 heartbeats) earns a backoff reset. Instantly-dropped
+                // sessions — controller version-mismatch close, registry
+                // refusal, flaky link — must keep exponential backoff or we
+                // reconnect-hammer the controller at ~backoff_min cadence.
+                if session_started.elapsed() > tuning.heartbeat_interval * 2 {
+                    backoff = tuning.backoff_min;
+                } else {
+                    match backoff_sleep(backoff, &tuning, &mut shutdown_rx).await {
+                        Some(b) => backoff = b,
+                        None => return,
+                    }
+                }
             }
             Err(e) => {
                 *last_error.lock().unwrap() = Some(e.to_string());
-                // Exponential backoff with jitter in [0.5x, 1.5x).
-                let jitter = {
-                    let mut b = [0u8; 8];
-                    rand_core::OsRng.fill_bytes(&mut b);
-                    (u64::from_le_bytes(b) % 1000) as f64 / 1000.0
-                };
-                let delay = Duration::from_secs_f64(backoff.as_secs_f64() * (0.5 + jitter))
-                    .min(tuning.backoff_max);
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    _ = shutdown_rx.changed() => return,
+                match backoff_sleep(backoff, &tuning, &mut shutdown_rx).await {
+                    Some(b) => backoff = b,
+                    None => return,
                 }
-                backoff = (backoff * 2).min(tuning.backoff_max);
             }
         }
     }
@@ -1299,6 +1328,79 @@ mod tests {
         );
 
         handle.shutdown();
+    }
+
+    /// Regression: reconnect backoff must not reset after sessions that
+    /// die almost immediately (controller version-mismatch close,
+    /// registry refusal, flaky link). The controller kills every session
+    /// the moment it registers; the worker must back off exponentially
+    /// instead of reconnect-hammering at ~backoff_min cadence.
+    #[tokio::test]
+    async fn short_lived_sessions_do_not_reset_backoff() {
+        let ctrl_dir = tempdir();
+        let work_dir = tempdir();
+        let ctrl = Arc::new(
+            Controller::bind(ctrl_dir.path(), "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let addr = ctrl.local_addr();
+        let c = ctrl.clone();
+        tokio::spawn(async move { c.accept_loop().await });
+
+        let material = ctrl.tls_material();
+        let cred = WorkerCredential {
+            controller_pubkey: protocol::pubkey_to_hex(&ctrl.cluster_pubkey()),
+            ca_fingerprint: material.ca_fingerprint(),
+            ca_cert_pem: material.ca_cert_pem.clone(),
+        };
+        save_worker_credential(work_dir.path(), &cred).unwrap();
+
+        // heartbeat_interval*2 = 400ms is far longer than the ~ms a
+        // loopback session lives here, so every session counts as "short".
+        let tuning = WorkerTuning {
+            heartbeat_interval: Duration::from_millis(200),
+            degraded_after: Duration::from_secs(60),
+            offline_after: Duration::from_secs(60),
+            backoff_min: Duration::from_millis(30),
+            backoff_max: Duration::from_millis(150),
+            connect_timeout: Duration::from_secs(5),
+        };
+        let client = Arc::new(
+            WorkerClient::load_with_tuning(work_dir.path(), worker_cfg(), tuning).unwrap(),
+        );
+        let handle = client.spawn(addr);
+
+        // Kill each session on connect and count reconnects over a fixed
+        // window. backoff_max=150ms bounds the steady-state rate to a
+        // handful per second; the old reset-after-every-session behavior
+        // reconnected with no delay at all.
+        let mut connects = 0usize;
+        let deadline = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < deadline {
+            let ev = match timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                ctrl.next_event(),
+            )
+            .await
+            {
+                Ok(ev) => ev,
+                Err(_) => break,
+            };
+            match ev {
+                ControllerEvent::WorkerConnected(ws) => {
+                    connects += 1;
+                    ws.session.close();
+                }
+                ControllerEvent::WorkerDisconnected { .. } => {}
+            }
+        }
+        handle.shutdown();
+        assert!(
+            connects < 20,
+            "instantly-dropped sessions caused a reconnect hammer: \
+             {connects} connects in 800ms"
+        );
     }
 
     #[tokio::test]
