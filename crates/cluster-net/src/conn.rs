@@ -44,7 +44,12 @@
 //! authenticated key, `protocol_version` must match) → session
 //! registration → `ControllerEvent::WorkerConnected`. A watcher removes
 //! the session and emits `WorkerDisconnected` (tagged with the dead
-//! [`Session`]) when the connection dies.
+//! [`Session`]) when the connection dies — or when inbound control
+//! traffic stays silent past the liveness threshold
+//! ([`Controller::set_liveness_reap_after`]), which catches workers that
+//! vanish without a TCP close. Liveness is measured on the control
+//! channel, so the consumer spawned by `cluster-node`'s control pump
+//! (or any `recv_message` loop) must be running for heartbeats to count.
 //! Per-session heartbeats keep workers' liveness checks fed; disable with
 //! [`Controller::disable_heartbeats`] (tests only).
 
@@ -779,6 +784,15 @@ impl std::fmt::Debug for ControllerEvent {
     }
 }
 
+/// Default controller-side reap threshold for inbound silence:
+/// `offline_after` (30 s) plus slack for three missed worker heartbeats
+/// (≈15 s) so a live-but-slow worker is never reaped.
+fn default_liveness_reap_after() -> Duration {
+    Duration::from_secs(
+        (registry::OFFLINE_AFTER_SECS + 3 * registry::HEARTBEAT_INTERVAL_SECS) as u64,
+    )
+}
+
 /// Upper bound on delivering one [`ControllerEvent`]. `send().await`
 /// applies backpressure instead of the old `try_send`, which silently
 /// dropped connect/disconnect events on a full queue (leaving a
@@ -806,6 +820,9 @@ pub struct Controller {
     cluster_key: Keypair,
     tls_material: TlsMaterial,
     heartbeat: Option<Duration>,
+    /// Inbound-silence threshold after which the per-session watchdog
+    /// reaps a session whose peer vanished without a TCP close.
+    liveness_reap_after: Duration,
     sessions: Arc<Mutex<HashMap<[u8; 32], Arc<Session>>>>,
     event_tx: mpsc::Sender<ControllerEvent>,
     event_rx: tokio::sync::Mutex<mpsc::Receiver<ControllerEvent>>,
@@ -830,6 +847,7 @@ impl Controller {
             heartbeat: Some(Duration::from_secs(
                 registry::HEARTBEAT_INTERVAL_SECS as u64,
             )),
+            liveness_reap_after: default_liveness_reap_after(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             event_rx: tokio::sync::Mutex::new(event_rx),
@@ -859,6 +877,17 @@ impl Controller {
     /// Override the heartbeat interval.
     pub fn set_heartbeat_interval(&mut self, every: Duration) {
         self.heartbeat = Some(every);
+    }
+
+    /// Override the inbound-silence reap threshold (tests).
+    ///
+    /// Sessions whose control channel has delivered no message for
+    /// longer than this are closed by the per-session watchdog — the
+    /// controller-side counterpart of the worker's `offline_after`.
+    /// Default is `OFFLINE_AFTER_SECS + 3 * HEARTBEAT_INTERVAL_SECS`
+    /// (45 s), which tolerates several missed worker heartbeats.
+    pub fn set_liveness_reap_after(&mut self, after: Duration) {
+        self.liveness_reap_after = after;
     }
 
     /// The live session for a worker pubkey, if connected.
@@ -980,12 +1009,40 @@ impl Controller {
         }
         send_controller_event(&self.event_tx, ControllerEvent::WorkerConnected(ws)).await;
 
-        // Watcher: on conn death, unregister + emit disconnect.
+        // Watcher: unregister + emit disconnect when the connection dies
+        // OR when inbound control traffic goes silent past the reap
+        // threshold — a worker host that powers off or loses NAT state
+        // without a TCP FIN would otherwise leave this session (and its
+        // bridge, registry row, unix listener) alive forever. Closing the
+        // session here runs the exact same cleanup path as a real
+        // disconnect: the mux closes, `wait_closed` resolves, and the
+        // `WorkerDisconnected` event below fires.
         let sessions = self.sessions.clone();
         let event_tx = self.event_tx.clone();
         let watcher_session = session.clone();
+        let reap_after = self.liveness_reap_after;
         tokio::spawn(async move {
-            watcher_session.wait_closed().await;
+            // Tick often enough to observe even test-tuned thresholds,
+            // mirroring the worker-side `monitor_session` cadence.
+            let tick_every =
+                (reap_after / 4).clamp(Duration::from_millis(10), Duration::from_secs(5));
+            let mut tick = tokio::time::interval(tick_every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = watcher_session.wait_closed() => break,
+                    _ = tick.tick() => {
+                        if watcher_session.since_last_inbound() >= reap_after {
+                            tracing::warn!(
+                                "worker session silent for {:?}; reaping (possible ungraceful disconnect)",
+                                watcher_session.since_last_inbound()
+                            );
+                            watcher_session.close();
+                            break;
+                        }
+                    }
+                }
+            }
             {
                 let mut map = sessions.lock().unwrap();
                 // Only remove if it's still *our* session (a reconnect may
@@ -1401,6 +1458,90 @@ mod tests {
             "instantly-dropped sessions caused a reconnect hammer: \
              {connects} connects in 800ms"
         );
+    }
+
+    /// Regression for #95: a worker that vanishes without a TCP close
+    /// (power loss, NAT state drop) leaves the mux "alive" forever — the
+    /// controller only learned of death via `wait_closed`. The per-session
+    /// watchdog must reap sessions whose inbound control traffic stays
+    /// silent past the reap threshold, running the same disconnect path
+    /// (`WorkerDisconnected` + session-map removal) as a real close,
+    /// while leaving heartbeat-fed sessions alone.
+    #[tokio::test]
+    async fn controller_reaps_session_when_inbound_goes_silent() {
+        let ctrl_dir = tempdir();
+        let work_dir = tempdir();
+        let mut ctrl = Controller::bind(ctrl_dir.path(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        ctrl.set_liveness_reap_after(Duration::from_millis(300));
+        let ctrl = Arc::new(ctrl);
+        let addr = ctrl.local_addr();
+        let c = ctrl.clone();
+        tokio::spawn(async move { c.accept_loop().await });
+
+        let material = ctrl.tls_material();
+        let cred = WorkerCredential {
+            controller_pubkey: protocol::pubkey_to_hex(&ctrl.cluster_pubkey()),
+            ca_fingerprint: material.ca_fingerprint(),
+            ca_cert_pem: material.ca_cert_pem.clone(),
+        };
+        save_worker_credential(work_dir.path(), &cred).unwrap();
+
+        let client = WorkerClient::load(work_dir.path(), worker_cfg()).unwrap();
+        let worker_pub = client.public_key();
+        let session = client.connect_once(addr).await.unwrap();
+        // Fast heartbeats so inbound traffic is dense relative to the
+        // 300 ms reap threshold.
+        let hb = session.spawn_heartbeat(Duration::from_millis(50));
+
+        // Wait for registration, then drain the control channel — this
+        // is what marks `since_last_inbound` fresh on heartbeats (the
+        // cluster-node control pump plays this role in production).
+        let c_session = match timeout(Duration::from_secs(5), ctrl.next_event())
+            .await
+            .unwrap()
+        {
+            ControllerEvent::WorkerConnected(ws) => {
+                assert_eq!(ws.worker_pubkey, worker_pub);
+                ws.session
+            }
+            other => panic!("expected WorkerConnected, got {other:?}"),
+        };
+        let pump = tokio::spawn({
+            let s = c_session.clone();
+            async move { while s.recv_message().await.is_ok() {} }
+        });
+
+        // Well past the reap threshold with heartbeats flowing: the
+        // session must NOT be reaped (idle-but-alive stays alive).
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(c_session.is_alive(), "live session was reaped");
+        assert!(ctrl.session(&worker_pub).is_some());
+
+        // Simulate an ungraceful worker death: heartbeats stop but the
+        // TCP connection stays open (no FIN/RST).
+        hb.abort();
+
+        match timeout(Duration::from_secs(5), ctrl.next_event())
+            .await
+            .unwrap()
+        {
+            ControllerEvent::WorkerDisconnected {
+                worker_pubkey,
+                session: dead,
+            } => {
+                assert_eq!(worker_pubkey, worker_pub);
+                assert!(!dead.is_alive());
+            }
+            other => panic!("expected WorkerDisconnected, got {other:?}"),
+        }
+        // Same cleanup as a real disconnect: session-map entry gone.
+        assert!(ctrl.session(&worker_pub).is_none());
+        assert!(ctrl.connected_workers().is_empty());
+
+        pump.abort();
+        session.close();
     }
 
     #[tokio::test]
