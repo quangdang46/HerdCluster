@@ -47,7 +47,12 @@ pub fn format_global_id(machine: &str, agent: &str) -> String {
 /// A path segment is valid iff non-empty and free of `/`, whitespace, and
 /// control characters. Machine labels and agent names/terminal-ids do not
 /// legitimately contain those.
-fn valid_part(part: &str) -> bool {
+///
+/// This is the canonical rule for both halves of a global ID; callers
+/// validating an agent name *before* a global ID exists (e.g. `spawn`,
+/// `agent rename`) use this directly so stamped IDs always round-trip
+/// through [`parse_global_id`].
+pub fn valid_id_part(part: &str) -> bool {
     !part.is_empty()
         && !part
             .chars()
@@ -70,13 +75,13 @@ pub fn parse_global_id(input: &str) -> Result<GlobalId, FleetError> {
     let (machine, agent) = input
         .split_once('/')
         .ok_or_else(|| malformed("expected `{machine}/{agent}`"))?;
-    if !valid_part(machine) {
+    if !valid_id_part(machine) {
         return Err(malformed("empty or invalid machine label"));
     }
     if agent.contains('/') {
         return Err(malformed("agent part must not contain '/'"));
     }
-    if !valid_part(agent) {
+    if !valid_id_part(agent) {
         return Err(malformed("empty or invalid agent identifier"));
     }
     Ok(GlobalId {
@@ -231,6 +236,25 @@ mod tests {
                 matches!(parse_global_id(bad), Err(FleetError::MalformedId { .. })),
                 "expected MalformedId for {bad:?}"
             );
+        }
+    }
+
+    #[test]
+    fn valid_id_part_matches_parse_rules() {
+        for ok in ["claude-1", "my.agent_v2", "term_42", "a.b-c_d"] {
+            assert!(valid_id_part(ok), "expected accept for {ok:?}");
+        }
+        for bad in [
+            "",
+            "foo/bar",
+            "my agent",
+            " lead",
+            "trail ",
+            "new\nline",
+            "tab\there",
+            "nul\0byte",
+        ] {
+            assert!(!valid_id_part(bad), "expected reject for {bad:?}");
         }
     }
 

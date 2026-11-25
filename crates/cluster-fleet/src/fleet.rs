@@ -35,7 +35,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::endpoint::{FleetContext, MachineEndpoint, MachineKind};
-use crate::ids::format_global_id;
+use crate::ids::{format_global_id, valid_id_part};
 use crate::parse;
 use crate::spawn::effective_max_agents;
 
@@ -182,7 +182,7 @@ const CONSUMED_KEYS: &[&str] = &["machine", "id", "agent", "name", "kind", "stat
 fn agent_row(machine: &str, item: &Value) -> Option<FleetAgent> {
     // Bare-string rows are treated as the agent id itself.
     if let Some(s) = item.as_str() {
-        if s.is_empty() {
+        if !valid_id_part(s) {
             return None;
         }
         return Some(FleetAgent {
@@ -195,10 +195,16 @@ fn agent_row(machine: &str, item: &Value) -> Option<FleetAgent> {
             extra: serde_json::Map::new(),
         });
     }
-    let local_id = parse::str_field(item, AGENT_ID_KEYS).map(str::to_string)?;
-    if local_id.is_empty() {
-        return None;
-    }
+    // First id alias that can form the agent half of a valid global ID.
+    // A herdr-native name like "foo/bar" would stamp an unresolvable
+    // `{machine}/{id}`, so invalid candidates fall through to the next
+    // alias (pane_id/terminal_id); the row is skipped only when nothing
+    // addressable remains (issue #53).
+    let local_id = AGENT_ID_KEYS
+        .iter()
+        .filter_map(|key| item.get(*key).and_then(Value::as_str))
+        .find(|s| valid_id_part(s))
+        .map(str::to_string)?;
     let mut extra = item.as_object().cloned().unwrap_or_default();
     for key in CONSUMED_KEYS {
         extra.remove(*key);
@@ -603,6 +609,30 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].agent, "bare-id");
         assert_eq!(rows[1].id, "w/bare-id");
+    }
+
+    #[test]
+    fn parse_agent_list_skips_unresolvable_ids() {
+        // Issue #53: a herdr-native agent named "foo/bar" would stamp an
+        // id `parse_global_id` rejects — fall back to a valid alias
+        // (pane_id) when one exists, skip the row when none does.
+        let rows = parse_agent_list(
+            "local",
+            &json!({"agents": [
+                {"name": "foo/bar", "pane_id": "w2:p1", "kind": "claude"},
+                {"name": "bad name", "terminal_id": "term_7"},
+                {"name": "bad/name", "kind": "codex"},
+                "also/bad"
+            ]}),
+        );
+        assert_eq!(rows.len(), 2);
+        // Invalid `name` falls through to `pane_id` — still addressable.
+        assert_eq!(rows[0].agent, "w2:p1");
+        assert_eq!(rows[0].id, "local/w2:p1");
+        assert_eq!(rows[0].name.as_deref(), Some("foo/bar"));
+        // Invalid `name` falls through to `terminal_id`.
+        assert_eq!(rows[1].agent, "term_7");
+        assert_eq!(rows[1].id, "local/term_7");
     }
 
     #[test]

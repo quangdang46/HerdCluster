@@ -69,7 +69,7 @@ use serde_json::Value;
 
 use crate::endpoint::{FleetContext, MachineEndpoint, MachineKind, LOCAL_LABEL};
 use crate::error::FleetError;
-use crate::ids::format_global_id;
+use crate::ids::{format_global_id, valid_id_part};
 use crate::parse;
 
 /// Default bound for the post-`agent.start` readiness wait (PLAN.md §3.8:
@@ -250,6 +250,14 @@ pub enum SpawnError {
         /// Effective cap (`cluster.json` override → reported → default).
         max_agents: u32,
     },
+    /// `req.name` cannot form the agent half of a global ID
+    /// (`{machine}/{name}`): empty, or containing `/`, whitespace, or
+    /// control characters — [`crate::ids::parse_global_id`] would reject
+    /// every later op on the stamped ID (issue #53).
+    InvalidName {
+        /// The rejected agent name.
+        name: String,
+    },
     /// Underlying API/config failure not attributable to a step.
     Api {
         /// Machine label, if known.
@@ -273,6 +281,7 @@ impl SpawnError {
             SpawnError::TimeoutWaitingReady { .. } => "timeout_waiting_ready",
             SpawnError::SpawnTimeout { .. } => "spawn_timeout",
             SpawnError::MaxAgentsExceeded { .. } => "max_agents_exceeded",
+            SpawnError::InvalidName { .. } => "invalid_name",
             SpawnError::Api { .. } => "api_error",
         }
     }
@@ -392,6 +401,11 @@ impl std::fmt::Display for SpawnError {
             } => write!(
                 f,
                 "machine {machine:?} is at agent capacity ({agent_count}/{max_agents})"
+            ),
+            SpawnError::InvalidName { name } => write!(
+                f,
+                "invalid agent name {name:?}: must be non-empty and contain \
+                 no '/', whitespace, or control characters"
             ),
             SpawnError::Api { machine, reason } => match machine {
                 Some(m) => write!(f, "API error on {m:?}: {reason}"),
@@ -1533,6 +1547,14 @@ fn effective_repo_path(req_repo: &Option<String>, is_local: bool) -> Option<Stri
 /// Compose and run a spawn: resolve machine → pre-flight → workspace →
 /// pane → `agent.start` → wait ready. See module docs.
 pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, SpawnError> {
+    // Fail fast on names that cannot round-trip through the global ID
+    // (`{machine}/{name}`) — `parse_global_id` rejects '/', whitespace,
+    // and control characters in the agent part (issue #53).
+    if !valid_id_part(&req.name) {
+        return Err(SpawnError::InvalidName {
+            name: req.name.clone(),
+        });
+    }
     let machine = resolve_machine(ctx, req)?;
     let ep = ctx
         .endpoint_for(&machine)
@@ -2060,6 +2082,22 @@ mod tests {
                 assert_eq!(machine.as_deref(), Some("ghost"))
             }
             other => panic!("expected NoPlacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_agent_name_fails_before_machine_resolution() {
+        // Issue #53: a name parse_global_id would reject must never reach
+        // agent.start — the stamped `{machine}/{name}` id would be
+        // unusable by every later op.
+        let ctx = FleetContext::build(PathBuf::from("/tmp/hc"), cluster(), vec![]).unwrap();
+        for bad in ["foo/bar", "my agent", " lead", "trail\n", ""] {
+            let mut r = req(MachineTarget::Label("local".into()));
+            r.name = bad.to_string();
+            match spawn(&ctx, &r) {
+                Err(SpawnError::InvalidName { name }) => assert_eq!(name, bad),
+                other => panic!("expected InvalidName for {bad:?}, got {other:?}"),
+            }
         }
     }
 

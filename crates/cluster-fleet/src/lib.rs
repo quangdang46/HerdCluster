@@ -52,7 +52,9 @@ pub use fleet::{
     list_all_agents, machines, normalize_agent_get, AgentListRow, FleetAgent, MachineInfo,
     FANOUT_TIMEOUT, PROBE_TIMEOUT,
 };
-pub use ids::{format_global_id, parse_global_id, resolve_global_id, GlobalId, ResolvedAgent};
+pub use ids::{
+    format_global_id, parse_global_id, resolve_global_id, valid_id_part, GlobalId, ResolvedAgent,
+};
 pub use ops::{
     agent_focus, agent_get, agent_prompt, agent_read, agent_rename, agent_send_keys, agent_wait,
     machine_pane_close, machine_workspace_close,
