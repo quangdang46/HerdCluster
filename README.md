@@ -92,6 +92,22 @@ published NDJSON socket API. Upstream herdr updates flow through untouched.
 
 ---
 
+## Why spawn *separate* coding agents?
+
+Subagents inside one agent session share its context, tools, and failure
+modes — they inherit its blind spots and burn the same context window. Real
+parallel work needs **independent agents with their own sessions, worktrees,
+and lifecycles**, coordinated by an orchestrator that can read, prompt, and
+retask each one. That is exactly what HerdCluster provides.
+
+- [anti_subagent](https://github.com/quangdang46/anti_subagent) — the case
+  against delegating to built-in subagents.
+- [SLP: Supervisor–Lead–Peer](https://ultrabuilders.xyz/en/posts/slp-supervisor-lead-peer) —
+  a pattern for orchestrating many independent coding agents instead of
+  nesting them.
+
+---
+
 ## Quick Example
 
 ```bash
