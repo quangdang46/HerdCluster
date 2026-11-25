@@ -1056,8 +1056,7 @@ async fn on_worker_connected(
         match ControllerBridge::new(&state_dir, &label, ws.session.clone()).await {
             Ok(bridge) => {
                 let mut map = bridges.lock().unwrap();
-                if let Some((_, old)) =
-                    map.insert(worker_id.clone(), (ws.session.clone(), bridge))
+                if let Some((_, old)) = map.insert(worker_id.clone(), (ws.session.clone(), bridge))
                 {
                     old.shutdown();
                 }
@@ -1808,7 +1807,10 @@ mod tests {
                 if let Some(s) = ctrl.session(&pubkey) {
                     break s;
                 }
-                assert!(std::time::Instant::now() < deadline, "session 1 never registered");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "session 1 never registered"
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         };
@@ -1824,7 +1826,10 @@ mod tests {
                         break s;
                     }
                 }
-                assert!(std::time::Instant::now() < deadline, "session 2 never registered");
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "session 2 never registered"
+                );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         };

@@ -1281,9 +1281,7 @@ fn ensure_pane(
     let after_timeout = handshake_left(deadline, ep, "pane.list")?;
     let after = client.list_pane_ids(ep, workspace_id, after_timeout)?;
     let before_set: BTreeSet<&String> = before.iter().collect();
-    let mut new_panes = after
-        .into_iter()
-        .filter(|id| !before_set.contains(id));
+    let mut new_panes = after.into_iter().filter(|id| !before_set.contains(id));
     if let Some(id) = new_panes.next() {
         return Ok(id);
     }
@@ -1582,7 +1580,14 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
         workspace_created,
         pane_id: None,
     };
-    match launch_agent(&client, &ep, req, repo.as_deref(), handshake_deadline, &mut res) {
+    match launch_agent(
+        &client,
+        &ep,
+        req,
+        repo.as_deref(),
+        handshake_deadline,
+        &mut res,
+    ) {
         Ok(result) => Ok(result),
         Err(e) => {
             cleanup_failed_spawn(&client, &ep, &res, handshake_deadline);
@@ -1622,8 +1627,7 @@ fn cleanup_failed_spawn(
     deadline: Instant,
 ) {
     if let Some(pane_id) = &res.pane_id {
-        let timeout =
-            handshake_left(deadline, ep, "pane.close").unwrap_or(Duration::from_secs(1));
+        let timeout = handshake_left(deadline, ep, "pane.close").unwrap_or(Duration::from_secs(1));
         let _ = handshake_call(
             client,
             ep,
@@ -1766,9 +1770,7 @@ mod tests {
     fn worker(label: &str, status: WorkerStatus, kinds: Vec<String>) -> WorkerEntry {
         let last_seen = match status {
             WorkerStatus::Online => Some(chrono::Utc::now()),
-            WorkerStatus::Degraded => {
-                Some(chrono::Utc::now() - chrono::Duration::seconds(20))
-            }
+            WorkerStatus::Degraded => Some(chrono::Utc::now() - chrono::Duration::seconds(20)),
             WorkerStatus::Offline => None,
         };
         WorkerEntry {

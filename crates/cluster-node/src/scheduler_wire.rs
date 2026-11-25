@@ -290,11 +290,7 @@ mod tests {
                 Some(now),
                 Some(resources_json(1, 4, 4096, &["claude", "codex"])),
             ),
-            worker_entry(
-                "w2",
-                None,
-                Some(resources_json(3, 4, 2048, &["claude"])),
-            ),
+            worker_entry("w2", None, Some(resources_json(3, 4, 2048, &["claude"]))),
         ];
         let ctx = FleetContext::build(PathBuf::from("/tmp/hc-wire"), cluster, workers).unwrap();
         let caps = collect_worker_caps(&ctx);

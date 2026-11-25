@@ -979,9 +979,9 @@ mod tests {
         // Envelope preserved; inner record now matches list-row semantics.
         assert_eq!(out["type"], "agent_info");
         let inner = &out["agent"];
-        assert_eq!(inner["kind"], "claude");       // kind under `kind`
-        assert_eq!(inner["agent"], "w2:pHF");      // pane id under `agent`
-        assert_eq!(inner["pane_id"], "w2:pHF");    // raw fields intact
+        assert_eq!(inner["kind"], "claude"); // kind under `kind`
+        assert_eq!(inner["agent"], "w2:pHF"); // pane id under `agent`
+        assert_eq!(inner["pane_id"], "w2:pHF"); // raw fields intact
         assert_eq!(inner["agent_status"], "idle");
         assert_eq!(inner["state_change_seq"], 3);
         assert_eq!(inner["interactive_ready"], true);

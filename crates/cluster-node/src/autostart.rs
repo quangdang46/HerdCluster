@@ -428,14 +428,9 @@ mod tests {
         // argv and `%` can't expand as a specifier.
         let exe = Path::new("/opt/my apps/herd%cluster/bin/herdcluster");
         let unit = systemd_unit_contents(exe);
-        assert!(unit.contains(
-            "ExecStart=\"/opt/my apps/herd%%cluster/bin/herdcluster\" worker"
-        ));
+        assert!(unit.contains("ExecStart=\"/opt/my apps/herd%%cluster/bin/herdcluster\" worker"));
         // No unquoted `%` may remain on the ExecStart line.
-        let line = unit
-            .lines()
-            .find(|l| l.starts_with("ExecStart="))
-            .unwrap();
+        let line = unit.lines().find(|l| l.starts_with("ExecStart=")).unwrap();
         assert!(!line.replace("%%", "").contains('%'));
     }
 

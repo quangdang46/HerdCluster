@@ -800,9 +800,12 @@ mod tests {
             keepawake: true,
         };
         for label in ["local", "wsl", "ghost"] {
-            info.machines.insert(label.into(), MachineOverride::default());
+            info.machines
+                .insert(label.into(), MachineOverride::default());
         }
-        let known: BTreeSet<String> = ["local".to_string(), "wsl".to_string()].into_iter().collect();
+        let known: BTreeSet<String> = ["local".to_string(), "wsl".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(info.unknown_machine_overrides(&known), vec!["ghost"]);
 
         // Everything known → no dead config. Empty machines → empty.

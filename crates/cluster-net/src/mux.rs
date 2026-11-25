@@ -1137,9 +1137,11 @@ mod tests {
         assert_eq!(h.id(), 7);
 
         // No second handle is ever handed out.
-        assert!(timeout(Duration::from_millis(300), acceptor.accept_stream())
-            .await
-            .is_err());
+        assert!(
+            timeout(Duration::from_millis(300), acceptor.accept_stream())
+                .await
+                .is_err()
+        );
 
         // The duplicate OPEN is answered with RST on the wire.
         let mut hdr = [0u8; HEADER_LEN];
@@ -1174,11 +1176,7 @@ mod tests {
         let mut saw_data = false;
         let mut saw_eof = 0usize;
         for t in tasks {
-            match timeout(Duration::from_secs(5), t)
-                .await
-                .unwrap()
-                .unwrap()
-            {
+            match timeout(Duration::from_secs(5), t).await.unwrap().unwrap() {
                 Ok(Some(_)) => saw_data = true,
                 Ok(None) => saw_eof += 1,
                 Err(e) => panic!("unexpected recv error: {e}"),

@@ -1055,8 +1055,7 @@ mod tests {
     fn poll_agent_not_found_on_first_poll_is_error() {
         // Never existed (typo'd id) → typed agent_not_found error, not a
         // success-looking Gone (issue #10).
-        let mut responses =
-            std::collections::VecDeque::from(vec![Err(not_found())]);
+        let mut responses = std::collections::VecDeque::from(vec![Err(not_found())]);
         let e = poll_until(
             &mut fake(&mut responses),
             &until(&["done"]),

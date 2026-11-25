@@ -4,8 +4,8 @@
 //! worker stream, the worker pipes cluster stream ↔ local herdr API socket.
 //! The two directions are symmetric, so one function serves both.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -263,6 +263,9 @@ mod tests {
         assert!(fin.is_none());
 
         // Pipe finishes once both directions close/idle out.
-        timeout(Duration::from_secs(5), pipe).await.unwrap().unwrap();
+        timeout(Duration::from_secs(5), pipe)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

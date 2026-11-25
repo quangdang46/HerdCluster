@@ -737,9 +737,7 @@ pub enum ControllerEvent {
 impl std::fmt::Debug for ControllerEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WorkerConnected(ws) => {
-                f.debug_tuple("WorkerConnected").field(ws).finish()
-            }
+            Self::WorkerConnected(ws) => f.debug_tuple("WorkerConnected").field(ws).finish(),
             Self::WorkerDisconnected {
                 worker_pubkey,
                 session,
