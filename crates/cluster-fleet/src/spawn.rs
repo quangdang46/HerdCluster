@@ -34,8 +34,13 @@
 //!   the local machine that is `$HOME`; a remote worker's home is not
 //!   discoverable through the API, so `~` there degrades to the same
 //!   default-placement behavior as omitting `--repo`.
-//! - Any other value → find-or-create a workspace for that target-local
-//!   path, exactly as before — with one guard: when a workspace must be
+//! - Any other value → must be an **absolute** target-local path
+//!   (`~/…` aside, relative paths like `foo/bar` or `./x` and `~user`
+//!   are rejected with [`SpawnError::InvalidRepoPath`]: `workspace.create`
+//!   would resolve a relative `cwd` against the herdr server's own cwd,
+//!   and `~user` needs a passwd lookup the API does not expose — issue
+//!   #81). An absolute path finds-or-creates a workspace for it, with
+//!   one guard: when a workspace must be
 //!   *created* for the path, the fresh workspace's pane cwd is verified
 //!   against the request ([`verify_workspace_repo_cwd`]). herdr silently
 //!   substitutes the server user's home when `cwd` does not exist on the
@@ -258,6 +263,15 @@ pub enum SpawnError {
         /// The rejected agent name.
         name: String,
     },
+    /// `--repo` was not an absolute target-local path: relative paths
+    /// (`foo/bar`, `./x`) would be resolved by `workspace.create`
+    /// against the herdr *server's* cwd — possibly a different
+    /// directory — and `~user` cannot be expanded without a passwd
+    /// lookup the herdr API does not expose (issue #81).
+    InvalidRepoPath {
+        /// The rejected repo path, as given.
+        repo: String,
+    },
     /// Underlying API/config failure not attributable to a step.
     Api {
         /// Machine label, if known.
@@ -282,6 +296,7 @@ impl SpawnError {
             SpawnError::SpawnTimeout { .. } => "spawn_timeout",
             SpawnError::MaxAgentsExceeded { .. } => "max_agents_exceeded",
             SpawnError::InvalidName { .. } => "invalid_name",
+            SpawnError::InvalidRepoPath { .. } => "invalid_repo_path",
             SpawnError::Api { .. } => "api_error",
         }
     }
@@ -406,6 +421,13 @@ impl std::fmt::Display for SpawnError {
                 f,
                 "invalid agent name {name:?}: must be non-empty and contain \
                  no '/', whitespace, or control characters"
+            ),
+            SpawnError::InvalidRepoPath { repo } => write!(
+                f,
+                "invalid repo path {repo:?}: must be an absolute path on the \
+                 target machine ('~' and '~/…' are expanded; '~user' is not \
+                 supported — it needs a passwd lookup the herdr API does not \
+                 expose)"
             ),
             SpawnError::Api { machine, reason } => match machine {
                 Some(m) => write!(f, "API error on {m:?}: {reason}"),
@@ -684,15 +706,27 @@ fn build_worker_caps(ctx: &FleetContext) -> Vec<WorkerCaps> {
 }
 
 /// Best-effort local probe: `(reachable, agent_count, manifest_kinds)`.
+///
+/// `reachable` is derived from the `agent.list` request succeeding —
+/// [`api_client::ApiClient::connect`] only checks the socket path
+/// exists, so a stale socket file passes construction and the request
+/// itself is the liveness check (issue #74). When `agent.list` fails the
+/// probe reports offline with no kinds, so `build_worker_caps` emits
+/// `local` as `online: false` and the scheduler rejects it with
+/// `Offline` instead of placing a spawn that dies at handshake. A failed
+/// `server.agent_manifests` still leaves the machine online but with an
+/// empty kind set — the same shape a kind-less probe always produced.
 fn probe_local(ctx: &FleetContext) -> (bool, u32, Vec<String>) {
     let client = match ctx.local().client() {
         Ok(c) => c,
         Err(_) => return (false, 0, Vec::new()),
     };
-    let count = client
-        .request_with_timeout("agent.list", &serde_json::json!({}), Duration::from_secs(5))
-        .map(|v| parse::items_array(&v).len() as u32)
-        .unwrap_or(0);
+    let agents =
+        client.request_with_timeout("agent.list", &serde_json::json!({}), Duration::from_secs(5));
+    let Ok(agents) = agents else {
+        return (false, 0, Vec::new());
+    };
+    let count = parse::items_array(&agents).len() as u32;
     let kinds = client
         .server_agent_manifests()
         .map(|v| manifest_kinds(&v))
@@ -872,7 +906,18 @@ fn workspace_path_candidates<'a>(
 /// `repo` is a prefix of `candidate` at a path boundary: equal, or
 /// `candidate` lies inside `repo` (`<repo>/…`). Both inputs must already
 /// be trimmed of trailing slashes.
+///
+/// An empty `repo` — what `"/"` trims to — must never prefix-match:
+/// `"".starts_with`-style matching would degenerate to
+/// `candidate.starts_with("/")`, true for every absolute path, so
+/// `--repo /` would "find" the first workspace with any absolute cwd
+/// and reuse it, skipping `workspace.create` and the
+/// [`verify_workspace_repo_cwd`] guard entirely (issue #81). Only exact
+/// equality — both sides trimmed to `""` — matches.
 fn path_within(repo: &str, candidate: &str) -> bool {
+    if repo.is_empty() {
+        return candidate.is_empty();
+    }
     candidate == repo || candidate.starts_with(&format!("{repo}/"))
 }
 
@@ -1338,20 +1383,49 @@ fn sweep_stray_split_panes(
 }
 
 /// Status strings that mean "the agent CLI is up and interactive".
-/// `blocked` = waiting for input (login/permission prompt) and `done` =
-/// finished its task — both are stable interactive states herdr reports
-/// for a live agent, so spawn should not keep polling through them.
-const READY_STATUSES: &[&str] = &["idle", "interactive_ready", "ready", "blocked", "done"];
+/// `blocked` = waiting for input (login/permission prompt) — a stable
+/// interactive state herdr reports for a live agent, so spawn should not
+/// keep polling through it. `done` is deliberately NOT here: it is the
+/// agent-finished signal and is gated separately in [`agent_ready`]
+/// (issue #82).
+const READY_STATUSES: &[&str] = &["idle", "interactive_ready", "ready", "blocked"];
+/// The agent-finished status. Counts as ready only after the agent was
+/// observed in a non-terminal state — see [`agent_ready`].
+const DONE_STATUS: &str = "done";
 
 /// Extract a readiness signal from an `agent.get` response: the status
 /// string under `status`/`state`, or an `interactive_ready: true` flag.
-fn agent_ready(value: &Value) -> bool {
+///
+/// `done_ready` is the caller's record of whether a *non-terminal*
+/// status was observed on an earlier poll. `done` means the agent
+/// finished its task; an agent CLI that exits instantly (bad
+/// `extra_agent_args`, crash on launch) can report `done` on the very
+/// first poll, and counting that as ready would make `spawn` return
+/// success for a dead agent (issue #82). Requiring a prior non-terminal
+/// observation keeps `done` valid for the normal case — an agent that
+/// was seen `working`/`idle` and then finished — while rejecting the
+/// never-alive case. (Whether herdr 0.9.5 can emit a *transient* `done`
+/// at startup is unverifiable from the published schema; this is the
+/// conservative reading.)
+fn agent_ready(value: &Value, done_ready: bool) -> bool {
     let entity = parse::unwrap_entity(value, "agent");
     if entity.get("interactive_ready").and_then(Value::as_bool) == Some(true) {
         return true;
     }
+    match parse::str_field(entity, parse::STATUS_KEYS) {
+        Some(DONE_STATUS) => done_ready,
+        Some(s) => READY_STATUSES.contains(&s),
+        None => false,
+    }
+}
+
+/// True when the response reports any agent status other than `done` —
+/// i.e. the agent was observed in a non-terminal (therefore presumably
+/// live) state at least once.
+fn observed_nonterminal_status(value: &Value) -> bool {
+    let entity = parse::unwrap_entity(value, "agent");
     parse::str_field(entity, parse::STATUS_KEYS)
-        .map(|s| READY_STATUSES.contains(&s))
+        .map(|s| s != DONE_STATUS)
         .unwrap_or(false)
 }
 
@@ -1452,6 +1526,9 @@ fn wait_until_ready(
 ) -> Result<(), SpawnError> {
     let deadline = Instant::now() + timeout;
     let target = serde_json::json!({ "target": name });
+    // Whether any earlier poll reported a non-terminal status — gates
+    // `done` as a ready signal (issue #82).
+    let mut seen_nonterminal = false;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -1465,10 +1542,13 @@ fn wait_until_ready(
         let req_timeout = remaining.min(READY_POLL_REQUEST_TIMEOUT);
         match client.request_with_timeout("agent.get", &target, req_timeout) {
             Ok(value) => {
-                if agent_ready(&value) {
+                if agent_ready(&value, seen_nonterminal) {
                     return Ok(());
                 }
-                // Status present but not ready yet — keep polling.
+                // Status present but not ready yet — keep polling, and
+                // remember a non-terminal observation so a later `done`
+                // counts as ready.
+                seen_nonterminal |= observed_nonterminal_status(&value);
             }
             Err(ApiError::ServerNotRunning { .. }) | Err(ApiError::Io(_)) => {
                 return Err(SpawnError::WorkerUnreachable {
@@ -1514,34 +1594,52 @@ fn step_error(ep: &MachineEndpoint, step: &str, e: ApiError) -> SpawnError {
 /// Expand a leading `~` / `~/…` in a `--repo` value against the target
 /// machine's home directory.
 ///
-/// Returns `Some(path)` for ordinary absolute/relative target-local paths
-/// and for `~` on the local machine (`$HOME`). Returns `None` — the
+/// Returns `Ok(Some(path))` for absolute target-local paths and for `~`
+/// on the local machine (`$HOME`). Returns `Ok(None)` — the
 /// default-placement mode — when `--repo` was omitted, was blank, or was
 /// `~`-rooted on a **remote** worker: a remote home directory is not
 /// discoverable through the herdr API, so `~` degrades to the same
 /// behavior as omitting `--repo` (reuse the single workspace, else
 /// `workspace.create` with server-default cwd, which is the remote
 /// server user's home in practice).
-fn effective_repo_path(req_repo: &Option<String>, is_local: bool) -> Option<String> {
-    let raw = req_repo.as_deref()?.trim();
-    if raw.is_empty() {
-        return None;
-    }
+///
+/// Anything that is not an absolute path after `~`/`~/` expansion is
+/// rejected with [`SpawnError::InvalidRepoPath`] (issue #81):
+/// `workspace.create` resolves a relative `cwd` against the herdr
+/// *server's* working directory — possibly a different directory than
+/// the caller's — and [`verify_workspace_repo_cwd`] cannot compare
+/// relative paths reliably, so `foo/bar` or `./x` would silently land
+/// the agent somewhere else. `~user` is rejected for the same reason it
+/// cannot be expanded: resolving another user's home needs a passwd
+/// lookup the herdr API does not expose, and passing it through
+/// verbatim would hit the relative-path problem above.
+fn effective_repo_path(
+    req_repo: &Option<String>,
+    is_local: bool,
+) -> Result<Option<String>, SpawnError> {
+    let Some(raw) = req_repo.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
     if raw == "~" || raw.starts_with("~/") {
         if !is_local {
-            return None;
+            return Ok(None);
         }
         let home = std::env::home_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .filter(|h| !h.is_empty())
             .unwrap_or_else(|| "/".to_string());
-        return Some(if raw == "~" {
+        return Ok(Some(if raw == "~" {
             home
         } else {
             format!("{home}/{}", &raw[2..])
+        }));
+    }
+    if raw.starts_with('~') || !raw.starts_with('/') {
+        return Err(SpawnError::InvalidRepoPath {
+            repo: raw.to_string(),
         });
     }
-    Some(raw.to_string())
+    Ok(Some(raw.to_string()))
 }
 
 /// Compose and run a spawn: resolve machine → pre-flight → workspace →
@@ -1586,8 +1684,9 @@ pub fn spawn(ctx: &FleetContext, req: &SpawnRequest) -> Result<SpawnResult, Spaw
     check_kind_supported(ctx, &ep, &client, &req.kind, handshake_deadline)?;
 
     // Effective repo placement: `--repo` path, `~` expansion, or default
-    // placement (`None`) when omitted.
-    let repo = effective_repo_path(&req.repo_path, ep.kind == MachineKind::Local);
+    // placement (`None`) when omitted. Invalid (relative / `~user`) repo
+    // paths are rejected here, before any workspace work (issue #81).
+    let repo = effective_repo_path(&req.repo_path, ep.kind == MachineKind::Local)?;
 
     // Workspace: find by repo path / sole workspace, or create.
     let (workspace_id, workspace_created) =
@@ -2032,44 +2131,124 @@ mod tests {
     #[test]
     fn effective_repo_path_handles_tilde_and_blank() {
         // Omitted / blank → default placement.
-        assert_eq!(effective_repo_path(&None, true), None);
-        assert_eq!(effective_repo_path(&Some("  ".into()), true), None);
-        // Ordinary path passes through.
+        assert_eq!(effective_repo_path(&None, true).unwrap(), None);
+        assert_eq!(effective_repo_path(&Some("  ".into()), true).unwrap(), None);
+        // Ordinary absolute path passes through.
         assert_eq!(
-            effective_repo_path(&Some("/repo".into()), false),
+            effective_repo_path(&Some("/repo".into()), false).unwrap(),
             Some("/repo".into())
         );
         // `~` on a remote worker → default placement (remote home is not
         // discoverable via the API).
-        assert_eq!(effective_repo_path(&Some("~".into()), false), None);
-        assert_eq!(effective_repo_path(&Some("~/proj".into()), false), None);
+        assert_eq!(effective_repo_path(&Some("~".into()), false).unwrap(), None);
+        assert_eq!(
+            effective_repo_path(&Some("~/proj".into()), false).unwrap(),
+            None
+        );
         // `~` on local expands via $HOME (present in test envs; if absent
         // the fallback is "/").
         let home = std::env::home_dir().unwrap_or_else(|| "/".into());
         let home = home.to_string_lossy().into_owned();
         assert_eq!(
-            effective_repo_path(&Some("~".into()), true),
+            effective_repo_path(&Some("~".into()), true).unwrap(),
             Some(home.clone())
         );
         assert_eq!(
-            effective_repo_path(&Some("~/proj".into()), true),
+            effective_repo_path(&Some("~/proj".into()), true).unwrap(),
             Some(format!("{home}/proj"))
         );
     }
 
     #[test]
+    fn effective_repo_path_rejects_non_absolute_and_tilde_user() {
+        // Issue #81: relative paths resolve against the herdr server's
+        // cwd, not the caller's — reject them instead of silently
+        // spawning in the wrong directory.
+        for bad in ["foo/bar", "./x", "../up", "rel", ""] {
+            if bad.is_empty() {
+                continue; // blank → default placement, covered above
+            }
+            match effective_repo_path(&Some(bad.into()), true) {
+                Err(SpawnError::InvalidRepoPath { repo }) => assert_eq!(repo, bad),
+                other => panic!("expected InvalidRepoPath for {bad:?}, got {other:?}"),
+            }
+            // Same rejection on a remote worker.
+            match effective_repo_path(&Some(bad.into()), false) {
+                Err(SpawnError::InvalidRepoPath { .. }) => {}
+                other => panic!("expected InvalidRepoPath for {bad:?}, got {other:?}"),
+            }
+        }
+        // `~user` cannot be expanded without a passwd lookup the herdr
+        // API does not expose — rejected explicitly on both machine
+        // kinds (unlike bare `~`, which degrades to default placement
+        // on remote).
+        for bad in ["~root", "~root/x", "~user with space"] {
+            match effective_repo_path(&Some(bad.into()), true) {
+                Err(SpawnError::InvalidRepoPath { repo }) => assert_eq!(repo, bad),
+                other => panic!("expected InvalidRepoPath for {bad:?}, got {other:?}"),
+            }
+            match effective_repo_path(&Some(bad.into()), false) {
+                Err(SpawnError::InvalidRepoPath { repo }) => assert_eq!(repo, bad),
+                other => panic!("expected InvalidRepoPath for {bad:?}, got {other:?}"),
+            }
+        }
+        // The error has a stable --json code.
+        let e = SpawnError::InvalidRepoPath { repo: "foo".into() };
+        assert_eq!(e.code(), "invalid_repo_path");
+        assert_eq!(e.to_json()["error"]["code"], "invalid_repo_path");
+    }
+
+    #[test]
     fn agent_ready_recognizes_states() {
-        assert!(agent_ready(&json!({"agent": {"status": "idle"}})));
-        assert!(agent_ready(&json!({"status": "interactive_ready"})));
-        assert!(agent_ready(&json!({"state": "ready"})));
+        // `done_ready=false` models the first poll (no prior
+        // non-terminal observation); `true` models a later poll.
+        assert!(agent_ready(&json!({"agent": {"status": "idle"}}), false));
+        assert!(agent_ready(&json!({"status": "interactive_ready"}), false));
+        assert!(agent_ready(&json!({"state": "ready"}), false));
         // herdr 0.9.5 field name + post-launch interactive states.
-        assert!(agent_ready(&json!({"agent": {"agent_status": "idle"}})));
-        assert!(agent_ready(&json!({"agent": {"agent_status": "blocked"}})));
-        assert!(agent_ready(&json!({"agent": {"agent_status": "done"}})));
-        assert!(agent_ready(&json!({"interactive_ready": true})));
-        assert!(!agent_ready(&json!({"agent": {"status": "working"}})));
-        assert!(!agent_ready(&json!({"agent": {"agent_status": "working"}})));
-        assert!(!agent_ready(&json!({"agent": {}})));
+        assert!(agent_ready(
+            &json!({"agent": {"agent_status": "idle"}}),
+            false
+        ));
+        assert!(agent_ready(
+            &json!({"agent": {"agent_status": "blocked"}}),
+            false
+        ));
+        assert!(agent_ready(&json!({"interactive_ready": true}), false));
+        assert!(!agent_ready(
+            &json!({"agent": {"status": "working"}}),
+            false
+        ));
+        assert!(!agent_ready(
+            &json!({"agent": {"agent_status": "working"}}),
+            false
+        ));
+        assert!(!agent_ready(&json!({"agent": {}}), false));
+    }
+
+    #[test]
+    fn agent_ready_gates_done_on_prior_observation() {
+        // Issue #82: `done` is the agent-finished signal — an
+        // instantly-exiting CLI can report it on the first poll, so it
+        // must not count as ready until a non-terminal status was seen.
+        let done = json!({"agent": {"agent_status": "done"}});
+        assert!(!agent_ready(&done, false));
+        assert!(agent_ready(&done, true));
+        // `interactive_ready` stays an immediate ready signal regardless.
+        assert!(agent_ready(
+            &json!({"agent": {"agent_status": "done", "interactive_ready": true}}),
+            false
+        ));
+        // observed_nonterminal_status: any non-`done` status counts,
+        // `done` itself does not.
+        assert!(observed_nonterminal_status(
+            &json!({"agent": {"agent_status": "working"}})
+        ));
+        assert!(observed_nonterminal_status(
+            &json!({"agent": {"status": "unknown"}})
+        ));
+        assert!(!observed_nonterminal_status(&done));
+        assert!(!observed_nonterminal_status(&json!({"agent": {}})));
     }
 
     #[test]
@@ -2634,5 +2813,165 @@ mod tests {
         // Empty / missing text → None.
         assert_eq!(read_tail_text(&json!({"text": "  \n "})), None);
         assert_eq!(read_tail_text(&json!({"foo": 1})), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #81: `--repo /` must not prefix-match every absolute path.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn path_matches_repo_root_only_matches_root() {
+        // "/" trims to "" — without the guard, path_within degenerated
+        // to `candidate.starts_with("/")` and `--repo /` reused ANY
+        // workspace with an absolute cwd, skipping verification.
+        assert!(path_matches_repo("/", "/"));
+        assert!(path_matches_repo("/", "//"));
+        assert!(!path_matches_repo("/", "/repo"));
+        assert!(!path_matches_repo("/", "/repo/sub"));
+        assert!(!path_matches_repo("/repo", "/"));
+        // Ordinary prefix semantics are unchanged.
+        assert!(path_matches_repo("/repo/sub", "/repo"));
+        assert!(path_matches_repo("/repo", "/repo/"));
+        assert!(!path_matches_repo("/repox", "/repo"));
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #74: probe_local derives `online` from the agent.list probe.
+    // ------------------------------------------------------------------
+
+    /// Fake herdr API server on a unix socket. `respond` maps the
+    /// request `method` to the response envelope body (`{"result": …}`
+    /// or `{"error": …}`); the request id is echoed automatically.
+    #[cfg(unix)]
+    struct FakeHerdr {
+        socket_path: PathBuf,
+        dir: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn fake_herdr_socket(respond: impl Fn(&str) -> Value + Send + Sync + 'static) -> FakeHerdr {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hc-fake-herdr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let respond = std::sync::Arc::new(respond);
+        std::thread::spawn(move || {
+            // One connection per request, mirroring real herdr.
+            while let Ok((stream, _)) = listener.accept() {
+                let respond = std::sync::Arc::clone(&respond);
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut writer = stream;
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                        let req: Value =
+                            serde_json::from_str(line.trim()).unwrap_or_else(|_| json!({}));
+                        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let mut resp = respond(method);
+                        if let Some(obj) = resp.as_object_mut() {
+                            obj.insert("id".to_string(), id);
+                        }
+                        let _ = writeln!(writer, "{resp}");
+                        let _ = writer.flush();
+                    }
+                });
+            }
+        });
+        FakeHerdr { socket_path, dir }
+    }
+
+    /// Point the context's local endpoint at `socket_path`.
+    #[cfg(unix)]
+    fn ctx_with_local_socket(socket_path: PathBuf) -> FleetContext {
+        let mut ctx = FleetContext::build(PathBuf::from("/tmp/hc"), cluster(), vec![]).unwrap();
+        ctx.endpoints
+            .iter_mut()
+            .find(|e| e.kind == MachineKind::Local)
+            .unwrap()
+            .socket_path = socket_path;
+        ctx
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_local_reports_online_when_agent_list_succeeds() {
+        let fake = fake_herdr_socket(|method| match method {
+            "agent.list" => json!({"result": {"agents": [{"name": "a"}, {"name": "b"}]}}),
+            "server.agent_manifests" => {
+                json!({"result": {"manifests": [{"agent": "claude"}]}})
+            }
+            _ => json!({"result": {}}),
+        });
+        let ctx = ctx_with_local_socket(fake.socket_path.clone());
+        let (online, count, kinds) = probe_local(&ctx);
+        assert!(online);
+        assert_eq!(count, 2);
+        assert!(kinds.contains(&"claude".to_string()));
+        let _ = std::fs::remove_dir_all(&fake.dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_local_reports_offline_on_stale_socket() {
+        // Issue #74: ApiClient::connect only checks the socket path
+        // exists. A stale socket file (listener bound then dropped —
+        // the file remains, connections are refused) used to report
+        // online=true with 0 agents/kinds, letting the scheduler pick a
+        // dead `local` for `--machine auto`.
+        let dir = std::env::temp_dir().join(format!(
+            "hc-stale-sock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("herdr.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(listener); // socket file remains; connect → ECONNREFUSED
+
+        let ctx = ctx_with_local_socket(sock);
+        // Sanity: connect() itself succeeds on the stale path — that is
+        // exactly the bug; only the request proves herdr is down.
+        assert!(ctx.local().client().is_ok());
+        let (online, count, kinds) = probe_local(&ctx);
+        assert!(!online, "stale socket must report offline");
+        assert_eq!(count, 0);
+        assert!(kinds.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_local_stays_online_when_only_manifests_fail() {
+        // agent.list is the liveness probe; a failed
+        // server.agent_manifests leaves the machine online with an
+        // empty kind set (same shape as before, minus the false
+        // online-on-dead-socket case).
+        let fake = fake_herdr_socket(|method| match method {
+            "agent.list" => json!({"result": {"agents": []}}),
+            "server.agent_manifests" => {
+                json!({"error": {"code": "boom", "message": "wedged"}})
+            }
+            _ => json!({"result": {}}),
+        });
+        let ctx = ctx_with_local_socket(fake.socket_path.clone());
+        let (online, count, kinds) = probe_local(&ctx);
+        assert!(online);
+        assert_eq!(count, 0);
+        assert!(kinds.is_empty());
+        let _ = std::fs::remove_dir_all(&fake.dir);
     }
 }

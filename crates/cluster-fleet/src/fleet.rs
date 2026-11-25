@@ -393,6 +393,24 @@ fn join_outcome(
     }
 }
 
+/// Map one `machines` probe thread's join result to its `(label, probe)`
+/// pair — the same panic handling [`join_outcome`] gives `agent list
+/// --all` (issue #54). A panicked probe becomes an explicit `Err`
+/// probe failure rather than a missing map entry: the old
+/// `("", None)` substitution was filtered out, leaving no probe for a
+/// non-skipped endpoint, so `assemble_machine_info` reported
+/// `reachable: false` while `status` fell back to the registry value
+/// (e.g. `"online"`) — a contradictory row (issue #80).
+fn probe_join_outcome(
+    label: String,
+    result: std::thread::Result<Result<usize, String>>,
+) -> (String, Result<usize, String>) {
+    match result {
+        Ok(probe) => (label, probe),
+        Err(payload) => (label, Err(panic_reason(payload))),
+    }
+}
+
 /// Human-readable reason for a panicked query thread, using the panic
 /// payload when it carries a message.
 fn panic_reason(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -515,26 +533,25 @@ pub fn machines_with_timeout(ctx: &FleetContext, timeout: Duration) -> Vec<Machi
         .filter(|e| !skipped.contains(&e.label))
         .collect();
 
-    let probes: Vec<(String, Option<Result<usize, String>>)> = std::thread::scope(|s| {
+    let probes: Vec<(String, Result<usize, String>)> = std::thread::scope(|s| {
         let handles: Vec<_> = live
             .iter()
             .map(|ep| {
-                s.spawn(move || {
+                let label = ep.label.clone();
+                let handle = s.spawn(move || {
                     // Count the same addressable rows `agent list --all`
                     // emits so the two commands cannot disagree (issue #8).
-                    let result = fetch_agent_list(ep, timeout)
-                        .map(|v| parse_agent_list(&ep.label, &v).len());
-                    (ep.label.clone(), Some(result))
-                })
+                    fetch_agent_list(ep, timeout).map(|v| parse_agent_list(&ep.label, &v).len())
+                });
+                (label, handle)
             })
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| ("".to_string(), None)))
-            .filter(|(l, _)| !l.is_empty())
+            .map(|(label, h)| probe_join_outcome(label, h.join()))
             .collect()
     });
-    let mut probe_map: std::collections::BTreeMap<String, Option<Result<usize, String>>> =
+    let mut probe_map: std::collections::BTreeMap<String, Result<usize, String>> =
         probes.into_iter().collect();
 
     let mut out: Vec<MachineInfo> = ctx
@@ -545,7 +562,7 @@ pub fn machines_with_timeout(ctx: &FleetContext, timeout: Duration) -> Vec<Machi
             let probe = if skipped.contains(&ep.label) {
                 None
             } else {
-                probe_map.remove(&ep.label).flatten()
+                probe_map.remove(&ep.label)
             };
             let override_max = ctx
                 .machines_overrides
@@ -792,6 +809,37 @@ mod tests {
         );
         assert_eq!(label, "ok");
         assert!(matches!(outcome, MachineAgents::Unreachable { .. }));
+    }
+
+    #[test]
+    fn panicked_probe_thread_is_explicit_probe_failure() {
+        // Issue #80: a panicked `machines` probe thread must yield an
+        // explicit Err probe — not a missing entry — so the row reports
+        // reachable:false AND status:"unreachable" instead of falling
+        // back to the registry status.
+        let handle = std::thread::spawn(|| -> Result<usize, String> { panic!("boom") });
+        let (label, probe) = probe_join_outcome("w".into(), handle.join());
+        assert_eq!(label, "w");
+        let Err(reason) = probe else {
+            panic!("expected Err probe, got {probe:?}");
+        };
+        assert!(reason.contains("boom"), "unexpected reason: {reason}");
+
+        // A non-string payload still maps to a reasoned failure.
+        let (label, probe) = probe_join_outcome(
+            "x".into(),
+            Err(Box::new(42u32) as Box<dyn std::any::Any + Send>),
+        );
+        assert_eq!(label, "x");
+        assert_eq!(probe.unwrap_err(), "internal query panic");
+
+        // Successful joins pass through untouched — Ok stays Ok, Err
+        // stays Err.
+        let (label, probe) = probe_join_outcome("ok".into(), Ok(Ok(3)));
+        assert_eq!(label, "ok");
+        assert_eq!(probe.unwrap(), 3);
+        let (_, probe) = probe_join_outcome("bad".into(), Ok(Err("timeout".into())));
+        assert_eq!(probe.unwrap_err(), "timeout");
     }
 
     #[test]
