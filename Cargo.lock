@@ -278,11 +278,13 @@ dependencies = [
  "bytes",
  "cluster-core",
  "cluster-net",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
