@@ -211,23 +211,34 @@ fn resolve_port(cfg_port: Option<u16>, persisted: u16) -> Result<u16, ConfigErro
 
 /// Pick a filesystem-unique worker label: `desired`, or `desired-2`,
 /// `desired-3`, … when another registered worker already uses it.
+///
+/// Uniqueness is enforced on the *sanitized* form
+/// ([`cluster_fleet::endpoint::sanitize_label`]) because the bridge
+/// socket path is `<state_dir>/bridge/<sanitize(label)>.sock` — labels
+/// like `"a b"` and `"a_b"` sanitize identically and would fight over
+/// the same socket, leaving the second worker permanently bridgeless
+/// (issue #100). The `"{desired}-N"` fallback loops until its sanitized
+/// form is also free.
 fn unique_label(registry: &WorkerRegistry, desired: &str, own_pubkey: &str) -> String {
+    let sanitize = cluster_fleet::endpoint::sanitize_label;
     let taken = |label: &str| {
+        let want = sanitize(label);
         registry
             .list()
             .iter()
-            .any(|w| w.label == label && w.pubkey != own_pubkey)
+            .any(|w| w.pubkey != own_pubkey && sanitize(&w.label) == want)
     };
     if !taken(desired) {
         return desired.to_string();
     }
-    for n in 2..1000u32 {
+    let mut n = 2u64;
+    loop {
         let candidate = format!("{desired}-{n}");
         if !taken(&candidate) {
             return candidate;
         }
+        n += 1;
     }
-    format!("{desired}-x")
 }
 
 // ---- UDP discovery wire format (mirrors cluster_net::discovery) ----
@@ -761,37 +772,46 @@ async fn run_pairing_exchange(
             } else {
                 confirm_prompt(&pending).await
             };
-            let response = if approved {
+            if !approved {
                 shared.with_server(|server| {
-                    server.confirm().map(|join| {
-                        register_worker(&join, shared);
-                        build_pair_accept(shared)
-                    })
-                })
-            } else {
-                Ok(shared.with_server(|server| {
                     let _ = server.deny("denied by controller user");
-                    Some(Message::PairReject {
+                });
+                write_pairing_frame(
+                    stream,
+                    &Message::PairReject {
                         reason: "join denied by controller user".to_string(),
-                    })
-                }))
-            };
-            match response {
-                Ok(Some(msg)) => {
-                    write_pairing_frame(stream, &msg).await;
-                    if let Message::PairAccept { .. } = msg {
-                        println!("worker paired successfully");
+                    },
+                )
+                .await;
+                return;
+            }
+            // `confirm()` consumes the FSM (code rotates on the next
+            // request) but does no I/O — registry mutation is deferred
+            // until the PairAccept frame is actually delivered (issue
+            // #101): a worker whose TCP died during the up-to-120 s
+            // confirm prompt must not leave an orphan workers.json row
+            // it can never use, and no disk I/O runs under the pairing
+            // mutex.
+            match shared.with_server(|server| server.confirm()) {
+                Ok(join) => match build_pair_accept(shared) {
+                    Some(msg) => {
+                        if write_pairing_frame(stream, &msg).await {
+                            register_worker(&join, shared);
+                            println!("worker paired successfully");
+                        } else {
+                            tracing::debug!("pairing accept undeliverable; worker not registered");
+                        }
                     }
-                }
-                Ok(None) => {
-                    write_pairing_frame(
-                        stream,
-                        &Message::PairReject {
-                            reason: "pairing session error".to_string(),
-                        },
-                    )
-                    .await;
-                }
+                    None => {
+                        write_pairing_frame(
+                            stream,
+                            &Message::PairReject {
+                                reason: "pairing session error".to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                },
                 Err(e) => {
                     tracing::debug!("pairing confirm failed: {e}");
                     write_pairing_frame(
@@ -856,14 +876,23 @@ async fn run_pairing_exchange(
 }
 
 /// Encode + write one pairing response frame, then half-close.
-async fn write_pairing_frame(stream: &mut TcpStream, msg: &Message) {
+/// Returns `true` when the frame was fully written — callers registering
+/// state on approval use this to avoid orphan rows for dead workers
+/// (issue #101).
+async fn write_pairing_frame(stream: &mut TcpStream, msg: &Message) -> bool {
     match protocol::encode_frame(msg) {
         Ok(frame) => {
             if stream.write_all(&frame).await.is_ok() {
                 let _ = stream.shutdown().await;
+                true
+            } else {
+                false
             }
         }
-        Err(e) => tracing::warn!("pairing response encode failed: {e}"),
+        Err(e) => {
+            tracing::warn!("pairing response encode failed: {e}");
+            false
+        }
     }
 }
 
@@ -959,6 +988,7 @@ async fn controller_event_loop(
         };
         match event {
             ControllerEvent::WorkerConnected(ws) => {
+                let controller = controller.clone();
                 let registry = registry.clone();
                 let dirty = dirty.clone();
                 let state_dir = state_dir.clone();
@@ -967,6 +997,7 @@ async fn controller_event_loop(
                 tokio::spawn(async move {
                     on_worker_connected(
                         ws,
+                        controller,
                         registry,
                         dirty,
                         state_dir,
@@ -1007,9 +1038,13 @@ fn find_worker(registry: &WorkerRegistry, pubkey: &[u8; 32]) -> Option<(String, 
 
 /// A worker completed TLS + auth + `WorkerHello`: verify it is paired,
 /// mark it seen, spawn its bridge, and start the control-message pump.
+///
+/// `controller` is needed on unix to verify the session is still current
+/// before its bridge is installed (issue #94).
 #[allow(clippy::too_many_arguments)]
 async fn on_worker_connected(
     ws: WorkerSession,
+    controller: Arc<Controller>,
     registry: Arc<Mutex<WorkerRegistry>>,
     dirty: Arc<AtomicBool>,
     state_dir: PathBuf,
@@ -1053,22 +1088,119 @@ async fn on_worker_connected(
 
     #[cfg(unix)]
     {
-        match ControllerBridge::new(&state_dir, &label, ws.session.clone()).await {
+        install_worker_bridge(&controller, &ws, &state_dir, &label, &worker_id, &bridges).await;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (state_dir, ws, controller);
+    }
+}
+
+/// How long a connect task waits for an incumbent bridge (the previous
+/// session's listener still bound at the same socket path) to leave the
+/// bridges map before giving up. Disconnect processing is prompt, so
+/// this only bounds the wait — issue #94.
+#[cfg(unix)]
+const BRIDGE_SOCKET_FREE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Poll cadence while waiting for the bridge socket path to free up.
+#[cfg(unix)]
+const BRIDGE_SOCKET_FREE_POLL: Duration = Duration::from_millis(50);
+
+/// Install the per-worker unix bridge for `ws.session`, tolerating the
+/// reconnect races of issue #94:
+///
+/// - Connect events are handled by independent, unordered tasks, so two
+///   connects for the same worker can race to bind
+///   `<state_dir>/bridge/<label>.sock`. The `SocketInUse` loser used to
+///   warn-and-drop, leaving the worker TLS-connected forever with every
+///   fleet/API call `worker_unreachable`. Now the loser waits for the
+///   incumbent's bridge to leave the map (its disconnect handler shuts
+///   it down) and retries the bind.
+/// - Before inserting, the controller's session map must still hold
+///   *this* session (`Arc::ptr_eq`) and it must be alive — a disconnect
+///   processed ahead of this task, or a newer reconnect, must not leave
+///   a bridge serving a dead session.
+#[cfg(unix)]
+async fn install_worker_bridge(
+    controller: &Arc<Controller>,
+    ws: &WorkerSession,
+    state_dir: &Path,
+    label: &str,
+    worker_id: &str,
+    bridges: &WorkerBridges,
+) {
+    // True while `ws.session` is still the controller's current session
+    // for this worker and alive.
+    let session_current = |controller: &Arc<Controller>| {
+        ws.session.is_alive()
+            && controller
+                .session(&ws.worker_pubkey)
+                .is_some_and(|cur| Arc::ptr_eq(&cur, &ws.session))
+    };
+
+    loop {
+        if !session_current(controller) {
+            // Superseded or already dead — a newer connect (or the
+            // disconnect path) owns the bridge now.
+            tracing::debug!(worker = %label, "worker session superseded before bridge install");
+            return;
+        }
+        match ControllerBridge::new(state_dir, label, ws.session.clone()).await {
             Ok(bridge) => {
+                if !session_current(controller) {
+                    // Died or was superseded between bind and insert —
+                    // don't leave a bridge serving a stale session. The
+                    // queued disconnect event would clean it up anyway,
+                    // but releasing the socket now lets the winning
+                    // connect's retry succeed immediately.
+                    bridge.shutdown();
+                    return;
+                }
                 let mut map = bridges.lock().unwrap();
-                if let Some((_, old)) = map.insert(worker_id.clone(), (ws.session.clone(), bridge))
+                if let Some((_, old)) =
+                    map.insert(worker_id.to_string(), (ws.session.clone(), bridge))
                 {
                     old.shutdown();
+                }
+                return;
+            }
+            Err(cluster_bridge::BridgeError::SocketInUse(path)) => {
+                // An incumbent bridge still serves this socket path —
+                // typically the previous session's listener whose
+                // disconnect hasn't been processed yet. Wait for it to
+                // leave the bridges map, then retry the bind.
+                let deadline = std::time::Instant::now() + BRIDGE_SOCKET_FREE_TIMEOUT;
+                loop {
+                    if !session_current(controller) {
+                        tracing::debug!(
+                            worker = %label,
+                            "session lost while waiting for bridge socket"
+                        );
+                        return;
+                    }
+                    let occupied = bridges
+                        .lock()
+                        .unwrap()
+                        .values()
+                        .any(|(_, b)| b.socket_path() == path.as_path());
+                    if !occupied {
+                        break; // socket freed — retry the bind
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            worker = %label,
+                            "bridge socket still held after {BRIDGE_SOCKET_FREE_TIMEOUT:?}; giving up"
+                        );
+                        return;
+                    }
+                    tokio::time::sleep(BRIDGE_SOCKET_FREE_POLL).await;
                 }
             }
             Err(e) => {
                 tracing::warn!(worker = %label, "bridge bind failed: {e}");
+                return;
             }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (state_dir, ws);
     }
 }
 
@@ -1208,7 +1340,6 @@ async fn revocation_watch_loop(
             &controller,
             &registry,
             &dirty,
-            &state_dir,
             #[cfg(unix)]
             &bridges,
             &dir,
@@ -1235,7 +1366,6 @@ fn process_revocations(
     controller: &Arc<Controller>,
     registry: &Arc<Mutex<WorkerRegistry>>,
     dirty: &AtomicBool,
-    state_dir: &Path,
     #[cfg(unix)] bridges: &WorkerBridges,
     dir: &Path,
 ) {
@@ -1304,8 +1434,13 @@ fn process_revocations(
         #[cfg(not(unix))]
         let _ = removed_id;
 
-        // 4. Consume the marker.
-        if let Err(e) = crate::revoke::consume_marker(state_dir, &marker.worker_id) {
+        // 4. Consume the marker — delete the exact file we read.
+        //    `consume_marker(state_dir, worker_id)` rebuilt the path
+        //    from the file *contents'*, so a filename/content mismatch
+        //    was never deleted (reprocessed every scan forever) and
+        //    could even remove a different worker's pending marker —
+        //    issue #97.
+        if let Err(e) = std::fs::remove_file(&path) {
             tracing::debug!(error = %e, "revocation marker cleanup failed");
         }
         println!("worker '{}' revoked", marker.label);
@@ -1875,6 +2010,199 @@ mod tests {
         on_worker_disconnected(pubkey, &s2, &ctrl, &registry, &bridges, &dirty);
         assert!(!bridges.lock().unwrap().contains_key(&worker_id));
         assert!(!sock.exists());
+
+        let _ = std::fs::remove_dir_all(&ctrl_dir);
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _ = std::fs::remove_dir_all(&bridge_dir);
+    }
+
+    /// Issue #100: `unique_label` must dedupe on the *sanitized* label —
+    /// the bridge socket path is `bridge/<sanitize(label)>.sock`, so
+    /// `"a b"` and `"a_b"` collide on disk even though the raw labels
+    /// differ.
+    #[test]
+    fn unique_label_dedupes_on_sanitized_form() {
+        let dir = tempdir("labels");
+        let mut reg = WorkerRegistry::open(dir.join("workers.json")).unwrap();
+        let mk = |id: &str, label: &str, pk: &str| WorkerEntry {
+            worker_id: id.into(),
+            label: label.into(),
+            pubkey: pk.into(),
+            paired_at: Utc::now(),
+            last_seen: None,
+            status: WorkerStatus::Offline,
+            resources: None,
+        };
+        reg.upsert(mk("w1", "a b", "pk1"));
+        reg.upsert(mk("w2", "a_b-2", "pk2"));
+
+        // "a_b" sanitizes to "a_b" — the same socket as "a b". The
+        // "a_b-2" candidate is also taken, so the loop must reach -3.
+        assert_eq!(unique_label(&reg, "a_b", "pk3"), "a_b-3");
+        // Re-pairing the same worker (own pubkey) keeps its label.
+        assert_eq!(unique_label(&reg, "a b", "pk1"), "a b");
+        // A label with a free sanitized form is untouched.
+        assert_eq!(unique_label(&reg, "plain", "pk3"), "plain");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #97: `process_revocations` must consume the marker file it
+    /// actually read — not a path rebuilt from the marker's *contents*.
+    /// A filename/content mismatch previously survived every 500 ms
+    /// scan forever (and `consume_marker` could delete a different
+    /// worker's pending marker for the same worker_id).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mismatched_marker_filename_is_consumed() {
+        let state_dir = tempdir("rev-mismatch");
+        let rev_dir = crate::revoke::revocations_dir(&state_dir);
+        std::fs::create_dir_all(&rev_dir).unwrap();
+
+        let marker = crate::revoke::RevocationMarker {
+            version: crate::revoke::REVOCATION_MARKER_VERSION,
+            worker_id: "w-real".into(),
+            label: "m".into(),
+            pubkey: "00".repeat(32),
+            revoked_at_unix: 0,
+        };
+        let json = serde_json::to_vec(&marker).unwrap();
+        // Filename deliberately does NOT match sanitize_label(worker_id)
+        // — the old code rebuilt the consume path from the contents and
+        // so never deleted this file.
+        let stray = rev_dir.join("unrelated.json");
+        std::fs::write(&stray, &json).unwrap();
+
+        let ctrl_dir = tempdir("rev-mismatch-ctrl");
+        let ctrl = Arc::new(
+            conn::Controller::bind(&ctrl_dir, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let registry = Arc::new(Mutex::new(
+            WorkerRegistry::open(state_dir.join("workers.json")).unwrap(),
+        ));
+        let bridges: WorkerBridges = Arc::new(Mutex::new(HashMap::new()));
+        let dirty = Arc::new(AtomicBool::new(false));
+
+        process_revocations(&ctrl, &registry, &dirty, &bridges, &rev_dir);
+        assert!(!stray.exists(), "iterated marker file must be consumed");
+
+        // A second, correctly-named marker is consumed on its own scan —
+        // and processing it must not touch unrelated files.
+        let legit = rev_dir.join("w-real.json");
+        std::fs::write(&legit, &json).unwrap();
+        process_revocations(&ctrl, &registry, &dirty, &bridges, &rev_dir);
+        assert!(!legit.exists());
+
+        let _ = std::fs::remove_dir_all(&state_dir);
+        let _ = std::fs::remove_dir_all(&ctrl_dir);
+    }
+
+    /// Issue #94 regression: two quick reconnects produce two unordered
+    /// `on_worker_connected` tasks racing to bind the same bridge
+    /// socket. The bridge must end up serving the *latest* session —
+    /// the stale connect must not win the bind, and a stale disconnect
+    /// must not tear it down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnect_race_installs_bridge_for_latest_session() {
+        let ctrl_dir = tempdir("race-ctrl");
+        let work_dir = tempdir("race-worker");
+        let bridge_dir = tempdir("race-bridges");
+
+        let ctrl = Arc::new(
+            conn::Controller::bind(&ctrl_dir, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let addr = ctrl.local_addr();
+        let c = ctrl.clone();
+        tokio::spawn(async move { c.accept_loop().await });
+
+        let material = ctrl.tls_material();
+        let cred = conn::WorkerCredential {
+            controller_pubkey: protocol::pubkey_to_hex(&ctrl.cluster_pubkey()),
+            ca_fingerprint: material.ca_fingerprint(),
+            ca_cert_pem: material.ca_cert_pem.clone(),
+        };
+        conn::save_worker_credential(&work_dir, &cred).unwrap();
+        let client = conn::WorkerClient::load(&work_dir, worker_cfg("race-w")).unwrap();
+        let pubkey = client.public_key();
+
+        // Registry row so on_worker_connected accepts the pubkey.
+        let mut reg = WorkerRegistry::open(bridge_dir.join("workers.json")).unwrap();
+        let worker_id = registry::random_id(16);
+        reg.upsert(WorkerEntry {
+            worker_id: worker_id.clone(),
+            label: "race-w".to_string(),
+            pubkey: protocol::pubkey_to_hex(&pubkey),
+            paired_at: Utc::now(),
+            last_seen: None,
+            status: WorkerStatus::Offline,
+            resources: None,
+        });
+        let registry = Arc::new(Mutex::new(reg));
+        let bridges: WorkerBridges = Arc::new(Mutex::new(HashMap::new()));
+        let dirty = Arc::new(AtomicBool::new(false));
+
+        // Next WorkerConnected event, skipping disconnects.
+        async fn next_connected(ctrl: &Controller) -> WorkerSession {
+            loop {
+                match ctrl.next_event().await {
+                    ControllerEvent::WorkerConnected(ws) => return ws,
+                    ControllerEvent::WorkerDisconnected { .. } => continue,
+                }
+            }
+        }
+
+        // Two quick reconnects.
+        let w1 = client.connect_once(addr).await.expect("connect 1");
+        let ws1 = next_connected(&ctrl).await;
+        let s1 = ws1.session.clone();
+        w1.close();
+        let _w2 = client.connect_once(addr).await.expect("connect 2");
+        let ws2 = next_connected(&ctrl).await;
+        let s2 = ws2.session.clone();
+        assert!(!Arc::ptr_eq(&s1, &s2));
+
+        // Feed both connect events to unordered tasks — the original
+        // race. Exactly one bridge may survive, bound to s2.
+        tokio::join!(
+            on_worker_connected(
+                ws1,
+                ctrl.clone(),
+                registry.clone(),
+                dirty.clone(),
+                bridge_dir.clone(),
+                bridges.clone(),
+            ),
+            on_worker_connected(
+                ws2,
+                ctrl.clone(),
+                registry.clone(),
+                dirty.clone(),
+                bridge_dir.clone(),
+                bridges.clone(),
+            ),
+        );
+
+        {
+            let map = bridges.lock().unwrap();
+            let (sess, bridge) = map.get(&worker_id).expect("bridge must be installed");
+            assert!(
+                Arc::ptr_eq(sess, &s2),
+                "bridge must serve the latest session, not the stale one"
+            );
+            assert!(bridge.socket_path().exists());
+        }
+
+        // Stale disconnect for s1 keeps the s2 bridge; s2's own
+        // disconnect tears it down.
+        on_worker_disconnected(pubkey, &s1, &ctrl, &registry, &bridges, &dirty);
+        assert!(bridges.lock().unwrap().contains_key(&worker_id));
+        on_worker_disconnected(pubkey, &s2, &ctrl, &registry, &bridges, &dirty);
+        assert!(!bridges.lock().unwrap().contains_key(&worker_id));
 
         let _ = std::fs::remove_dir_all(&ctrl_dir);
         let _ = std::fs::remove_dir_all(&work_dir);
