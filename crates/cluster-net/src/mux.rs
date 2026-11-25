@@ -746,10 +746,15 @@ async fn deliver_data(
 
     // Wait until the inbound budget (bytes AND message slots) allows this
     // frame. While waiting we simply don't read — TCP backpressure.
+    // A frame carrying both payload and FIN enqueues two messages
+    // (`Data` + `Fin`), so reserve one slot per message up front —
+    // guaranteeing only a single free slot let `Data` through and then
+    // failed `Fin`, which used to kill the whole connection.
+    let needed = (!payload.is_empty()) as usize + fin as usize;
     loop {
         let plen = payload.len();
         let byte_room = st.in_bytes.load(Ordering::Acquire) + plen <= STREAM_BUFFER_CAP;
-        let msg_room = st.in_tx.capacity() > 0;
+        let msg_room = st.in_tx.capacity() >= needed;
         if byte_room && msg_room {
             break;
         }
@@ -766,14 +771,18 @@ async fn deliver_data(
     let plen = payload.len();
     if plen > 0 {
         if st.in_tx.try_send(InMsg::Data(payload)).is_err() {
-            return false; // channel closed → connection is going away
+            // The channel can only be full here if a concurrent reset
+            // marker claimed a slot we reserved — the stream is already
+            // dead, so dropping the frame is correct. Never fatal: one
+            // stream's edge case must not kill the whole connection.
+            return true;
         }
         st.in_bytes.fetch_add(plen, Ordering::AcqRel);
     }
     if fin {
         st.flags.fetch_or(SF_REMOTE_FIN, Ordering::AcqRel);
         if st.in_tx.try_send(InMsg::Fin).is_err() {
-            return false;
+            return true;
         }
     }
     gc_stream(shared, st);
@@ -804,17 +813,31 @@ where
             // Deterministic-ish order: control first, then by stream id.
             let mut ids: Vec<u32> = map.keys().copied().collect();
             ids.sort_unstable();
+            // Fair share: cap how many frames each stream may drain per
+            // batch. Without a cap, the lowest-id stream with a constant
+            // backlog consumes the entire WRITER_BATCH every iteration and
+            // starves every other stream (head-of-line blocking). Streams
+            // with an empty queue don't count against the share.
+            let live = map
+                .values()
+                .filter(|st| st.out_len.load(Ordering::Acquire) > 0)
+                .count()
+                .max(1);
+            let per_stream = (WRITER_BATCH / live).max(1);
             for id in ids {
                 if batch.len() >= WRITER_BATCH {
                     break;
                 }
                 let Some(st) = map.get(&id) else { continue };
                 let mut out = st.out.lock().unwrap();
-                while let Some(item) = out.pop_front() {
+                let mut drained = 0usize;
+                while drained < per_stream {
+                    let Some(item) = out.pop_front() else { break };
                     let plen = item.payload.len();
                     batch.push((id, item.flags, item.payload));
                     st.out_bytes.fetch_sub(plen, Ordering::AcqRel);
                     st.out_len.fetch_sub(1, Ordering::AcqRel);
+                    drained += 1;
                     if batch.len() >= WRITER_BATCH {
                         break;
                     }
@@ -1155,6 +1178,122 @@ mod tests {
         // And the accepted handle observes the reset.
         let res = timeout(Duration::from_secs(5), h.recv()).await.unwrap();
         assert!(matches!(res, Err(MuxError::Reset)));
+    }
+
+    /// Regression: a frame carrying payload AND FIN enqueues two inbound
+    /// messages (`Data` + `Fin`). With exactly one free channel slot the
+    /// old code delivered `Data`, failed `Fin`, and killed the whole
+    /// connection. The reader must wait for both slots instead.
+    #[tokio::test]
+    async fn payload_fin_with_one_free_slot_survives() {
+        let (mut client, server) = duplex(1 << 16);
+        let acceptor = Mux::new(server, MuxRole::Acceptor);
+
+        // OPEN stream 1, then fill its inbound queue to INBOUND_MSG_CAP-1.
+        client
+            .write_all(&wire_frame(1, FLAG_OPEN, b""))
+            .await
+            .unwrap();
+        for i in 0..(INBOUND_MSG_CAP as u32 - 1) {
+            client
+                .write_all(&wire_frame(1, 0, format!("d{i}").as_bytes()))
+                .await
+                .unwrap();
+        }
+        // Payload+FIN frame arrives while exactly one slot is free.
+        client
+            .write_all(&wire_frame(1, FLAG_FIN, b"tail"))
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let h = timeout(Duration::from_secs(5), acceptor.accept_stream())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.id(), 1);
+
+        // Draining one message frees the second slot the pending frame
+        // needs; the reader then delivers Data+Fin and keeps going.
+        let first = timeout(Duration::from_secs(5), h.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.as_ref(), b"d0");
+
+        let mut saw_tail = false;
+        // `first` was already one data message.
+        let mut data_msgs = 1usize;
+        while let Some(b) = timeout(Duration::from_secs(5), h.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            data_msgs += 1;
+            if &b[..] == b"tail" {
+                saw_tail = true;
+            }
+        }
+        assert!(saw_tail, "payload+FIN frame was not delivered");
+        // 63 plain data frames + the FIN payload = 64 data messages.
+        assert_eq!(data_msgs, INBOUND_MSG_CAP);
+
+        // The connection is still alive: a second stream works end-to-end.
+        client
+            .write_all(&wire_frame(2, FLAG_OPEN, b""))
+            .await
+            .unwrap();
+        client.write_all(&wire_frame(2, 0, b"alive")).await.unwrap();
+        client.flush().await.unwrap();
+        let h2 = timeout(Duration::from_secs(5), acceptor.accept_stream())
+            .await
+            .unwrap()
+            .unwrap();
+        let b = timeout(Duration::from_secs(5), h2.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&b[..], b"alive");
+    }
+
+    /// Regression: the writer must not let one stream's constant backlog
+    /// starve every other stream. A low-id stream flooding the connection
+    /// used to consume each whole WRITER_BATCH, so higher-id streams got
+    /// zero wire time until it drained.
+    #[tokio::test]
+    async fn busy_stream_does_not_starve_others() {
+        let (d, a) = mux_pair();
+        let (s1, p1) = open_pair(&d, &a).await;
+        let (s2, p2) = open_pair(&d, &a).await;
+
+        // Keep p1's inbound drained so the reader never stalls — the
+        // writer's batch composition is the only bottleneck under test.
+        tokio::spawn(async move { while let Ok(Some(_)) = p1.recv().await {} });
+
+        // Flood s1 so its outbound queue never empties.
+        let stop = Arc::new(AtomicBool::new(false));
+        let feeder_stop = stop.clone();
+        let feeder = tokio::spawn(async move {
+            while !feeder_stop.load(Ordering::Relaxed) {
+                let _ = s1.send_bytes(b"flood").await;
+            }
+        });
+        // Let the backlog build past several writer batches.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // A message on the higher-id stream must still get wire time.
+        s2.send_bytes(b"urgent").await.unwrap();
+        let got = timeout(Duration::from_secs(5), p2.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(&got[..], b"urgent");
+
+        stop.store(true, Ordering::Relaxed);
+        feeder.abort();
     }
 
     /// Regression for the recv() race: once FIN is consumed, every
