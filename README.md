@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-blue.svg)
 ![Rust](https://img.shields.io/badge/Rust-stable-orange.svg)
 ![License](https://img.shields.io/badge/License-MIT-blue.svg)
-![Release](https://img.shields.io/github/v/release/quangdang46/herd_cluster?include_prereleases)
+![Release](https://img.shields.io/github/v/release/quangdang46/herdr_cluster?include_prereleases)
 
 </div>
 
@@ -21,7 +21,7 @@ Mac workers, all through one terminal.
 <div align="center">
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/herdr_cluster/main/install.sh" | bash
 ```
 
 </div>
@@ -135,7 +135,7 @@ published NDJSON socket API. Upstream herdr updates flow through untouched.
 herdcluster init                 # prints an 8-char pairing code
 
 # On each worker (Windows/WSL2, Mac mini, Linux box):
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/herdr_cluster/main/install.sh" | bash
 herdcluster join --controller <MAC_LAN_IP>:47820   # enter the code once
 herdcluster autostart install                     # survive reboots
 
@@ -156,7 +156,7 @@ herdcluster agent list --all                     # every agent, every machine
 **curl (recommended, macOS + Linux x86_64/arm64):**
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/quangdang46/herd_cluster/main/install.sh" | bash
+curl -fsSL "https://raw.githubusercontent.com/quangdang46/herdr_cluster/main/install.sh" | bash
 ```
 
 The script detects OS/arch, downloads the release asset, verifies its
@@ -168,7 +168,7 @@ support is on the roadmap.
 **From source:**
 
 ```bash
-git clone https://github.com/quangdang46/herd_cluster && cd HerdCluster
+git clone https://github.com/quangdang46/herdr_cluster && cd HerdCluster
 cargo install --path crates/herdcluster --locked
 ```
 

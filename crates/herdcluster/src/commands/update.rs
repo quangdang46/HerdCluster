@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-const REPO: &str = "quangdang46/herd_cluster";
+const REPO: &str = "quangdang46/herdr_cluster";
 const API_BASE: &str = "https://api.github.com";
 const USER_AGENT: &str = concat!("herdcluster/", env!("CARGO_PKG_VERSION"));
 const HTTP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -537,7 +537,7 @@ mod tests {
     fn checksums_url_matches_install_sh_pattern() {
         assert_eq!(
             checksums_url("v0.1.1"),
-            "https://github.com/quangdang46/herd_cluster/releases/download/v0.1.1/checksums.txt"
+            "https://github.com/quangdang46/herdr_cluster/releases/download/v0.1.1/checksums.txt"
         );
     }
 }
