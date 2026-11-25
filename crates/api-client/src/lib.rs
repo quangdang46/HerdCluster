@@ -68,6 +68,17 @@ impl ApiError {
     pub fn is_server_not_running(&self) -> bool {
         matches!(self, ApiError::ServerNotRunning { .. })
     }
+
+    /// Structured error code from the server's
+    /// `{"error":{"code","message"}}` envelope (e.g. `"agent_pane_busy"`),
+    /// or `None` for non-server errors. Prefer this over matching on
+    /// [`Display`](fmt::Display) output.
+    pub fn code(&self) -> Option<&str> {
+        match self {
+            ApiError::Server { code, .. } => Some(code),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ApiError {
@@ -259,5 +270,27 @@ impl ApiClient {
                 code: "invalid_response".to_string(),
                 message: "herdr response had neither 'result' nor 'error'".to_string(),
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_error_code_only_for_server_errors() {
+        let server = ApiError::Server {
+            code: "agent_pane_busy".to_string(),
+            message: "pane is not an available shell".to_string(),
+        };
+        assert_eq!(server.code(), Some("agent_pane_busy"));
+        assert_eq!(ApiError::Timeout.code(), None);
+        assert_eq!(
+            ApiError::ServerNotRunning {
+                path: "/tmp/x.sock".into()
+            }
+            .code(),
+            None
+        );
     }
 }
