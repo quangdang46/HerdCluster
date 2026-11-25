@@ -205,6 +205,79 @@ fn timeout_when_server_never_responds() {
 }
 
 #[test]
+fn dribbling_response_cannot_outlive_overall_deadline() {
+    // The server trickles one byte every 50ms — each individual read()
+    // returns well within the per-syscall timeout, but the overall
+    // request deadline must still fire (issue #44).
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            thread::spawn(move || {
+                let mut writer = match stream {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                // Send '{"result":' one byte at a time, forever-ish.
+                for &b in b"{\"result\":".iter().cycle().take(2000) {
+                    if writer.write_all(&[b]).is_err() {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            });
+        }
+    });
+    let client = ApiClient::connect(&socket_path).unwrap();
+    let start = std::time::Instant::now();
+    match client.request_with_timeout("ping", &json!({}), Duration::from_millis(300)) {
+        Err(ApiError::Timeout) => {}
+        other => panic!("expected Timeout, got {other:?}"),
+    }
+    // Generous bound: the deadline is 300ms; allow scheduling slack but
+    // prove it is nowhere near the ~100s the dribble would otherwise take.
+    assert!(
+        start.elapsed() < Duration::from_secs(10),
+        "deadline not enforced: {:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
+fn oversized_response_line_is_rejected() {
+    // The server streams more than MAX_RESPONSE_LINE_BYTES without ever
+    // sending a newline — the client must error instead of buffering
+    // without bound (issue #44).
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            thread::spawn(move || {
+                let mut writer = match stream {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let chunk = vec![b'x'; 64 * 1024];
+                // ~MAX + a bit; the client stops reading once the cap is
+                // hit, so write errors are expected and fine.
+                for _ in 0..(api_client::MAX_RESPONSE_LINE_BYTES / chunk.len() + 2) {
+                    if writer.write_all(&chunk).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let client = ApiClient::connect(&socket_path).unwrap();
+    match client.request_with_timeout("ping", &json!({}), Duration::from_secs(30)) {
+        Err(ApiError::Server { code, .. }) => assert_eq!(code, "response_too_large"),
+        other => panic!("expected response_too_large, got {other:?}"),
+    }
+}
+
+#[test]
 fn wire_shape_is_id_method_params() {
     let server = FakeServer::start(|_| json!({"result": {}}));
     let client = server.client();
