@@ -1240,10 +1240,13 @@ fn apply_fixes(
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             match crate::skills::skills_status(&cwd) {
                 crate::skills::SkillStatus::Missing => {
+                    // Writes files into the user's project — unlike the
+                    // state-dir/chmod fixes above, unattended (non-TTY)
+                    // runs must not auto-install; --yes is the consent.
                     let proceed = opts.yes
                         || crate::join_ux::confirm(
                             "Install the herdcluster skills into this project?",
-                            true,
+                            false,
                         );
                     if proceed {
                         // Install every bundled skill that is still missing.
