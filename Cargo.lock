@@ -330,6 +330,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]

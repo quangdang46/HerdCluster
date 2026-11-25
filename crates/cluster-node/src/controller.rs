@@ -70,6 +70,13 @@ use cluster_bridge::controller::ControllerBridge;
 #[cfg(unix)]
 use std::collections::HashMap;
 
+/// Worker bridges keyed by `worker_id`. Each entry also records the
+/// [`Session`] the bridge was built from, so a *stale*
+/// `WorkerDisconnected` (an old session dying after a reconnect already
+/// replaced it) cannot tear down the replacement session's bridge.
+#[cfg(unix)]
+type WorkerBridges = Arc<Mutex<HashMap<String, (Arc<Session>, ControllerBridge)>>>;
+
 /// How often the UDP socket re-broadcasts its discovery announce.
 const UDP_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(1);
 /// How often the registry persist task checks the dirty flag.
@@ -145,7 +152,7 @@ struct Inner {
     /// Current one-time pairing code (rotates when a session expires).
     pairing_code: Arc<Mutex<String>>,
     #[cfg(unix)]
-    bridges: Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    bridges: WorkerBridges,
     shutdown_tx: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     /// Keeps the mDNS advertisement alive; unregisters on drop.
@@ -402,8 +409,7 @@ impl ControllerHandle {
 
         // ---- controller event loop: registry marks, bridges, status ----
         #[cfg(unix)]
-        let bridges: Arc<Mutex<HashMap<String, ControllerBridge>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let bridges: WorkerBridges = Arc::new(Mutex::new(HashMap::new()));
         {
             let controller = controller.clone();
             let registry = registry.clone();
@@ -590,7 +596,7 @@ impl ControllerHandle {
         #[cfg(unix)]
         {
             let mut bridges = self.inner.bridges.lock().unwrap();
-            for (_, bridge) in bridges.drain() {
+            for (_, (_, bridge)) in bridges.drain() {
                 bridge.shutdown();
             }
         }
@@ -943,7 +949,7 @@ async fn controller_event_loop(
     registry: Arc<Mutex<WorkerRegistry>>,
     dirty: Arc<AtomicBool>,
     state_dir: PathBuf,
-    #[cfg(unix)] bridges: Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    #[cfg(unix)] bridges: WorkerBridges,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     loop {
@@ -970,9 +976,14 @@ async fn controller_event_loop(
                     .await;
                 });
             }
-            ControllerEvent::WorkerDisconnected { worker_pubkey } => {
+            ControllerEvent::WorkerDisconnected {
+                worker_pubkey,
+                session,
+            } => {
                 on_worker_disconnected(
                     worker_pubkey,
+                    &session,
+                    &controller,
                     &registry,
                     #[cfg(unix)]
                     &bridges,
@@ -1002,7 +1013,7 @@ async fn on_worker_connected(
     registry: Arc<Mutex<WorkerRegistry>>,
     dirty: Arc<AtomicBool>,
     state_dir: PathBuf,
-    #[cfg(unix)] bridges: Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    #[cfg(unix)] bridges: WorkerBridges,
 ) {
     let found = {
         let reg = registry.lock().unwrap();
@@ -1045,7 +1056,9 @@ async fn on_worker_connected(
         match ControllerBridge::new(&state_dir, &label, ws.session.clone()).await {
             Ok(bridge) => {
                 let mut map = bridges.lock().unwrap();
-                if let Some(old) = map.insert(worker_id.clone(), bridge) {
+                if let Some((_, old)) =
+                    map.insert(worker_id.clone(), (ws.session.clone(), bridge))
+                {
                     old.shutdown();
                 }
             }
@@ -1110,12 +1123,24 @@ fn spawn_control_pump(
     });
 }
 
-/// A worker session ended: tear down its bridge; the registry row stays —
-/// `derive_status` flips it to degraded/offline as `last_seen` ages.
+/// A worker session ended: tear down *its* bridge; the registry row
+/// stays — `derive_status` flips it to degraded/offline as `last_seen`
+/// ages.
+///
+/// `session` is the exact session that died (tagged on the event). A
+/// fast reconnect can emit a disconnect for a session the registry has
+/// already superseded; tearing down whatever bridge sits in the map
+/// would kill the *new* session's bridge while the worker stays
+/// connected but unusable. So the bridge is only removed when it was
+/// built from this very session (`Arc::ptr_eq`), and the "disconnected"
+/// report is skipped entirely when the controller's session map already
+/// holds a newer session for the worker.
 fn on_worker_disconnected(
     worker_pubkey: [u8; 32],
+    session: &Arc<Session>,
+    controller: &Arc<Controller>,
     registry: &Arc<Mutex<WorkerRegistry>>,
-    #[cfg(unix)] bridges: &Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    #[cfg(unix)] bridges: &WorkerBridges,
     dirty: &Arc<AtomicBool>,
 ) {
     let found = {
@@ -1123,11 +1148,37 @@ fn on_worker_disconnected(
         find_worker(&reg, &worker_pubkey)
     };
     if let Some((worker_id, label)) = found {
-        println!("worker '{label}' disconnected");
+        // Session-map truth: `None` means the dying session was the
+        // latest registered one; `Some(cur)` with a different `Arc`
+        // means a reconnect already replaced it → this disconnect is
+        // stale for status purposes (its bridge cleanup below still
+        // applies when the bridge belongs to this session).
+        let superseded = controller
+            .session(&worker_pubkey)
+            .is_some_and(|cur| !Arc::ptr_eq(&cur, session));
+
         #[cfg(unix)]
-        if let Some(bridge) = bridges.lock().unwrap().remove(&worker_id) {
-            bridge.shutdown();
+        {
+            let mut map = bridges.lock().unwrap();
+            let ours = matches!(
+                map.get(&worker_id),
+                Some((bridge_session, _)) if Arc::ptr_eq(bridge_session, session)
+            );
+            if ours {
+                if let Some((_, bridge)) = map.remove(&worker_id) {
+                    bridge.shutdown();
+                }
+            }
         }
+
+        if superseded {
+            tracing::debug!(
+                worker = %label,
+                "stale worker disconnect (superseded session); bridge kept"
+            );
+            return;
+        }
+        println!("worker '{label}' disconnected");
         dirty.store(true, Ordering::Relaxed);
     }
 }
@@ -1143,7 +1194,7 @@ async fn revocation_watch_loop(
     registry: Arc<Mutex<WorkerRegistry>>,
     dirty: Arc<AtomicBool>,
     state_dir: PathBuf,
-    #[cfg(unix)] bridges: Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    #[cfg(unix)] bridges: WorkerBridges,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let dir = crate::revoke::revocations_dir(&state_dir);
@@ -1186,7 +1237,7 @@ fn process_revocations(
     registry: &Arc<Mutex<WorkerRegistry>>,
     dirty: &AtomicBool,
     state_dir: &Path,
-    #[cfg(unix)] bridges: &Arc<Mutex<HashMap<String, ControllerBridge>>>,
+    #[cfg(unix)] bridges: &WorkerBridges,
     dir: &Path,
 ) {
     let Ok(read) = std::fs::read_dir(dir) else {
@@ -1247,7 +1298,7 @@ fn process_revocations(
         };
         #[cfg(unix)]
         if let Some(id) = &removed_id {
-            if let Some(bridge) = bridges.lock().unwrap().remove(id) {
+            if let Some((_, bridge)) = bridges.lock().unwrap().remove(id) {
                 bridge.shutdown();
             }
         }
@@ -1716,5 +1767,112 @@ mod tests {
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&state_dir);
         let _ = std::fs::remove_dir_all(&worker_dir);
+    }
+
+    /// Regression (stale-disconnect race): when a worker reconnects, the
+    /// old session's `WorkerDisconnected` can be delivered *after* the
+    /// new session's bridge was installed. `on_worker_disconnected`
+    /// must only tear down a bridge built from the session that
+    /// actually died — never the replacement session's bridge.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_disconnect_keeps_new_session_bridge() {
+        let ctrl_dir = tempdir("stale-ctrl");
+        let work_dir = tempdir("stale-worker");
+        let bridge_dir = tempdir("stale-bridges");
+
+        let ctrl = Arc::new(
+            conn::Controller::bind(&ctrl_dir, "127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap(),
+        );
+        let addr = ctrl.local_addr();
+        let c = ctrl.clone();
+        tokio::spawn(async move { c.accept_loop().await });
+
+        let material = ctrl.tls_material();
+        let cred = conn::WorkerCredential {
+            controller_pubkey: protocol::pubkey_to_hex(&ctrl.cluster_pubkey()),
+            ca_fingerprint: material.ca_fingerprint(),
+            ca_cert_pem: material.ca_cert_pem.clone(),
+        };
+        conn::save_worker_credential(&work_dir, &cred).unwrap();
+        let client = conn::WorkerClient::load(&work_dir, worker_cfg("stale-w")).unwrap();
+        let pubkey = client.public_key();
+
+        // Session 1: connect, grab the controller-side Arc<Session>.
+        let w1 = client.connect_once(addr).await.expect("connect 1");
+        let s1 = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(s) = ctrl.session(&pubkey) {
+                    break s;
+                }
+                assert!(std::time::Instant::now() < deadline, "session 1 never registered");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+
+        // Reconnect: session 2 replaces session 1 in the session map.
+        w1.close();
+        let _w2 = client.connect_once(addr).await.expect("connect 2");
+        let s2 = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(s) = ctrl.session(&pubkey) {
+                    if !Arc::ptr_eq(&s, &s1) {
+                        break s;
+                    }
+                }
+                assert!(std::time::Instant::now() < deadline, "session 2 never registered");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+
+        // Registry row + a bridge built from session 2 (as
+        // on_worker_connected would have installed).
+        let mut reg = WorkerRegistry::open(bridge_dir.join("workers.json")).unwrap();
+        let worker_id = registry::random_id(16);
+        reg.upsert(WorkerEntry {
+            worker_id: worker_id.clone(),
+            label: "stale-w".to_string(),
+            pubkey: protocol::pubkey_to_hex(&pubkey),
+            paired_at: Utc::now(),
+            last_seen: None,
+            status: WorkerStatus::Online,
+            resources: None,
+        });
+        let registry = Arc::new(Mutex::new(reg));
+
+        let bridges: WorkerBridges = Arc::new(Mutex::new(HashMap::new()));
+        let bridge = ControllerBridge::new(&bridge_dir, "stale-w", s2.clone())
+            .await
+            .unwrap();
+        let sock = bridge.socket_path().to_path_buf();
+        bridges
+            .lock()
+            .unwrap()
+            .insert(worker_id.clone(), (s2.clone(), bridge));
+        assert!(sock.exists());
+
+        let dirty = Arc::new(AtomicBool::new(false));
+
+        // Stale disconnect for session 1: bridge (built from s2) must
+        // survive and stay in the map.
+        on_worker_disconnected(pubkey, &s1, &ctrl, &registry, &bridges, &dirty);
+        assert!(
+            bridges.lock().unwrap().contains_key(&worker_id),
+            "stale disconnect removed the new session's bridge"
+        );
+        assert!(sock.exists(), "stale disconnect unlinked the bridge socket");
+
+        // The real disconnect for session 2 still tears its bridge down.
+        on_worker_disconnected(pubkey, &s2, &ctrl, &registry, &bridges, &dirty);
+        assert!(!bridges.lock().unwrap().contains_key(&worker_id));
+        assert!(!sock.exists());
+
+        let _ = std::fs::remove_dir_all(&ctrl_dir);
+        let _ = std::fs::remove_dir_all(&work_dir);
+        let _ = std::fs::remove_dir_all(&bridge_dir);
     }
 }
