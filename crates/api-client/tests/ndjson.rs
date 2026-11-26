@@ -11,7 +11,9 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
-use api_client::methods::{AgentStartParams, PaneSplitParams, SplitDirection};
+use api_client::methods::{
+    AgentStartParams, EventsSubscribeParams, PaneSplitParams, SplitDirection, Subscription,
+};
 use api_client::{ApiClient, ApiError};
 use serde_json::{json, Value};
 
@@ -274,6 +276,49 @@ fn oversized_response_line_is_rejected() {
     match client.request_with_timeout("ping", &json!({}), Duration::from_secs(30)) {
         Err(ApiError::Server { code, .. }) => assert_eq!(code, "response_too_large"),
         other => panic!("expected response_too_large, got {other:?}"),
+    }
+}
+
+#[test]
+fn subscribe_ack_over_cap_is_rejected() {
+    // Issue #113: the `events.subscribe` ack read went through an
+    // unbounded `read_line`. A peer streaming more than
+    // MAX_RESPONSE_LINE_BYTES without a newline must produce
+    // `response_too_large`, not unbounded memory growth.
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("herdr.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            thread::spawn(move || {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                // Consume the subscribe request line, then stream an
+                // unterminated "ack" past the cap.
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    return;
+                }
+                let chunk = vec![b'x'; 64 * 1024];
+                for _ in 0..(api_client::MAX_RESPONSE_LINE_BYTES / chunk.len() + 2) {
+                    if stream.write_all(&chunk).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    let client = ApiClient::connect(&socket_path).unwrap();
+    let params = EventsSubscribeParams {
+        subscriptions: vec![Subscription::PaneExited],
+    };
+    match client.events_subscribe(&params, Duration::from_secs(30)) {
+        Err(ApiError::Server { code, .. }) => assert_eq!(code, "response_too_large"),
+        Err(e) => panic!("expected response_too_large, got error: {e}"),
+        Ok(_) => panic!("expected response_too_large, got a live EventStream"),
     }
 }
 

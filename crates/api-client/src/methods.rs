@@ -678,8 +678,69 @@ pub struct EventStream {
     /// `next_event` calls. The stream's per-read timeout can fire
     /// mid-line; without this buffer the partial bytes would be dropped
     /// while the line's tail stayed buffered, so the next call would try
-    /// to parse the tail as a fresh JSON envelope (issue #87).
-    line_buf: String,
+    /// to parse the tail as a fresh JSON envelope (issue #87). Growth is
+    /// capped at [`MAX_RESPONSE_LINE_BYTES`] by [`read_event_line`]
+    /// (issue #113).
+    line_buf: Vec<u8>,
+}
+
+/// Outcome of one bounded line read on an event stream.
+enum EventLine {
+    /// A `\n` was consumed; `buf` holds the line's bytes, newline
+    /// excluded.
+    Complete,
+    /// EOF reached; `buf` holds any partial trailing bytes.
+    Eof,
+}
+
+fn event_line_too_large() -> ApiError {
+    ApiError::Server {
+        code: "response_too_large".to_string(),
+        message: format!("herdr event line exceeded {MAX_RESPONSE_LINE_BYTES} bytes"),
+    }
+}
+
+/// Read one NDJSON line from `reader` into `buf`, bounded by
+/// [`MAX_RESPONSE_LINE_BYTES`].
+///
+/// Unlike [`BufRead::read_line`], which loops `fill_buf` until `\n`, EOF,
+/// or error with no internal limit, this checks `buf.len()` against the
+/// cap **before every buffer extend** — including across `WouldBlock` /
+/// `TimedOut` returns, where `buf` retains the partial line between
+/// calls (issue #113). On a newline it consumes through the `\n` and
+/// leaves any following bytes buffered for the next call, matching
+/// `read_line` semantics.
+fn read_event_line(
+    reader: &mut BufReader<Box<dyn platform::IoStream>>,
+    buf: &mut Vec<u8>,
+) -> Result<EventLine, ApiError> {
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Err(ApiError::Timeout)
+            }
+            Err(e) => return Err(ApiError::Io(e)),
+        };
+        if available.is_empty() {
+            return Ok(EventLine::Eof);
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        // Bytes before the newline belong to this line; the newline
+        // itself (and anything after it) stays for the next read.
+        let content = newline.unwrap_or(available.len());
+        if buf.len() + content > MAX_RESPONSE_LINE_BYTES {
+            return Err(event_line_too_large());
+        }
+        buf.extend_from_slice(&available[..content]);
+        reader.consume(newline.map_or(content, |pos| pos + 1));
+        if newline.is_some() {
+            return Ok(EventLine::Complete);
+        }
+    }
 }
 
 impl EventStream {
@@ -692,60 +753,39 @@ impl EventStream {
     ///   timeout the stream was opened with; treat as a tick and call
     ///   `next_event` again. Any partial line already read is retained
     ///   and completed by a later call.
+    /// * `Err(ApiError::Server { code: "response_too_large", .. })` — the
+    ///   line exceeded [`MAX_RESPONSE_LINE_BYTES`]; the stream is
+    ///   unusable.
     /// * `Err(_)` — transport or parse failure; the stream is unusable.
     pub fn next_event(&mut self) -> Result<Option<serde_json::Value>, ApiError> {
         loop {
-            // `read_line` appends to `line_buf` rather than replacing it,
-            // so bytes consumed before a WouldBlock/TimedOut survive in
-            // the buffer until the rest of the line arrives.
-            match self.reader.read_line(&mut self.line_buf) {
-                Ok(0) => {
-                    if self.line_buf.is_empty() {
-                        // Clean EOF between lines.
-                        return Ok(None);
-                    }
-                    // EOF mid-line: parse whatever arrived — truncated
-                    // JSON surfaces as `ApiError::Json` (recoverable
-                    // upstream) rather than being silently dropped.
-                    let line = std::mem::take(&mut self.line_buf);
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    return Ok(Some(serde_json::from_str(trimmed)?));
-                }
-                Ok(_) => {
-                    // Cap on content bytes, excluding a trailing newline
-                    // `read_line` may have consumed.
-                    let content_len = self
-                        .line_buf
-                        .strip_suffix('\n')
-                        .unwrap_or(&self.line_buf)
-                        .len();
-                    if content_len > MAX_RESPONSE_LINE_BYTES {
-                        return Err(ApiError::Server {
-                            code: "response_too_large".to_string(),
-                            message: format!(
-                                "herdr event line exceeded {MAX_RESPONSE_LINE_BYTES} bytes"
-                            ),
-                        });
-                    }
-                    let line = std::mem::take(&mut self.line_buf);
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    return Ok(Some(serde_json::from_str(trimmed)?));
-                }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    // Tick: keep `line_buf` — it holds the partial line.
-                    return Err(ApiError::Timeout);
-                }
-                Err(e) => return Err(ApiError::Io(e)),
+            // `read_event_line` appends to `line_buf` rather than
+            // replacing it, so bytes consumed before a
+            // WouldBlock/TimedOut survive in the buffer until the rest
+            // of the line arrives.
+            let outcome = read_event_line(&mut self.reader, &mut self.line_buf)?;
+            if matches!(outcome, EventLine::Eof) && self.line_buf.is_empty() {
+                // Clean EOF between lines.
+                return Ok(None);
             }
+            let line = std::mem::take(&mut self.line_buf);
+            // `read_line` rejected invalid UTF-8 with an `InvalidData`
+            // io error; keep that mapping for byte-at-a-time reads that
+            // may split a multi-byte sequence across calls.
+            let text = String::from_utf8(line).map_err(|e| {
+                ApiError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                // Blank line (or whitespace-only partial at EOF): skip
+                // it. On EOF the next `read_event_line` returns `Eof`
+                // with an empty buffer, which surfaces as `Ok(None)`.
+                continue;
+            }
+            // EOF mid-line parses whatever arrived — truncated JSON
+            // surfaces as `ApiError::Json` (recoverable upstream)
+            // rather than being silently dropped.
+            return Ok(Some(serde_json::from_str(trimmed)?));
         }
     }
 }
@@ -785,26 +825,22 @@ impl ApiClient {
 
         // Consume the ack line, which shares the request/response
         // envelope: {"id","result":{"type":"subscription_started"}} or
-        // {"id","error":{...}}.
+        // {"id","error":{...}}. Read it through the same bounded helper
+        // as event lines — an ack streaming past
+        // `MAX_RESPONSE_LINE_BYTES` without a newline must error rather
+        // than grow `ack` without bound (issue #113).
         let mut reader = BufReader::new(stream);
-        let mut ack = String::new();
-        match reader.read_line(&mut ack) {
-            Ok(0) => {
-                return Err(ApiError::Server {
-                    code: "connection_closed".to_string(),
-                    message: "herdr closed the connection without a response".to_string(),
-                })
-            }
-            Ok(_) => {}
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                return Err(ApiError::Timeout)
-            }
-            Err(e) => return Err(ApiError::Io(e)),
+        let mut ack = Vec::new();
+        let outcome = read_event_line(&mut reader, &mut ack)?;
+        if matches!(outcome, EventLine::Eof) && ack.is_empty() {
+            return Err(ApiError::Server {
+                code: "connection_closed".to_string(),
+                message: "herdr closed the connection without a response".to_string(),
+            });
         }
-        let envelope: serde_json::Value = serde_json::from_str(ack.trim_end())?;
+        // `serde_json::from_slice` tolerates trailing whitespace (e.g. a
+        // `\r` from `\r\n`) just like the previous `trim_end` + `from_str`.
+        let envelope: serde_json::Value = serde_json::from_slice(&ack)?;
         if let Some(error) = envelope.get("error") {
             let code = error
                 .get("code")
@@ -826,7 +862,7 @@ impl ApiClient {
         }
         Ok(EventStream {
             reader,
-            line_buf: String::new(),
+            line_buf: Vec::new(),
         })
     }
 }
@@ -893,7 +929,7 @@ mod tests {
         (
             EventStream {
                 reader: BufReader::new(boxed),
-                line_buf: String::new(),
+                line_buf: Vec::new(),
             },
             limit,
         )
@@ -959,6 +995,29 @@ mod tests {
     fn event_stream_oversized_line_is_rejected() {
         let data = vec![b'x'; MAX_RESPONSE_LINE_BYTES + 1];
         let (mut events, _limit) = drip_event_stream(&data, data.len());
+        assert!(matches!(
+            events.next_event(),
+            Err(ApiError::Server { ref code, .. }) if code == "response_too_large"
+        ));
+    }
+
+    /// Issue #113: bytes dribbled in across per-read timeouts must not
+    /// let an unterminated line grow past `MAX_RESPONSE_LINE_BYTES`
+    /// unchecked. The cap applies before every buffer extend — on the
+    /// `Timeout` path too, not only when `read_line` finally returns.
+    #[test]
+    fn event_stream_cap_applies_across_timeouts() {
+        let data = vec![b'x'; MAX_RESPONSE_LINE_BYTES + 1];
+        // Only the first MAX bytes are readable; the rest are gated, so
+        // the first call consumes MAX bytes then hits WouldBlock →
+        // Timeout with the partial line retained.
+        let (mut events, limit) = drip_event_stream(&data, MAX_RESPONSE_LINE_BYTES);
+        assert!(matches!(events.next_event(), Err(ApiError::Timeout)));
+
+        // One more byte arrives — still no newline, still no EOF. The
+        // old `read_line` path returned Timeout again with the buffer
+        // now past the cap; the bounded read must error instead.
+        limit.store(MAX_RESPONSE_LINE_BYTES + 1, Ordering::Relaxed);
         assert!(matches!(
             events.next_event(),
             Err(ApiError::Server { ref code, .. }) if code == "response_too_large"
