@@ -753,6 +753,7 @@ impl std::fmt::Debug for WorkerSession {
 }
 
 /// Controller-side events.
+#[derive(Clone)]
 pub enum ControllerEvent {
     /// A worker completed auth + `WorkerHello` and registered.
     WorkerConnected(WorkerSession),
@@ -800,16 +801,64 @@ fn default_liveness_reap_after() -> Duration {
 /// consumer.
 const EVENT_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Total send attempts for a `WorkerConnected` event before it is
+/// dropped (initial attempt + retries). A dropped connect event
+/// leaves the worker TLS-connected but bridge-less until the liveness
+/// reaper kills the session (~45 s) and it reconnects (issue #110),
+/// so it gets bounded retries; other events keep single-attempt
+/// semantics (self-healing or low-impact).
+const CONNECT_EVENT_ATTEMPTS: u32 = 3;
+/// Delay between `WorkerConnected` send retries — long enough for a
+/// wedged consumer to make progress, short enough to stay well under
+/// the liveness-reap window.
+const CONNECT_EVENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Deliver a controller event with a bounded wait. A closed channel
-/// (controller shutting down) or a consumer stalled past
-/// [`EVENT_SEND_TIMEOUT`] drops the event — logged, never silent.
+/// (controller shutting down) drops the event immediately; a consumer
+/// stalled past [`EVENT_SEND_TIMEOUT`] drops it after a warn — except
+/// `WorkerConnected`, which is retried up to [`CONNECT_EVENT_ATTEMPTS`]
+/// times with [`CONNECT_EVENT_RETRY_DELAY`] between attempts.
 async fn send_controller_event(tx: &mpsc::Sender<ControllerEvent>, event: ControllerEvent) {
-    match timeout(EVENT_SEND_TIMEOUT, tx.send(event)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => tracing::debug!("controller event channel closed; event dropped"),
-        Err(_) => tracing::warn!(
-            "controller event queue did not drain within {EVENT_SEND_TIMEOUT:?}; event dropped"
-        ),
+    send_controller_event_inner(tx, event, EVENT_SEND_TIMEOUT, CONNECT_EVENT_RETRY_DELAY).await;
+}
+
+/// [`send_controller_event`] with injectable timing, so tests can
+/// exercise the retry path without multi-second waits.
+async fn send_controller_event_inner(
+    tx: &mpsc::Sender<ControllerEvent>,
+    event: ControllerEvent,
+    send_timeout: Duration,
+    retry_delay: Duration,
+) {
+    let attempts = match event {
+        ControllerEvent::WorkerConnected(_) => CONNECT_EVENT_ATTEMPTS,
+        _ => 1,
+    };
+    for attempt in 1..=attempts {
+        // `send` consumes its payload and a timeout drops the future
+        // (and the event with it), so each attempt gets a clone; the
+        // original is kept for the final drop log.
+        match timeout(send_timeout, tx.send(event.clone())).await {
+            Ok(Ok(())) => return,
+            Ok(Err(_)) => {
+                tracing::debug!("controller event channel closed; event dropped");
+                return;
+            }
+            Err(_) if attempt < attempts => {
+                tracing::warn!(
+                    "controller event queue did not drain within {send_timeout:?}; \
+                     retrying WorkerConnected send (attempt {attempt}/{attempts})"
+                );
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "controller event queue did not drain within {send_timeout:?}; \
+                     {event:?} dropped after {attempts} attempt(s)"
+                );
+                return;
+            }
+        }
     }
 }
 
@@ -1561,6 +1610,109 @@ mod tests {
         let client = WorkerClient::load(work_dir.path(), worker_cfg()).unwrap();
         let err = client.connect_once(addr).await.err().unwrap();
         assert!(matches!(err, ConnError::Tls(TlsError::PinMismatch)));
+    }
+
+    /// Helper: a `WorkerSession` wrapping a live loopback session.
+    fn worker_session(session: Session, pubkey_byte: u8) -> WorkerSession {
+        WorkerSession {
+            session: Arc::new(session),
+            worker_pubkey: [pubkey_byte; 32],
+            hostname: "retry-worker".to_string(),
+            caps: vec![],
+            resources: None,
+            connected_at: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_connected_event_retries_until_queue_drains() {
+        // Issue #110: a `WorkerConnected` dropped on a full/stalled
+        // event queue leaves the worker bridge-less until the liveness
+        // reaper reconnects it (~45 s). It must be retried instead.
+        let (_ctrl, client, addr, _cd, _wd) = loopback_pair().await;
+        let filler_session = client.connect_once(addr).await.unwrap();
+        let connect_session = client.connect_once(addr).await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        // Occupy the single slot so the connect send must wait.
+        tx.send(ControllerEvent::WorkerDisconnected {
+            worker_pubkey: [0u8; 32],
+            session: Arc::new(filler_session),
+        })
+        .await
+        .unwrap();
+
+        let ws = worker_session(connect_session, 7);
+        let tx2 = tx.clone();
+        let send = tokio::spawn(async move {
+            send_controller_event_inner(
+                &tx2,
+                ControllerEvent::WorkerConnected(ws),
+                Duration::from_millis(100),
+                Duration::from_millis(20),
+            )
+            .await;
+        });
+
+        // Attempt windows are ~0-100 / 120-220 / 240-340 ms; drain the
+        // filler inside the third attempt's window so a retry (not the
+        // first try) must deliver the connect event.
+        tokio::time::sleep(Duration::from_millis(280)).await;
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            ControllerEvent::WorkerDisconnected { .. }
+        ));
+        match timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            ControllerEvent::WorkerConnected(ws) => {
+                assert_eq!(ws.hostname, "retry-worker");
+                assert_eq!(ws.worker_pubkey, [7u8; 32]);
+            }
+            other => panic!("expected WorkerConnected, got {other:?}"),
+        }
+        send.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_connect_event_is_not_retried() {
+        // WorkerDisconnected keeps single-attempt semantics: a stalled
+        // consumer drops it after one timeout (self-healing via the
+        // session map / next connect).
+        let (_ctrl, client, addr, _cd, _wd) = loopback_pair().await;
+        let filler_session = client.connect_once(addr).await.unwrap();
+        let event_session = client.connect_once(addr).await.unwrap();
+
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ControllerEvent::WorkerDisconnected {
+            worker_pubkey: [0u8; 32],
+            session: Arc::new(filler_session),
+        })
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        send_controller_event_inner(
+            &tx,
+            ControllerEvent::WorkerDisconnected {
+                worker_pubkey: [9u8; 32],
+                session: Arc::new(event_session),
+            },
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+        )
+        .await;
+        // One 40 ms timeout and done — no retry delay, no extra attempts.
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        // Only the filler is in the channel; the event was dropped.
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ControllerEvent::WorkerDisconnected { .. }
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
