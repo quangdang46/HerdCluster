@@ -912,10 +912,17 @@ fn agent_watch_stream(
                             stuck_warned = false;
                         }
                         if WATCH_TERMINAL_STATUSES.contains(&status.as_str()) {
-                            return Ok(Some(PollResult::Matched {
-                                status,
-                                agent: data,
-                            }));
+                            // `Matched.agent` must be the full agent.get
+                            // record like the baseline-terminal path — the
+                            // event payload is just the status-change
+                            // fields. If the fetch fails, the transition
+                            // already happened, so fall back to the event
+                            // data rather than failing the whole watch.
+                            let agent = client
+                                .agent_get(&target)
+                                .map(|v| crate::fleet::normalize_agent_get(&v, &target))
+                                .unwrap_or(data);
+                            return Ok(Some(PollResult::Matched { status, agent }));
                         }
                     }
                     StreamEvent::Gone => return Ok(Some(PollResult::Gone)),
