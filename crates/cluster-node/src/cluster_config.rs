@@ -18,11 +18,12 @@
 //! the right.
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use cluster_core::config as core_config;
-use cluster_core::registry::{ClusterInfo, MachineOverride};
+use cluster_core::registry::{self, ClusterInfo, MachineOverride};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -267,14 +268,33 @@ fn load_existing() -> Result<ClusterInfo, ClusterConfigError> {
 }
 
 /// Held `cluster.json` lock: the file's existence is the mutex;
-/// dropping the guard removes it. See [`acquire_cluster_lock`].
+/// dropping the guard removes it — but only while the file still
+/// carries *our* ownership token. See [`acquire_cluster_lock`].
 struct ClusterLock {
     path: PathBuf,
+    /// Unique ownership token written into the lock file at acquire
+    /// time (`"{pid}:{random}"`). Guards [`Drop`]: if our process
+    /// stalled past [`LOCK_STALE_AFTER`] and another process stole +
+    /// recreated the lock, the file on disk belongs to *them* and must
+    /// not be deleted.
+    token: String,
 }
 
 impl Drop for ClusterLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove the lock file when its contents prove it is
+        // still ours. A stolen/recreated lock (different token) is
+        // left alone — deleting it would let two processes hold the
+        // "lock" at once (lost update on cluster.json, issue #110).
+        // If the file can't be read we can't prove ownership, so the
+        // conservative choice is to leave it; it will be reclaimed by
+        // the stale-steal path after [`LOCK_STALE_AFTER`] anyway.
+        match std::fs::read_to_string(&self.path) {
+            Ok(contents) if contents == self.token => {
+                let _ = std::fs::remove_file(&self.path);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -301,7 +321,19 @@ fn acquire_cluster_lock() -> Result<ClusterLock, ClusterConfigError> {
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => return Ok(ClusterLock { path }),
+            Ok(mut file) => {
+                // Stamp the lock with an ownership token so `Drop` can
+                // tell "our" lock file from one a peer recreated after
+                // stealing ours as stale.
+                let token = format!("{}:{}", std::process::id(), registry::random_id(16));
+                if let Err(e) = file.write_all(token.as_bytes()) {
+                    // Don't leave a tokenless lock file behind — its
+                    // owner could never prove ownership on drop.
+                    let _ = std::fs::remove_file(&path);
+                    return Err(lock_err(e));
+                }
+                return Ok(ClusterLock { path, token });
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let stale = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
@@ -640,6 +672,48 @@ mod tests {
         for label in labels.iter().skip(4) {
             assert!(view.machines.contains_key(label), "lost {label}");
         }
+
+        std::env::remove_var(core_config::ENV_STATE_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lock_drop_only_removes_file_with_our_token() {
+        let _g1 = STATE_DIR_ENV_LOCK.lock().await;
+        let _g2 = ENV_LOCK.lock().await;
+        let dir = tmpdir("locktoken");
+        std::env::set_var(core_config::ENV_STATE_DIR, &dir);
+
+        let lock_path = core_config::cluster_json_path()
+            .unwrap()
+            .with_file_name(CLUSTER_LOCK_FILE_NAME);
+
+        // Normal path: the file carries our token and drop removes it.
+        let lock = acquire_cluster_lock().unwrap();
+        let contents = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(contents, lock.token);
+        assert!(contents.contains(':'), "token should be pid:random");
+        drop(lock);
+        assert!(!lock_path.exists());
+
+        // Steal path (issue #110): another process stalled past
+        // LOCK_STALE_AFTER, stole the lock, and recreated the file with
+        // *its* token. Our delayed drop must not delete their live
+        // lock — that would let two processes hold it at once.
+        let lock = acquire_cluster_lock().unwrap();
+        std::fs::write(&lock_path, "otherpid:otherrandom").unwrap();
+        drop(lock);
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            "otherpid:otherrandom"
+        );
+
+        // Clean up the foreign lock manually, then confirm a fresh
+        // acquire/drop cycle still works.
+        std::fs::remove_file(&lock_path).unwrap();
+        let lock = acquire_cluster_lock().unwrap();
+        drop(lock);
+        assert!(!lock_path.exists());
 
         std::env::remove_var(core_config::ENV_STATE_DIR);
         let _ = std::fs::remove_dir_all(&dir);
