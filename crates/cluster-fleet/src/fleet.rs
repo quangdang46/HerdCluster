@@ -267,8 +267,16 @@ fn normalize_agent_record(obj: &mut serde_json::Map<String, Value>, fallback_tar
     if let Some(kind) = parse::str_field(&snapshot, KIND_KEYS) {
         obj.insert("kind".to_string(), Value::String(kind.to_string()));
     }
-    let local_id = parse::str_field(&snapshot, AGENT_ID_KEYS).unwrap_or(fallback_target);
-    obj.insert("agent".to_string(), Value::String(local_id.to_string()));
+    // Same candidate walk as [`agent_row`]: an agent *name* like
+    // "foo/bar" cannot form the agent half of a valid global ID, so skip
+    // invalid candidates and fall through to pane_id/terminal_id/etc.
+    let local_id = AGENT_ID_KEYS
+        .iter()
+        .filter_map(|key| snapshot.get(*key).and_then(Value::as_str))
+        .find(|s| valid_id_part(s))
+        .unwrap_or(fallback_target)
+        .to_string();
+    obj.insert("agent".to_string(), Value::String(local_id));
 }
 
 /// Merge per-machine query outcomes into sorted [`AgentListRow`]s.
@@ -1144,6 +1152,18 @@ mod tests {
         assert_eq!(out["agent"]["agent"], "devin-mac");
         assert_eq!(out["agent"]["kind"], "devin");
         assert_eq!(out["agent"]["name"], "devin-mac");
+    }
+
+    #[test]
+    fn normalize_agent_get_skips_invalid_id_candidates() {
+        // Issue #112: a herdr-native name like "foo/bar" cannot round-trip
+        // as the agent half of a global ID, so `agent get` must skip it
+        // and resolve `agent` to the same pane_id `agent list` reports.
+        let v = json!({"agent": {"agent": "claude", "name": "foo/bar", "pane_id": "w2:p1"}});
+        let out = normalize_agent_get(&v, "w2:p1");
+        assert_eq!(out["agent"]["agent"], "w2:p1");
+        // The raw `name` field still passes through untouched.
+        assert_eq!(out["agent"]["name"], "foo/bar");
     }
 
     #[test]

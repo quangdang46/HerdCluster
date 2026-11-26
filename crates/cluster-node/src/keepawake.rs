@@ -443,8 +443,15 @@ impl KeepAwake {
                     self.idle_since = None;
                     true
                 } else {
-                    let since = *self.idle_since.get_or_insert(now);
-                    now.saturating_duration_since(since) < self.release_grace
+                    // The release grace only applies while an assertion
+                    // is already held (i.e. activity recently stopped) —
+                    // a daemon that never saw work must not acquire the
+                    // sleep assertion just because the first probe was
+                    // idle (issue #111).
+                    self.asserting && {
+                        let since = *self.idle_since.get_or_insert(now);
+                        now.saturating_duration_since(since) < self.release_grace
+                    }
                 };
                 self.apply(should_hold);
             }
@@ -730,6 +737,24 @@ mod tests {
         ka.observe(working(0), t0 + Duration::from_secs(160));
         assert!(!ka.asserting());
         assert_eq!(fake.state.lock().unwrap().releases, 1);
+    }
+
+    #[test]
+    fn never_acquires_when_idle_from_the_start() {
+        // Issue #111: grace exists to smooth the active→idle transition,
+        // not to hold sleep inhibition before any agent ever worked.
+        let grace = Duration::from_secs(60);
+        let asserter = FakeAsserter::default();
+        let (mut ka, fake) = manager(working(0), grace, asserter);
+        let t0 = Instant::now();
+
+        for secs in [0, 30, 90, 200] {
+            ka.observe(working(0), t0 + Duration::from_secs(secs));
+            assert!(!ka.asserting());
+        }
+        let s = fake.state.lock().unwrap();
+        assert_eq!(s.acquires, 0);
+        assert_eq!(s.releases, 0);
     }
 
     #[test]
