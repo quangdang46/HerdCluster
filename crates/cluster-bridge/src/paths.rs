@@ -20,15 +20,15 @@ pub const BRIDGE_SOCKET_SUFFIX: &str = ".sock";
 /// Sanitize a worker label into a filesystem-safe bridge socket basename.
 ///
 /// Identical to `cluster_fleet::endpoint::sanitize_label`: keeps
-/// `[A-Za-z0-9._-]`, maps everything else to `_`, trims leading/trailing
-/// dots, dashes, and underscores, and falls back to `"worker"` if nothing
-/// usable remains.
+/// `[A-Za-z0-9._-]` (lowercased for case-insensitive filesystems), maps
+/// everything else to `_`, trims leading/trailing dots, dashes, and
+/// underscores, and falls back to `"worker"` if nothing usable remains.
 pub fn sanitize_label(label: &str) -> String {
     let mut out: String = label
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
+                c.to_ascii_lowercase()
             } else {
                 '_'
             }
@@ -68,6 +68,7 @@ mod tests {
         assert_eq!(sanitize_label("..weird.."), "weird");
         assert_eq!(sanitize_label("!!!"), "worker");
         assert_eq!(sanitize_label("a/b\\c"), "a_b_c");
+        assert_eq!(sanitize_label("FooBar"), "foobar");
     }
 
     #[test]

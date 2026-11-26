@@ -100,16 +100,18 @@ impl MachineEndpoint {
 
 /// Sanitize a worker label into a filesystem-safe bridge socket basename.
 ///
-/// Keeps `[A-Za-z0-9._-]`, maps everything else to `_`, trims leading/trailing
-/// dots and dashes, and falls back to `"worker"` if nothing usable remains.
-/// Two distinct labels can theoretically sanitize to the same basename —
-/// pairing should reject such labels; this is documented, not enforced here.
+/// Keeps `[A-Za-z0-9._-]` (lowercased — bridge sockets must not collide
+/// on case-insensitive filesystems), maps everything else to `_`, trims
+/// leading/trailing dots and dashes, and falls back to `"worker"` if
+/// nothing usable remains. Two distinct labels can still theoretically
+/// sanitize to the same basename — pairing dedupes on this output
+/// (`unique_label`), so admitted workers never collide.
 pub fn sanitize_label(label: &str) -> String {
     let mut out: String = label
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-                c
+                c.to_ascii_lowercase()
             } else {
                 '_'
             }
@@ -332,6 +334,10 @@ mod tests {
         assert_eq!(sanitize_label("..weird.."), "weird");
         assert_eq!(sanitize_label("!!!"), "worker");
         assert_eq!(sanitize_label("a/b\\c"), "a_b_c");
+        // Case is folded: "Foo"/"foo" must not collide on
+        // case-insensitive filesystems.
+        assert_eq!(sanitize_label("FooBar"), "foobar");
+        assert_eq!(sanitize_label("WSL2-Box"), "wsl2-box");
     }
 
     #[test]
