@@ -103,21 +103,34 @@ pub(crate) fn block_on<F: Future>(fut: F) -> Result<F::Output, i32> {
     }
 }
 
+/// Issue tracker for bug reports — appended to bug-class failures so
+/// agents that hit a herdcluster bug know where to file it.
+pub(crate) const ISSUE_URL: &str = "https://github.com/quangdang46/herdr_cluster/issues";
+
 /// Print a `cluster-node` service error and return exit code 1.
 ///
 /// `code` is the stable snake_case tag used inside the `--json` error
 /// envelope (cluster-node errors don't carry machine-readable codes).
+/// Bug-class codes (`worker_daemon_failed`, `config_error`) also carry a
+/// bug-report pointer; expected operational failures (`pairing_rejected`,
+/// `join_failed` discovery/transport) do not.
 pub(crate) fn report_node_error(code: &str, e: &impl Display, json: bool) -> i32 {
+    let reportable = matches!(code, "worker_daemon_failed" | "config_error");
     if json {
-        let envelope = serde_json::json!({
-            "error": { "code": code, "message": e.to_string() }
-        });
+        let mut error = serde_json::json!({ "code": code, "message": e.to_string() });
+        if reportable {
+            error["report_url"] = serde_json::Value::String(ISSUE_URL.to_string());
+        }
+        let envelope = serde_json::json!({ "error": error });
         eprintln!(
             "{}",
             serde_json::to_string(&envelope).unwrap_or_else(|_| envelope.to_string())
         );
     } else {
         eprintln!("error: {e}");
+        if reportable {
+            eprintln!("note: if this looks like a herdcluster bug, file an issue: {ISSUE_URL}");
+        }
     }
     1
 }
@@ -151,16 +164,24 @@ pub(crate) fn load_ctx(verbose: bool, json: bool) -> Result<FleetContext, i32> {
     FleetContext::load().map_err(|e| report_fleet_error(&e, json))
 }
 
-/// Print a [`FleetError`] and return exit code 1.
+/// Print a [`FleetError`] and return exit code 1. Bug-class failures
+/// ([`FleetError::is_bug_reportable`]) also point at the issue tracker.
 pub(crate) fn report_fleet_error(e: &FleetError, json: bool) -> i32 {
     if json {
         // fleet provides the canonical {"error":{code,message}} envelope.
+        let mut value = e.to_json();
+        if e.is_bug_reportable() {
+            value["error"]["report_url"] = serde_json::Value::String(ISSUE_URL.to_string());
+        }
         eprintln!(
             "{}",
-            serde_json::to_string(&e.to_json()).unwrap_or_else(|_| e.to_string())
+            serde_json::to_string(&value).unwrap_or_else(|_| e.to_string())
         );
     } else {
         eprintln!("error: {e}");
+        if e.is_bug_reportable() {
+            eprintln!("note: if this looks like a herdcluster bug, file an issue: {ISSUE_URL}");
+        }
     }
     1
 }

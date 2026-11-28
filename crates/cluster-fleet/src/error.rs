@@ -93,6 +93,14 @@ impl FleetError {
         }
     }
 
+    /// Whether this failure plausibly indicates a herdcluster bug rather
+    /// than an expected operational condition (bad id, unknown machine,
+    /// unreachable worker, stalled prompt, bad argument). The CLI uses
+    /// this to decide whether to point the user at the issue tracker.
+    pub fn is_bug_reportable(&self) -> bool {
+        matches!(self, FleetError::Api { .. } | FleetError::Config { .. })
+    }
+
     /// Build the canonical `{"error": {"code", "message", ...}}` JSON value.
     pub fn to_json(&self) -> serde_json::Value {
         let mut error = serde_json::json!({
@@ -158,5 +166,50 @@ impl Serialize for FleetError {
             error["candidates"] = serde_json::json!(candidates);
         }
         error.serialize(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bug_reportable_only_for_internal_errors() {
+        assert!(FleetError::Api {
+            message: "x".into()
+        }
+        .is_bug_reportable());
+        assert!(FleetError::Config {
+            message: "x".into()
+        }
+        .is_bug_reportable());
+        for e in [
+            FleetError::MalformedId {
+                input: "x".into(),
+                reason: "r".into(),
+            },
+            FleetError::UnknownMachine { label: "x".into() },
+            FleetError::AgentNotFound {
+                machine: "m".into(),
+                agent: "a".into(),
+            },
+            FleetError::WorkerUnreachable {
+                machine: "m".into(),
+                reason: "r".into(),
+            },
+            FleetError::PromptStalled {
+                machine: "m".into(),
+                agent: "a".into(),
+            },
+            FleetError::InvalidArgument {
+                message: "x".into(),
+            },
+            FleetError::AmbiguousAgent {
+                agent: "a".into(),
+                candidates: vec![],
+            },
+        ] {
+            assert!(!e.is_bug_reportable(), "{e} should not be bug-reportable");
+        }
     }
 }
