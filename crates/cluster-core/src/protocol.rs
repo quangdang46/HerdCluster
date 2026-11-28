@@ -96,6 +96,18 @@ pub enum Message {
         /// Human-readable rejection reason.
         reason: String,
     },
+    /// Worker → controller: retract a pairing the controller already
+    /// accepted — e.g. the worker declined the CA-fingerprint TOFU check
+    /// or failed to persist its credential (issue #110). `signature` is
+    /// base64 Ed25519 over [`crate::identity::pair_decline_challenge`];
+    /// the controller only drops a registry row that has never completed
+    /// a session (`last_seen` still `None`).
+    PairDecline {
+        /// Worker's Ed25519 public key, hex-encoded.
+        worker_pubkey: String,
+        /// Ed25519 signature proving possession of the worker key, base64.
+        signature: String,
+    },
     /// Worker → controller: post-pairing hello with identity + resources.
     WorkerHello {
         /// Worker's Ed25519 public key, hex-encoded.
@@ -359,6 +371,10 @@ mod tests {
             },
             Message::PairReject {
                 reason: "user denied".into(),
+            },
+            Message::PairDecline {
+                worker_pubkey: pubkey_to_hex(&[0x22; 32]),
+                signature: bytes_to_base64(&[0x33; 64]),
             },
             Message::WorkerHello {
                 worker_pubkey: pubkey_to_hex(&[0x11; 32]),

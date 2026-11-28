@@ -247,6 +247,7 @@ pub async fn join_in_state_dir(
             );
             if !confirm_fingerprint()? {
                 eprintln!("CA fingerprint not verified — join aborted; nothing was saved");
+                notify_pair_decline(addr, &identity).await;
                 return Ok(JoinOutcome::FingerprintDeclined);
             }
         }
@@ -272,9 +273,14 @@ pub async fn join_in_state_dir(
         paired_at_unix: unix_now(),
         cluster_name: cluster_name.clone(),
     };
-    save_worker_info(&state_dir, &info).map_err(JoinError::Io)?;
-    conn::save_worker_credential(&state_dir, &credential)
-        .map_err(|e| JoinError::Credential(e.to_string()))?;
+    if let Err(e) = save_worker_info(&state_dir, &info) {
+        notify_pair_decline(addr, &identity).await;
+        return Err(JoinError::Io(e));
+    }
+    if let Err(e) = conn::save_worker_credential(&state_dir, &credential) {
+        notify_pair_decline(addr, &identity).await;
+        return Err(JoinError::Credential(e.to_string()));
+    }
 
     if !cfg.json {
         println!("Paired → worker '{}' online", label);
@@ -572,6 +578,31 @@ async fn read_pairing_answer(
             }
         }
     }
+}
+
+/// Best-effort `PairDecline` notification (issue #110): the controller
+/// registers the worker as soon as `PairAccept` is written, so aborting
+/// the join afterwards (fingerprint decline, persist failure) would
+/// otherwise leave a phantom Offline row in `workers.json`. The message
+/// is signed with the worker identity key; failures are ignored — the
+/// row self-heals on re-join or `revoke`.
+async fn notify_pair_decline(addr: SocketAddr, identity: &Keypair) {
+    let pubkey = identity.public_key_bytes();
+    let sig = identity.sign(&cluster_core::identity::pair_decline_challenge(&pubkey));
+    let msg = Message::PairDecline {
+        worker_pubkey: protocol::pubkey_to_hex(&pubkey),
+        signature: protocol::bytes_to_base64(&sig),
+    };
+    let Ok(frame) = protocol::encode_frame(&msg) else {
+        return;
+    };
+    let send = async {
+        let mut stream = TcpStream::connect(addr).await.ok()?;
+        stream.write_all(&frame).await.ok()?;
+        let _ = stream.shutdown().await;
+        Some(())
+    };
+    let _ = timeout(PAIR_CONNECT_TIMEOUT, send).await;
 }
 
 // ---------------------------------------------------------------------------

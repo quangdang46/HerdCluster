@@ -150,6 +150,16 @@ pub fn fingerprint_of_pubkey(pubkey: &[u8]) -> String {
     fsutil::hex_encode(&digest[..8])
 }
 
+/// Domain-separated challenge a worker signs to retract a pairing it
+/// accepted but then aborted (issue #110). The signature proves possession
+/// of the worker identity key, so a third party cannot delete someone
+/// else's pending registry row.
+pub fn pair_decline_challenge(pubkey: &[u8; PUBLIC_KEY_LEN]) -> Vec<u8> {
+    let mut challenge = b"herdcluster/pair-decline/v1".to_vec();
+    challenge.extend_from_slice(pubkey);
+    challenge
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

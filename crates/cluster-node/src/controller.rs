@@ -721,30 +721,35 @@ async fn handle_public_conn(
 /// confirm), write `PairAccept`/`PairReject`, close.
 async fn pairing_conn(mut stream: TcpStream, shared: Arc<PairingShared>) {
     let exchange = tokio::time::timeout(PAIR_EXCHANGE_TIMEOUT, async {
-        // Read exactly one frame; it must be PairHello.
+        // Read exactly one frame; it must be PairHello or PairDecline.
         let hello = read_one_frame(&mut stream).await;
-        let Some(Message::PairHello {
-            code,
-            worker_pubkey,
-            hostname,
-            ..
-        }) = hello
-        else {
-            return;
-        };
-        let Ok(pk) = protocol::pubkey_from_hex(&worker_pubkey) else {
-            return;
-        };
-        run_pairing_exchange(
-            &mut stream,
-            &shared,
-            JoinRequest {
+        match hello {
+            Some(Message::PairHello {
                 code,
-                worker_pubkey: pk,
+                worker_pubkey,
                 hostname,
-            },
-        )
-        .await;
+                ..
+            }) => {
+                let Ok(pk) = protocol::pubkey_from_hex(&worker_pubkey) else {
+                    return;
+                };
+                run_pairing_exchange(
+                    &mut stream,
+                    &shared,
+                    JoinRequest {
+                        code,
+                        worker_pubkey: pk,
+                        hostname,
+                    },
+                )
+                .await;
+            }
+            Some(Message::PairDecline {
+                worker_pubkey,
+                signature,
+            }) => handle_pair_decline(&shared, &worker_pubkey, &signature),
+            _ => {}
+        }
     });
     if exchange.await.is_err() {
         tracing::debug!("pairing exchange timed out");
@@ -888,6 +893,49 @@ async fn run_pairing_exchange(
                 },
             )
             .await;
+        }
+    }
+}
+
+/// Handle a worker-initiated [`Message::PairDecline`] (issue #110): the
+/// worker accepted `PairAccept` but then aborted (e.g. declined the CA
+/// fingerprint TOFU check), leaving a phantom Offline registry row.
+///
+/// The decline must carry a valid Ed25519 signature over
+/// [`identity::pair_decline_challenge`] so only the key holder can retract
+/// its own row. Only rows that have NEVER completed a session
+/// (`last_seen == None`) are removed — an established worker cannot be
+/// unpaired this way.
+fn handle_pair_decline(shared: &Arc<PairingShared>, worker_pubkey: &str, signature: &str) {
+    let Ok(pk) = protocol::pubkey_from_hex(worker_pubkey) else {
+        return;
+    };
+    let Ok(sig_bytes) = protocol::base64_to_bytes(signature) else {
+        return;
+    };
+    let Ok(sig) = <[u8; identity::SIGNATURE_LEN]>::try_from(sig_bytes.as_slice()) else {
+        return;
+    };
+    if !identity::Keypair::verify(&pk, &identity::pair_decline_challenge(&pk), &sig) {
+        tracing::debug!(%worker_pubkey, "pair decline with bad signature; ignoring");
+        return;
+    }
+    let pubkey_hex = protocol::pubkey_to_hex(&pk);
+    let mut reg = shared.registry.lock().unwrap();
+    let pending = reg
+        .list()
+        .iter()
+        .find(|w| w.pubkey == pubkey_hex && w.last_seen.is_none())
+        .map(|w| w.worker_id.clone());
+    let Some(worker_id) = pending else {
+        tracing::debug!(%worker_pubkey, "pair decline for unknown or established worker; ignoring");
+        return;
+    };
+    if reg.remove(&worker_id) {
+        if let Err(e) = reg.save() {
+            tracing::warn!("workers.json save after pair decline failed: {e}");
+        } else {
+            println!("worker declined pairing; removed pending registration");
         }
     }
 }
@@ -1811,6 +1859,95 @@ mod tests {
         }
         let reg = WorkerRegistry::open(state_dir.join("workers.json")).unwrap();
         assert!(reg.list().is_empty());
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(&state_dir);
+    }
+
+    /// Issue #110: a worker that aborts after `PairAccept` (e.g. declines
+    /// the CA fingerprint) sends a signed `PairDecline`; the controller
+    /// must drop the never-connected registry row — and only when the
+    /// signature verifies.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ctrl_pair_decline_removes_pending_worker() {
+        let state_dir = tempdir("decline");
+        let handle = ControllerHandle::run(ControllerConfig {
+            port: Some(0),
+            auto_accept_pairing: true,
+            state_dir: Some(state_dir.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let addr = handle.local_addr();
+        let identity = Keypair::generate();
+        let pubkey = identity.public_key_bytes();
+
+        let outcome = pair_with_controller(
+            addr,
+            &handle.pairing_code(),
+            &pubkey,
+            "declining-worker",
+            &[],
+            Duration::from_secs(15),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, PairingClientOutcome::Accepted { .. }));
+
+        // Row exists, never connected.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let reg = WorkerRegistry::open(state_dir.join("workers.json")).unwrap();
+                if reg.list().len() == 1 {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never registered"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        async fn send_decline(addr: SocketAddr, pubkey: [u8; 32], sig: &[u8; 64]) {
+            let msg = Message::PairDecline {
+                worker_pubkey: protocol::pubkey_to_hex(&pubkey),
+                signature: protocol::bytes_to_base64(sig),
+            };
+            let frame = protocol::encode_frame(&msg).unwrap();
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream.write_all(&frame).await.unwrap();
+            let _ = stream.shutdown().await;
+        }
+
+        // Forged signature must NOT remove the row.
+        send_decline(addr, pubkey, &[0xAB; 64]).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        {
+            let reg = WorkerRegistry::open(state_dir.join("workers.json")).unwrap();
+            assert_eq!(reg.list().len(), 1, "bad signature removed the row");
+        }
+
+        // Valid signature retracts the pending pairing.
+        let sig = identity.sign(&identity::pair_decline_challenge(&pubkey));
+        send_decline(addr, pubkey, &sig).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let reg = WorkerRegistry::open(state_dir.join("workers.json")).unwrap();
+                if reg.list().is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pair decline never removed the row"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
         handle.shutdown();
         let _ = std::fs::remove_dir_all(&state_dir);
     }
